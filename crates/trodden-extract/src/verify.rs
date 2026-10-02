@@ -46,8 +46,13 @@ static CHECK_WORD: LazyLock<Regex> = LazyLock::new(|| {
         .expect("check word pattern is valid")
 });
 
+static TEST_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[\s/_.:-])(?:tests?|specs?|unittest|pytest|jest|vitest|mocha|rspec|phpunit|nextest|tox|nox)(?:$|[\s/_.:-])")
+        .expect("test word pattern is valid")
+});
+
 static TRAILING_FILTER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s*(?:2>&1|\|&?\s*(?:head|tail|grep|less|more|tee|cat|wc)\b.*)$")
+    Regex::new(r"\s*(?:2>&1|\|&?\s*(?:head|tail|grep|less|more|tee|cat|wc)\b.*|\|\|\s*(?:true|:)|;\s*echo\b.*)$")
         .expect("filter pattern is valid")
 });
 
@@ -79,6 +84,18 @@ impl Verification {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn runs_tests(command: &str) -> bool {
+        TEST_WORD.is_match(&Self::clean(command))
+    }
+
+    pub(crate) fn covers(passed: &str, failed: &str) -> bool {
+        if Self::runs_tests(failed) {
+            return Self::runs_tests(passed);
+        }
+        let program = |command: &str| Command::normalize(&Self::clean(command), "").program();
+        program(passed) == program(failed)
     }
 
     pub(crate) fn clean(command: &str) -> String {
@@ -124,6 +141,27 @@ mod tests {
     }
 
     #[test]
+    fn tells_test_runs_from_other_checks() {
+        for command in [
+            "cargo test -p invoicer",
+            "npm test",
+            "node --test test/",
+            "python3 -m pytest -q",
+            "npm run test:unit",
+        ] {
+            assert!(Verification::runs_tests(command), "{command}");
+        }
+        for command in [
+            "cargo build",
+            "ruff check .",
+            "npm run lint",
+            "tsc --noEmit",
+        ] {
+            assert!(!Verification::runs_tests(command), "{command}");
+        }
+    }
+
+    #[test]
     fn strips_output_filters() {
         assert_eq!(
             Verification::clean("cargo test --lib 2>&1 | head -50"),
@@ -131,5 +169,7 @@ mod tests {
         );
         assert_eq!(Verification::clean("npm test | tee out.log"), "npm test");
         assert_eq!(Verification::clean("pytest -q"), "pytest -q");
+        assert_eq!(Verification::clean("cargo test || true"), "cargo test");
+        assert_eq!(Verification::clean("npm test; echo ok"), "npm test");
     }
 }

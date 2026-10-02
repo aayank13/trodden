@@ -13,6 +13,7 @@ use trodden_redact::Redactor;
 use crate::{
     ErrorSignature,
     command::Command,
+    evidence::CheckOutput,
     symbols::{Hunk, SymbolFinder},
 };
 
@@ -367,12 +368,19 @@ impl<'a> TraceBuilder<'a> {
             .and_then(Value::as_bool)
             == Some(true);
         let text = Self::text(content);
-        call.outcome = if interrupted {
-            ToolOutcome::Interrupted
-        } else if is_error {
-            Self::failure(&text)
-        } else {
-            ToolOutcome::Succeeded
+        let verdict = call
+            .args
+            .command
+            .as_deref()
+            .and_then(|command| CheckOutput::verdict(command, &text));
+        call.outcome = match (interrupted, is_error, verdict) {
+            (true, _, _) => ToolOutcome::Interrupted,
+            (false, true, verdict) => match Self::failure(&text) {
+                ToolOutcome::Failed { .. } if verdict == Some(true) => ToolOutcome::Succeeded,
+                outcome => outcome,
+            },
+            (false, false, Some(false)) => ToolOutcome::Failed { exit_code: None },
+            (false, false, _) => ToolOutcome::Succeeded,
         };
         if matches!(call.outcome, ToolOutcome::Failed { .. }) {
             call.error = ErrorSignature::of(&text, self.redactor);
@@ -504,6 +512,8 @@ impl<'a> TraceBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -511,6 +521,79 @@ mod tests {
         let redactor = Redactor::with_home("/home/dev");
 
         assert!(Transcript::parse("not a transcript\n", &redactor).is_err());
+    }
+
+    fn outcome(command: &str, output: &str, is_error: bool) -> ToolOutcome {
+        let lines = [
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                   "message": {"role": "user", "content": "Fix the paging bug"}}),
+            json!({"type": "assistant", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:12Z",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "tool_use", "id": "run", "name": "Bash", "input": {"command": command}}]}}),
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:13Z",
+                   "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "run", "content": output, "is_error": is_error}]}}),
+        ];
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let trace =
+            Transcript::parse(&text, &Redactor::with_home("/home/dev")).expect("valid transcript");
+        trace
+            .events
+            .into_iter()
+            .find_map(|event| match event.kind {
+                EventKind::ToolCall(call) => Some(call.outcome),
+                _ => None,
+            })
+            .expect("one tool call")
+    }
+
+    #[test]
+    fn piped_checks_are_judged_by_their_own_summary() {
+        let failing = "running 3 tests\ntest paging ... FAILED\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored";
+        let passing = "running 3 tests\n\ntest result: ok. 3 passed; 0 failed; 0 ignored";
+
+        assert_eq!(
+            outcome("cargo test 2>&1 | tail -20", failing, false),
+            ToolOutcome::Failed { exit_code: None }
+        );
+        assert_eq!(
+            outcome("cargo test || true", failing, false),
+            ToolOutcome::Failed { exit_code: None }
+        );
+        assert_eq!(
+            outcome("cargo test 2>&1 | grep -i failed", passing, true),
+            ToolOutcome::Succeeded
+        );
+        assert_eq!(
+            outcome("cargo test 2>&1 | tail -20", passing, false),
+            ToolOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn plain_commands_keep_their_exit_code() {
+        assert_eq!(
+            outcome(
+                "cargo test",
+                "test result: FAILED. 2 passed; 1 failed",
+                false
+            ),
+            ToolOutcome::Succeeded
+        );
+        assert_eq!(
+            outcome(
+                "cargo build && cargo test",
+                "Exit code 101\ntest result: ok. 3 passed",
+                true
+            ),
+            ToolOutcome::Failed {
+                exit_code: Some(101)
+            }
+        );
+        assert_eq!(
+            outcome("npm run build | tee build.log", "built in 2.1s", false),
+            ToolOutcome::Succeeded
+        );
     }
 
     #[test]
