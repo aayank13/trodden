@@ -13,9 +13,11 @@ account. It works with Claude Code today.
 ## How it works
 
 1. **Capture.** When a turn or session ends, Trodden reads the transcript.
-   It keeps commands, file paths, touched function names and exit codes, with
-   secrets redacted. It never stores file contents, tool output or full
-   prompts.
+   It keeps the first line of each prompt (up to 200 characters), commands,
+   file paths, touched function names and exit codes, with secrets redacted.
+   From a failed tool call it keeps at most one normalized error line, used
+   only to recognize the same error later. It never stores file contents,
+   other tool output or the rest of a prompt.
 2. **Extract.** A task becomes a procedure only if it changed files and a
    check (tests, build, lint) passed after the last change. Extraction is
    deterministic and uses no language model.
