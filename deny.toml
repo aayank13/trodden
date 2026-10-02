@@ -1,0 +1,30 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "reqwest" },
+    { name = "ureq" },
+    { name = "hyper" },
+    { name = "isahc" },
+    { name = "curl" },
+    { name = "rustls" },
+    { name = "native-tls" },
+    { name = "openssl" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

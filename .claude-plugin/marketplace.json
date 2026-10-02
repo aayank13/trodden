@@ -1,0 +1,17 @@
+{
+  "name": "trodden",
+  "owner": {
+    "name": "aayank13",
+    "url": "https://github.com/aayank13"
+  },
+  "metadata": {
+    "description": "Procedural memory for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "trodden",
+      "source": "./integrations/claude-code",
+      "description": "Recalls the path that worked when a similar task comes up. Local only; requires the trodden CLI."
+    }
+  ]
+}

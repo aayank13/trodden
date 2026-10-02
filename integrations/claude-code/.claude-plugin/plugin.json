@@ -1,0 +1,13 @@
+{
+  "name": "trodden",
+  "version": "0.1.0",
+  "description": "Procedural memory: recalls the path that worked when a similar task comes up. Local only; requires the trodden CLI.",
+  "author": {
+    "name": "aayank13",
+    "url": "https://github.com/aayank13"
+  },
+  "homepage": "https://github.com/aayank13/trodden",
+  "repository": "https://github.com/aayank13/trodden",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "procedures", "recall"]
+}

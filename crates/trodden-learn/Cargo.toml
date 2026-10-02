@@ -1,0 +1,21 @@
+[package]
+name = "trodden-learn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Outcome tracking, revision selection, holdouts and aging for Trodden"
+publish = false
+
+[dependencies]
+jiff.workspace = true
+rand = { version = "0.10.3", default-features = false, features = ["std", "sys_rng"] }
+rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
+trodden-core.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+quickcheck = "1.1.0"

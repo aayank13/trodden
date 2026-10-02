@@ -1,0 +1,24 @@
+[package]
+name = "trodden-recall"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hot-path procedure recall for Trodden"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+jiff.workspace = true
+rand = { version = "0.10.3", default-features = false, features = ["std", "sys_rng"] }
+trodden-core.workspace = true
+trodden-embed.workspace = true
+trodden-learn.workspace = true
+trodden-store.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+trodden-core = { workspace = true, features = ["test-support"] }

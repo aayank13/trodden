@@ -1,0 +1,18 @@
+[package]
+name = "trodden-redact"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Secret redaction for text Trodden stores"
+publish = false
+
+[dependencies]
+regex = "1.13.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+quickcheck = "1.1.0"

@@ -1,0 +1,19 @@
+[package]
+name = "trodden-extract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic procedure extraction from Trodden traces"
+publish = false
+
+[dependencies]
+jiff.workspace = true
+regex.workspace = true
+sha2 = "0.11.0"
+trodden-capture.workspace = true
+trodden-core.workspace = true
+
+[lints]
+workspace = true

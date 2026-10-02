@@ -1,0 +1,23 @@
+[package]
+name = "trodden-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite store for Trodden procedures"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+jiff.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json.workspace = true
+trodden-core.workspace = true
+trodden-learn.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+trodden-core = { workspace = true, features = ["test-support"] }

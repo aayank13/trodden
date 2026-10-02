@@ -1,0 +1,25 @@
+[package]
+name = "trodden-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Open data model for Trodden: agent session traces and learned procedures"
+keywords = ["agents", "memory", "llm", "procedures", "schema"]
+categories = ["data-structures", "development-tools"]
+readme = "../../README.md"
+
+[features]
+test-support = []
+
+[dependencies]
+jiff.workspace = true
+schemars = { version = "1.2.2", features = ["jiff02", "preserve_order"] }
+serde.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

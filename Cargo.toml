@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/aayank13/trodden"
+
+[workspace.dependencies]
+trodden-capture = { path = "crates/trodden-capture", version = "0.1.0" }
+trodden-core = { path = "crates/trodden-core", version = "0.1.0" }
+trodden-embed = { path = "crates/trodden-embed", version = "0.1.0" }
+trodden-extract = { path = "crates/trodden-extract", version = "0.1.0" }
+trodden-learn = { path = "crates/trodden-learn", version = "0.1.0" }
+trodden-recall = { path = "crates/trodden-recall", version = "0.1.0" }
+trodden-redact = { path = "crates/trodden-redact", version = "0.1.0" }
+trodden-store = { path = "crates/trodden-store", version = "0.1.0" }
+anyhow = "1.0.104"
+regex = "1.13.1"
+jiff = { version = "0.2.37", default-features = false, features = ["serde", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+unwrap_used = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

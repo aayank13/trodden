@@ -1,0 +1,185 @@
+mod ingest;
+mod learning;
+mod procedures;
+mod schema;
+mod terms;
+
+use std::{path::Path, time::Duration};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+
+pub use ingest::{ExtractionRecord, Progress};
+pub use learning::{Cue, FamilyEvidence, Injection, InjectionRecord, OutcomeSummary, Usage};
+pub use procedures::{EntityHit, Forget, LexicalHit, ProcedureRow, Upsert};
+pub use terms::Terms;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Patience {
+    Batch,
+    Interactive,
+}
+
+impl Patience {
+    fn timeout(self) -> Duration {
+        match self {
+            Self::Batch => Duration::from_secs(5),
+            Self::Interactive => Duration::from_millis(50),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    pub fn open(path: &Path, patience: Patience) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)
+            .with_context(|| format!("open {}", path.display()))?;
+        conn.busy_timeout(patience.timeout())
+            .context("set the busy timeout")?;
+        if patience == Patience::Batch {
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .context("configure the database")?;
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")
+            .context("configure durability")?;
+        let mut store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("open an in-memory database")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .context("configure the database")?;
+        let mut store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn paused(&self) -> Result<bool> {
+        Ok(self.setting("paused")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_paused(&self, paused: bool) -> Result<()> {
+        self.set_setting("paused", if paused { "1" } else { "0" })
+    }
+
+    pub fn holdout_rate(&self) -> Result<Option<f64>> {
+        self.setting("holdout")?
+            .map(|rate| rate.parse().context("parse the holdout rate"))
+            .transpose()
+    }
+
+    pub fn set_holdout_rate(&self, rate: Option<f64>) -> Result<()> {
+        match rate {
+            Some(rate) => self.set_setting("holdout", &rate.to_string()),
+            None => self.clear_setting("holdout"),
+        }
+    }
+
+    pub fn verify_reminder(&self) -> Result<bool> {
+        Ok(self.setting("verify_reminder")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_verify_reminder(&self, on: bool) -> Result<()> {
+        self.set_setting("verify_reminder", if on { "1" } else { "0" })
+    }
+
+    pub fn embedding_scheme(&self) -> Result<Option<String>> {
+        self.setting("embedding_scheme")
+    }
+
+    pub fn set_embedding_scheme(&self, scheme: &str) -> Result<()> {
+        self.set_setting("embedding_scheme", scheme)
+    }
+
+    fn clear_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", [key])
+            .with_context(|| format!("clear setting {key}"))?;
+        Ok(())
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .with_context(|| format!("read setting {key}"))
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .with_context(|| format!("write setting {key}"))?;
+        Ok(())
+    }
+
+    pub fn repo_for_root(&self, root: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT repo FROM repos WHERE root = ?1", [root], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("look up a repository id")
+    }
+
+    pub fn remember_repo(&self, root: &str, repo: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO repos (root, repo) VALUES (?1, ?2)
+                 ON CONFLICT (root) DO UPDATE SET repo = excluded.repo",
+                params![root, repo],
+            )
+            .context("cache a repository id")?;
+        Ok(())
+    }
+
+    pub fn stats(&self) -> Result<Stats> {
+        self.conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(DISTINCT id) FROM procedures WHERE state != 'retired'),
+                    (SELECT COUNT(*) FROM procedures),
+                    (SELECT COUNT(*) FROM sessions),
+                    (SELECT COUNT(*) FROM extractions WHERE procedure IS NULL),
+                    (SELECT COUNT(*) FROM injections WHERE NOT holdout)",
+                [],
+                |row| {
+                    let count = |index| {
+                        row.get::<_, i64>(index)
+                            .map(|n| u64::try_from(n).unwrap_or(0))
+                    };
+                    Ok(Stats {
+                        procedures: count(0)?,
+                        revisions: count(1)?,
+                        sessions: count(2)?,
+                        rejections: count(3)?,
+                        injections: count(4)?,
+                    })
+                },
+            )
+            .context("count store contents")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub procedures: u64,
+    pub revisions: u64,
+    pub sessions: u64,
+    pub rejections: u64,
+    pub injections: u64,
+}
