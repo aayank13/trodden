@@ -219,9 +219,11 @@ impl Command {
         if fresh {
             println!(
                 "\nTrodden now learns from Claude Code sessions in this account. It stores\n\
-                 commands, file paths, touched function names and exit codes, with secrets\n\
-                 redacted. It never stores file contents, tool output or full prompts, and\n\
-                 makes no network calls. `trodden pause` stops it; `trodden forget` deletes."
+                 the first line of each prompt (up to 200 characters), commands, file paths,\n\
+                 touched function names, exit codes and one normalized line per error, with\n\
+                 secrets redacted. It never stores file contents, other tool output or the\n\
+                 rest of a prompt, and makes no network calls. `trodden pause` stops it;\n\
+                 `trodden forget` deletes."
             );
         }
         println!("\nNext steps:");
