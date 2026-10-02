@@ -106,7 +106,9 @@ impl Ingest {
         let ended = ended || Self::is_idle(transcript);
         let session = trace.session.as_str().to_owned();
         let progress = self.store.progress(&session)?;
-        if progress.is_some_and(|progress| progress.ended) {
+        let already = progress.and_then(|progress| progress.extracted_through);
+        let last_seq = trace.events.last().map(|event| event.seq);
+        if progress.is_some_and(|progress| progress.ended) && last_seq <= already {
             return Ok(IngestReport::default());
         }
 
@@ -118,7 +120,6 @@ impl Ingest {
         );
         let workspace = Workspace::resolve(&cwd, &self.store)?;
         trace.commit = workspace.head();
-        let already = progress.and_then(|progress| progress.extracted_through);
         let mut report = IngestReport {
             sessions: 1,
             ..IngestReport::default()
@@ -134,13 +135,16 @@ impl Ingest {
             if already.is_some_and(|done| extraction.last_seq <= done) {
                 continue;
             }
-            report.tasks += 1;
-            extracted_through = Some(extraction.last_seq);
             tasks.push(TaskSpan {
                 first_seq: extraction.first_seq,
                 last_seq: extraction.last_seq,
                 outcome: extraction.outcome,
             });
+            if already.is_some_and(|done| extraction.first_seq <= done) {
+                continue;
+            }
+            report.tasks += 1;
+            extracted_through = Some(extraction.last_seq);
             let (procedure, rejection) = match extraction.result {
                 Ok(procedure) => {
                     let upsert = self.store.upsert(&procedure)?;
@@ -187,7 +191,11 @@ impl Ingest {
             &transcript.to_string_lossy(),
             Some(workspace.repo.as_str()),
             Progress {
-                extracted_through,
+                extracted_through: if ended {
+                    last_seq.max(extracted_through)
+                } else {
+                    extracted_through
+                },
                 ended,
             },
             &stamp,
@@ -286,5 +294,202 @@ impl Ingest {
 
     fn reason_kind(reason: &str) -> String {
         reason.split(':').next().unwrap_or(reason).to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use serde_json::{Value, json};
+    use trodden_store::{Cue, Injection};
+
+    use super::*;
+
+    const SESSION: &str = "0f6c1c4e-2f3a-4b8e-9d1a-5b2c3d4e5f60";
+    const CWD: &str = "/home/dev/shop";
+
+    struct Scratch {
+        dir: PathBuf,
+        transcript: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("trodden-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch directory is writable");
+            let transcript = dir.join("session.jsonl");
+            Self { dir, transcript }
+        }
+
+        fn ingest(&self) -> Ingest {
+            let home = Home::at(self.dir.join("home"));
+            home.initialize().expect("home initializes");
+            Ingest::start(&home).expect("ingest starts")
+        }
+
+        fn append(&self, lines: &[Value]) {
+            let mut file = File::options()
+                .create(true)
+                .append(true)
+                .open(&self.transcript)
+                .expect("transcript is writable");
+            for line in lines {
+                writeln!(file, "{line}").expect("transcript line is written");
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn at(minute: u32, second: u32) -> String {
+        format!("2026-10-01T10:{minute:02}:{second:02}Z")
+    }
+
+    fn line(minute: u32, second: u32, kind: &str, message: Value) -> Value {
+        json!({
+            "type": kind,
+            "sessionId": SESSION,
+            "cwd": CWD,
+            "timestamp": at(minute, second),
+            "message": message,
+        })
+    }
+
+    fn task(minute: u32, prompt: &str, file: &str) -> Vec<Value> {
+        let path = format!("{CWD}/{file}");
+        let edit = format!("edit-{minute}");
+        let test = format!("test-{minute}");
+        let mut edited = line(
+            minute,
+            20,
+            "user",
+            json!({"content": [{"type": "tool_result", "tool_use_id": edit, "content": "ok"}]}),
+        );
+        edited["toolUseResult"] = json!({
+            "filePath": path,
+            "originalFile": "module.exports = 1;\n",
+            "structuredPatch": [{
+                "oldStart": 1,
+                "lines": ["-module.exports = 1;", "+module.exports = 2;"],
+            }],
+        });
+        vec![
+            line(minute, 0, "user", json!({"content": prompt})),
+            line(
+                minute,
+                10,
+                "assistant",
+                json!({"content": [{"type": "tool_use", "id": edit, "name": "Edit", "input": {"file_path": path}}]}),
+            ),
+            edited,
+            line(
+                minute,
+                30,
+                "assistant",
+                json!({"content": [{"type": "tool_use", "id": test, "name": "Bash", "input": {"command": "npm test"}}]}),
+            ),
+            line(
+                minute,
+                40,
+                "user",
+                json!({"content": [{"type": "tool_result", "tool_use_id": test, "content": "pass 3"}]}),
+            ),
+        ]
+    }
+
+    fn inject(ingest: &Ingest, minute: u32) {
+        let row = ingest
+            .store
+            .list(None, true)
+            .expect("procedures list")
+            .remove(0);
+        ingest
+            .store
+            .record_injection(&Injection {
+                session: SESSION.to_owned(),
+                procedure: row.procedure.id.to_string(),
+                revision: row.procedure.revision,
+                holdout: false,
+                cue: Cue::Prompt,
+                at: at(minute, 0).parse().expect("timestamp is valid"),
+            })
+            .expect("injection is recorded");
+    }
+
+    #[test]
+    fn resumed_sessions_are_learned_from_after_ending() {
+        let scratch = Scratch::new("resumed");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let first = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("first ingest");
+        assert_eq!((first.sessions, first.tasks, first.created), (1, 1, 1));
+
+        scratch.append(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        inject(&ingest, 5);
+        let running = ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest while resumed");
+        assert_eq!(
+            (running.sessions, running.tasks, running.settled),
+            (1, 0, 0)
+        );
+
+        let resumed = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest after resuming");
+        assert_eq!(
+            (resumed.sessions, resumed.tasks, resumed.settled),
+            (1, 1, 1)
+        );
+
+        let again = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest with nothing new");
+        assert_eq!(again, IngestReport::default());
+    }
+
+    #[test]
+    fn follow_ups_after_resuming_join_the_extracted_task() {
+        let scratch = Scratch::new("follow-up");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("first ingest");
+
+        scratch.append(&task(5, "still failing", "src/paginate.js"));
+        inject(&ingest, 5);
+        let resumed = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest after resuming");
+        assert_eq!(
+            (resumed.sessions, resumed.tasks, resumed.settled),
+            (1, 0, 1)
+        );
+
+        let again = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest with nothing new");
+        assert_eq!(again, IngestReport::default());
     }
 }
