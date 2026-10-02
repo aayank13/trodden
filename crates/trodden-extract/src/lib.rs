@@ -268,14 +268,30 @@ impl<'a> Builder<'a> {
                     || self.checks.find(command).is_some()
             })
         };
+        let failure = |call: &Call<'_>| Rejection::VerificationFailed {
+            command: Verification::clean(call.command().unwrap_or_default()),
+        };
         let after_edit = || self.calls.iter().enumerate().skip(last_edit + 1);
         let (index, call) = after_edit()
             .rfind(|(_, call)| is_check(call))
             .ok_or(Rejection::NotVerified)?;
         if !call.succeeded() {
-            return Err(Rejection::VerificationFailed {
-                command: Verification::clean(call.command().unwrap_or_default()),
-            });
+            return Err(failure(call));
+        }
+        let unresolved = after_edit().find(|&(at, failed)| {
+            is_check(failed)
+                && !failed.succeeded()
+                && !self.calls[at + 1..].iter().any(|later| {
+                    is_check(later)
+                        && later.succeeded()
+                        && Verification::covers(
+                            later.command().unwrap_or_default(),
+                            failed.command().unwrap_or_default(),
+                        )
+                })
+        });
+        if let Some((_, failed)) = unresolved {
+            return Err(failure(failed));
         }
         let Some(strongest) = self.checks.strongest() else {
             return Ok(index);
@@ -467,6 +483,7 @@ impl<'a> Builder<'a> {
                                 } else {
                                     Verification::is_verify(other)
                                         && Verification::is_verify(command)
+                                        && Verification::covers(other, command)
                                 }
                         })
                 });
@@ -882,6 +899,76 @@ mod tests {
             })
         );
         assert_eq!(read_only.extract_one(), Err(Rejection::NoEdits));
+    }
+
+    #[test]
+    fn stores_checks_without_tails_that_hide_their_result() {
+        for command in [
+            "npm test 2>&1 | tail -5",
+            "npm test || true",
+            "npm test; echo ok",
+        ] {
+            let procedure = Sketch::new()
+                .prompt("Fix the pagination bug in the catalog")
+                .edit("src/paginate.js", &[])
+                .run(command, 0)
+                .extract_one()
+                .expect("the check passed");
+
+            assert_eq!(
+                procedure.verify.map(|verify| verify.command).as_deref(),
+                Some("npm test"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_check_needs_a_later_pass_of_the_same_kind() {
+        let checked = |runs: &[(&str, i32)]| {
+            runs.iter()
+                .fold(
+                    Sketch::new()
+                        .prompt("Fix the pagination bug in the catalog")
+                        .edit("src/paginate.js", &[]),
+                    |sketch, (command, exit_code)| sketch.run(command, *exit_code),
+                )
+                .extract_one()
+        };
+        let failed = |command: &str| {
+            Err(Rejection::VerificationFailed {
+                command: command.to_owned(),
+            })
+        };
+
+        assert_eq!(
+            checked(&[("cargo test", 101), ("cargo build", 0)]),
+            failed("cargo test")
+        );
+        assert_eq!(
+            checked(&[("pytest", 1), ("ruff check .", 0)]),
+            failed("pytest")
+        );
+        assert_eq!(
+            checked(&[("cargo clippy", 101), ("cargo test", 0)]),
+            failed("cargo clippy")
+        );
+        assert!(checked(&[("cargo test", 101), ("cargo test", 0)]).is_ok());
+        assert!(checked(&[("node --test test/", 1), ("npm test", 0)]).is_ok());
+    }
+
+    #[test]
+    fn does_not_teach_swapping_tests_for_a_build() {
+        let procedure = Sketch::new()
+            .prompt("Fix the pagination bug in the catalog")
+            .run("cargo test", 101)
+            .run("cargo build", 0)
+            .edit("src/paginate.js", &[])
+            .run("cargo build", 0)
+            .extract_one()
+            .expect("the build passed after the edit");
+
+        assert!(procedure.avoid.is_empty(), "{:?}", procedure.avoid);
     }
 
     #[test]

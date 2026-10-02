@@ -25,7 +25,7 @@ static PASSWORD_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("password value pattern is valid")
 });
 
-static ANSI: LazyLock<Regex> =
+pub(crate) static ANSI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").expect("escape pattern is valid"));
 
 static VOLATILE: LazyLock<[(Regex, &str); 4]> = LazyLock::new(|| {
