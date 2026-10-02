@@ -4,7 +4,11 @@ mod index;
 mod kind;
 mod skeleton;
 
-use std::{collections::HashMap, env, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
@@ -23,6 +27,10 @@ pub use kind::TaskKind;
 pub use skeleton::Skeleton;
 
 const STAGE_LIMIT: usize = 10;
+
+const MAX_PROMPT_BYTES: usize = 16 * 1024;
+
+const MAX_TERMS: usize = 512;
 
 const RRF_K: f64 = 60.0;
 
@@ -207,7 +215,8 @@ impl<'a> Recall<'a> {
     }
 
     fn candidates(&mut self, query: &Query<'_>) -> Result<Vec<Match>> {
-        let terms = Terms::of(query.prompt);
+        let prompt = Self::bounded(query.prompt);
+        let terms = Self::terms(prompt);
         let mut signals: HashMap<i64, Signals> = HashMap::new();
 
         let mut keys = terms.clone();
@@ -236,7 +245,7 @@ impl<'a> Recall<'a> {
         }
         if let Some((embedder, index)) = &mut self.semantic
             && let Some(embedding) = embedder
-                .embed(Skeleton::of(query.prompt).as_str())
+                .embed(Skeleton::of(prompt).as_str())
                 .context("embed the prompt")?
         {
             for (rank, neighbor) in index
@@ -265,8 +274,8 @@ impl<'a> Recall<'a> {
             s.fused += s.semantic.map_or(0.0, |(rank, _)| Self::rrf(rank));
         }
 
-        let query_kind = TaskKind::of(query.prompt);
-        let requested = Artifacts::requested(query.prompt);
+        let query_kind = TaskKind::of(prompt);
+        let requested = Artifacts::requested(prompt);
         let mut candidates = Vec::with_capacity(signals.len());
         for (rowid, mut signals) in signals {
             if let Some(row) = self.store.procedure(rowid)? {
@@ -290,6 +299,21 @@ impl<'a> Recall<'a> {
                 .then(a.row.rowid.cmp(&b.row.rowid))
         });
         Ok(candidates)
+    }
+
+    fn bounded(prompt: &str) -> &str {
+        &prompt[..prompt.floor_char_boundary(MAX_PROMPT_BYTES)]
+    }
+
+    fn terms(prompt: &str) -> Vec<String> {
+        let terms = Terms::of(prompt);
+        let mut seen = HashSet::new();
+        terms
+            .iter()
+            .filter(|term| seen.insert(term.as_str()))
+            .take(MAX_TERMS)
+            .cloned()
+            .collect()
     }
 
     fn rrf(rank: usize) -> f64 {
@@ -404,5 +428,64 @@ impl Preconditions {
                 candidate.is_file() || (cfg!(windows) && candidate.with_extension("exe").is_file())
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use trodden_core::Procedure;
+
+    use super::*;
+
+    const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
+
+    const PROMPT: &str =
+        "Page 2 of the listing repeats the last item. Fix the pagination in src/paginate.js.";
+
+    fn outcome(store: &Store, prompt: &str) -> Outcome {
+        Recall::new(store, None)
+            .seeded(7)
+            .recall(&Query {
+                prompt,
+                repo: REPO,
+                root: Path::new("."),
+                session: None,
+            })
+            .expect("recall succeeds")
+    }
+
+    #[test]
+    fn recalls_the_same_despite_a_huge_paste() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut procedure = Procedure::example();
+        procedure.preconditions.clear();
+        store.upsert(&procedure).expect("procedure stores");
+        let paste: String = (0..200_000).map(|n| format!("w{n:x} ")).collect();
+
+        let expected = outcome(&store, PROMPT);
+
+        assert!(matches!(expected.decision, Decision::Inject(_)));
+        assert_eq!(outcome(&store, &format!("{PROMPT}\n{paste}")), expected);
+    }
+
+    #[test]
+    fn cuts_long_prompts_on_a_char_boundary() {
+        let long = "€".repeat(MAX_PROMPT_BYTES);
+
+        assert_eq!(Recall::bounded(PROMPT), PROMPT);
+        assert_eq!(Recall::bounded(&long).len(), MAX_PROMPT_BYTES / 3 * 3);
+    }
+
+    #[test]
+    fn keeps_the_first_unique_terms() {
+        let words: String = (0..2 * MAX_TERMS).map(|n| format!("w{n} w{n} ")).collect();
+
+        assert_eq!(
+            Recall::terms("fix src/a.rs then fix src/a.rs"),
+            ["fix", "src/a.rs"]
+        );
+        let terms = Recall::terms(&words);
+        assert_eq!(terms.len(), MAX_TERMS);
+        assert_eq!(terms[MAX_TERMS - 1], format!("w{}", MAX_TERMS - 1));
     }
 }

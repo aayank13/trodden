@@ -304,9 +304,7 @@ impl Embedder {
     }
 
     pub fn token_ids(&self, text: &str) -> Vec<u32> {
-        let mut ids = Tokenizer::encode(text, self);
-        ids.truncate(MAX_TOKENS);
-        ids
+        Tokenizer::encode(text, self, MAX_TOKENS)
     }
 
     fn entry(&self, position: usize) -> (&[u8], u32) {
