@@ -108,11 +108,7 @@ impl VectorIndex {
 
     pub fn search(&mut self, query: &Embedding, repo: &str, limit: usize) -> Result<Vec<Neighbor>> {
         let query_words = Self::words(&Quantized::query_code(query));
-        let mut ranges: Vec<(usize, usize)> = [repo, ""]
-            .iter()
-            .filter_map(|repo| self.groups.get(&Self::repo_hash(repo)).copied())
-            .collect();
-        ranges.dedup();
+        let ranges = self.ranges(repo);
 
         let total = ranges.iter().map(|(_, len)| len).sum();
         let mut closest: Vec<(u32, usize)> = Vec::with_capacity(total);
@@ -155,6 +151,51 @@ impl VectorIndex {
         Ok(neighbors)
     }
 
+    pub fn cosines(
+        &mut self,
+        query: &Embedding,
+        repo: &str,
+        rowids: &[i64],
+    ) -> Result<Vec<Neighbor>> {
+        let mut neighbors: Vec<Neighbor> = Vec::with_capacity(rowids.len());
+        if rowids.is_empty() {
+            return Ok(neighbors);
+        }
+        let mut vector = [0; QUANTIZED_LEN];
+        for (start, len) in self.ranges(repo) {
+            let mut ids = vec![0; len * 8];
+            self.read_at(self.rowids_offset() + start * 8, &mut ids)?;
+            for (offset, id) in ids.as_chunks::<8>().0.iter().enumerate() {
+                let rowid = i64::from_le_bytes(*id);
+                if !rowids.contains(&rowid) {
+                    continue;
+                }
+                self.read_at(
+                    self.vectors_offset() + (start + offset) * QUANTIZED_LEN,
+                    &mut vector,
+                )?;
+                let cosine = Quantized::from_array(&vector).cosine(query);
+                match neighbors
+                    .iter_mut()
+                    .find(|neighbor| neighbor.rowid == rowid)
+                {
+                    Some(neighbor) => neighbor.cosine = neighbor.cosine.max(cosine),
+                    None => neighbors.push(Neighbor { rowid, cosine }),
+                }
+            }
+        }
+        Ok(neighbors)
+    }
+
+    fn ranges(&self, repo: &str) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = [repo, ""]
+            .iter()
+            .filter_map(|repo| self.groups.get(&Self::repo_hash(repo)).copied())
+            .collect();
+        ranges.dedup();
+        ranges
+    }
+
     fn words(code: &[u8; CODE_LEN]) -> [u64; CODE_LEN / 8] {
         std::array::from_fn(|word| {
             u64::from_le_bytes(std::array::from_fn(|byte| code[word * 8 + byte]))
@@ -186,5 +227,60 @@ impl VectorIndex {
         repo.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use trodden_embed::DIMS;
+
+    use super::*;
+
+    fn direction(weights: &[(usize, f32)]) -> Embedding {
+        let mut embedding = [0.0; DIMS];
+        for (axis, weight) in weights {
+            embedding[*axis] = *weight;
+        }
+        embedding
+    }
+
+    #[test]
+    fn looks_up_the_best_cosine_of_given_procedures_in_a_repository() {
+        let row = |rowid: i64, repo: &str, weights: &[(usize, f32)]| {
+            (
+                rowid,
+                repo.to_owned(),
+                Quantized::new(&direction(weights)).to_bytes(),
+            )
+        };
+        let rows = vec![
+            row(1, "repo-a", &[(1, 1.0)]),
+            row(1, "repo-a", &[(0, 1.0)]),
+            row(2, "repo-a", &[(0, 1.0)]),
+            row(3, "repo-b", &[(0, 1.0)]),
+            row(4, "", &[(0, 0.6), (1, 0.8)]),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("trodden-cosines-{}.index", std::process::id()));
+        VectorIndex::build(&rows, &path).expect("index builds");
+        let mut index = VectorIndex::open(&path).expect("index opens");
+
+        let mut cosines = index
+            .cosines(&direction(&[(0, 1.0)]), "repo-a", &[1, 3, 4, 9])
+            .expect("index looks up cosines");
+        fs::remove_file(&path).expect("index is removable");
+
+        cosines.sort_by_key(|neighbor| neighbor.rowid);
+        let rowids: Vec<i64> = cosines.iter().map(|neighbor| neighbor.rowid).collect();
+        assert_eq!(
+            rowids,
+            [1, 4],
+            "repo-b's and unindexed procedures are excluded"
+        );
+        assert!(
+            (cosines[0].cosine - 1.0).abs() < 0.01,
+            "best of a procedure's vectors"
+        );
+        assert!((cosines[1].cosine - 0.6).abs() < 0.01);
     }
 }
