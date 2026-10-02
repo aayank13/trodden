@@ -184,7 +184,11 @@ impl Store {
             let state = Self::parse_state(state);
             if !matches!(
                 state,
-                Lifecycle::Active | Lifecycle::Stale | Lifecycle::Candidate
+                Lifecycle::Active
+                    | Lifecycle::Stale
+                    | Lifecycle::Candidate
+                    | Lifecycle::Quarantined
+                    | Lifecycle::Retired
             ) {
                 continue;
             }
@@ -614,4 +618,76 @@ pub enum Forget<'a> {
     Procedure(&'a str),
     Repo(&'a str),
     All,
+}
+
+#[cfg(test)]
+mod tests {
+    use trodden_core::{SessionId, procedure::StepKind};
+
+    use super::*;
+
+    const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
+
+    fn relearned(state: Lifecycle, check: &str) -> (Upsert, Store) {
+        let mut store = Store::open_in_memory().expect("store opens");
+        store.upsert(&Procedure::example()).expect("stored");
+        store
+            .set_states("p_7f3a91c2", &[(1, state)])
+            .expect("state changes");
+        let mut later = Procedure::example();
+        later.provenance.sources[0].session =
+            SessionId::new("9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58");
+        later
+            .steps
+            .iter_mut()
+            .rfind(|step| step.kind == StepKind::Verify)
+            .expect("the example has a check")
+            .command = Some(check.to_owned());
+        let upsert = store.upsert(&later).expect("stored");
+        (upsert, store)
+    }
+
+    fn states(store: &Store) -> Vec<(u32, Lifecycle)> {
+        store
+            .revisions("p_7f3a91c2")
+            .expect("revisions read")
+            .iter()
+            .map(|row| (row.procedure.revision, row.procedure.state))
+            .collect()
+    }
+
+    fn recallable(store: &Store) -> bool {
+        !store
+            .entity_hits(&["paginate".to_owned()], REPO)
+            .expect("entities read")
+            .is_empty()
+    }
+
+    #[test]
+    fn relearning_a_quarantined_procedure_keeps_it_quarantined() {
+        for (check, expected) in [
+            ("npm test", Upsert::Refreshed { rowid: 1 }),
+            ("npm check", Upsert::Generalized { rowid: 1 }),
+        ] {
+            let (upsert, store) = relearned(Lifecycle::Quarantined, check);
+
+            assert_eq!(upsert, expected, "`{check}`");
+            assert_eq!(states(&store), [(1, Lifecycle::Quarantined)], "`{check}`");
+            assert!(!recallable(&store), "`{check}`");
+        }
+    }
+
+    #[test]
+    fn relearning_a_retired_procedure_keeps_it_retired() {
+        for (check, expected) in [
+            ("npm test", Upsert::Refreshed { rowid: 1 }),
+            ("npm check", Upsert::Generalized { rowid: 1 }),
+        ] {
+            let (upsert, store) = relearned(Lifecycle::Retired, check);
+
+            assert_eq!(upsert, expected, "`{check}`");
+            assert_eq!(states(&store), [(1, Lifecycle::Retired)], "`{check}`");
+            assert!(!recallable(&store), "`{check}`");
+        }
+    }
 }
