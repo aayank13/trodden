@@ -561,6 +561,13 @@ impl Command {
             (None, None, false) => bail!("say what to forget: an id, --repo or --all"),
         };
         let deleted = store.forget(target)?;
+        if let Forget::Procedure(id) = target {
+            ensure!(deleted > 0, "no procedure {id}");
+        }
+        let log = home.hook_log();
+        if matches!(target, Forget::All) && log.exists() {
+            fs::remove_file(&log).with_context(|| format!("remove {}", log.display()))?;
+        }
         Ingest::start(home)?.rebuild_index()?;
         println!("Deleted {deleted} revision(s).");
         Ok(())
@@ -654,5 +661,67 @@ impl Command {
             .map(|dir| dir.join(program))
             .find(|candidate| candidate.is_file())
             .with_context(|| format!("`{program}` not found"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch {
+        home: Home,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("trodden-cli-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let home = Home::at(dir);
+            home.initialize().expect("home initializes");
+            Self { home }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.home.dir());
+        }
+    }
+
+    #[test]
+    fn forgetting_an_unknown_procedure_fails() {
+        let scratch = Scratch::new("forget-unknown");
+
+        let error = Command::forget(&scratch.home, Some("p_doesnotexist"), false, false)
+            .expect_err("unknown ids are reported");
+
+        assert_eq!(error.to_string(), "no procedure p_doesnotexist");
+    }
+
+    #[test]
+    fn forgetting_everything_removes_the_hook_log_and_repositories() {
+        let scratch = Scratch::new("forget-all");
+        let home = &scratch.home;
+        fs::write(
+            home.hook_log(),
+            "2026-10-01T10:00:00Z parse the hook payload\n",
+        )
+        .expect("hook log is writable");
+        home.open_store(Patience::Batch)
+            .expect("store opens")
+            .remember_repo("/home/dev/shop", "path-5f0c1d2e3a4b6978")
+            .expect("repository remembered");
+
+        Command::forget(home, None, false, true).expect("everything is forgotten");
+
+        assert!(!home.hook_log().exists());
+        assert_eq!(
+            home.open_store(Patience::Batch)
+                .expect("store opens")
+                .repo_for_root("/home/dev/shop")
+                .expect("repos read"),
+            None
+        );
+        Command::forget(home, None, false, true).expect("forgetting again is harmless");
     }
 }

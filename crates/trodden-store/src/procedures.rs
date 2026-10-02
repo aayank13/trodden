@@ -540,15 +540,26 @@ impl Store {
     }
 
     pub fn forget(&mut self, target: Forget<'_>) -> Result<usize> {
-        let (condition, value) = match target {
-            Forget::Procedure(id) => ("id = ?1", Some(id)),
-            Forget::Repo(repo) => ("repo = ?1", Some(repo)),
-            Forget::All => ("?1 IS NULL", None),
+        let (condition, injected, value) = match target {
+            Forget::Procedure(id) => ("id = ?1", "procedure = ?1", Some(id)),
+            Forget::Repo(repo) => (
+                "repo = ?1",
+                "procedure IN (SELECT id FROM procedures WHERE repo = ?1)",
+                Some(repo),
+            ),
+            Forget::All => ("?1 IS NULL", "?1 IS NULL", None),
         };
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start forgetting")?;
+        tx.execute(&format!("DELETE FROM injections WHERE {injected}"), [value])
+            .context("delete the injections of forgotten procedures")?;
+        tx.execute(
+            &format!("DELETE FROM extractions WHERE procedure IN (SELECT rowid FROM procedures WHERE {condition})"),
+            [value],
+        )
+        .context("delete the tasks forgotten procedures were learned from")?;
         tx.execute(
             &format!("DELETE FROM procedures_fts WHERE rowid IN (SELECT rowid FROM procedures WHERE {condition})"),
             [value],
@@ -561,10 +572,8 @@ impl Store {
             )
             .context("delete forgotten procedures")?;
         if matches!(target, Forget::All) {
-            tx.execute_batch(
-                "DELETE FROM extractions; DELETE FROM sessions; DELETE FROM injections;",
-            )
-            .context("delete ingest history")?;
+            tx.execute_batch("DELETE FROM extractions; DELETE FROM sessions; DELETE FROM repos;")
+                .context("delete ingest history")?;
         }
         tx.commit().context("commit forgetting")?;
         Ok(deleted)
@@ -623,10 +632,14 @@ pub enum Forget<'a> {
 #[cfg(test)]
 mod tests {
     use trodden_core::{SessionId, procedure::StepKind};
+    use trodden_learn::Evidence;
 
     use super::*;
+    use crate::{Cue, ExtractionRecord, FamilyEvidence, Injection, Stats};
 
     const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
+
+    const SESSION: &str = "0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90";
 
     fn relearned(state: Lifecycle, check: &str) -> (Upsert, Store) {
         let mut store = Store::open_in_memory().expect("store opens");
@@ -661,6 +674,151 @@ mod tests {
             .entity_hits(&["paginate".to_owned()], REPO)
             .expect("entities read")
             .is_empty()
+    }
+
+    fn learned_and_injected(store: &mut Store) {
+        let rowid = store.upsert(&Procedure::example()).expect("stored").rowid();
+        for (first_seq, procedure, rejection) in [
+            (0, Some(rowid), None),
+            (8, None, Some("no files were changed")),
+        ] {
+            store
+                .record_extraction(&ExtractionRecord {
+                    session: SESSION.to_owned(),
+                    first_seq,
+                    summary: "Page 2 repeats the last product".to_owned(),
+                    procedure,
+                    rejection: rejection.map(str::to_owned),
+                    outcome: Some("succeeded".to_owned()),
+                    tool_calls: Some(6),
+                    span: None,
+                    at: "2026-09-21T14:02:44Z".to_owned(),
+                })
+                .expect("extraction recorded");
+        }
+        for procedure in ["p_7f3a91c2", "p_0c4e2a9b"] {
+            store
+                .record_injection(&Injection {
+                    session: SESSION.to_owned(),
+                    procedure: procedure.to_owned(),
+                    revision: 1,
+                    holdout: false,
+                    cue: Cue::Prompt,
+                    at: "2026-09-21T14:03:00Z".parse().expect("timestamp is valid"),
+                })
+                .expect("injection recorded");
+        }
+        let injections = store.injections(None).expect("injections read");
+        for record in &injections {
+            store
+                .settle_injection(record, 8, "failed")
+                .expect("injection settled");
+        }
+    }
+
+    fn injected(store: &Store) -> Vec<String> {
+        store
+            .injections(None)
+            .expect("injections read")
+            .into_iter()
+            .map(|record| record.injection.procedure)
+            .collect()
+    }
+
+    #[test]
+    fn forgetting_a_procedure_deletes_its_injections_and_learned_tasks() {
+        for target in [Forget::Procedure("p_7f3a91c2"), Forget::Repo(REPO)] {
+            let mut store = Store::open_in_memory().expect("store opens");
+            learned_and_injected(&mut store);
+
+            let deleted = store.forget(target).expect("forgotten");
+
+            assert_eq!(deleted, 1, "{target:?}");
+            assert_eq!(injected(&store), ["p_0c4e2a9b"], "{target:?}");
+            let stats = store.stats().expect("stats read");
+            assert_eq!((stats.rejections, stats.injections), (1, 1), "{target:?}");
+            assert_eq!(
+                store.rejections(10).expect("rejections read").len(),
+                1,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relearned_procedure_starts_without_the_forgotten_evidence() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        learned_and_injected(&mut store);
+        assert_eq!(
+            store
+                .family_evidence("p_7f3a91c2")
+                .expect("evidence read")
+                .injected(),
+            Evidence::new(0, 1)
+        );
+
+        store
+            .forget(Forget::Procedure("p_7f3a91c2"))
+            .expect("forgotten");
+        store.upsert(&Procedure::example()).expect("relearned");
+
+        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
+        assert_eq!(
+            store.family_evidence("p_7f3a91c2").expect("evidence read"),
+            FamilyEvidence {
+                revisions: vec![(1, Lifecycle::Active, Evidence::default())],
+                holdout: Evidence::default(),
+            }
+        );
+        assert!(
+            store
+                .outcome_summaries()
+                .expect("summaries read")
+                .iter()
+                .all(|summary| summary.procedure != "p_7f3a91c2")
+        );
+    }
+
+    #[test]
+    fn forgetting_an_unknown_procedure_deletes_nothing_else() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        learned_and_injected(&mut store);
+
+        let deleted = store
+            .forget(Forget::Procedure("p_doesnotexist"))
+            .expect("forgetting is harmless");
+
+        assert_eq!(deleted, 0);
+        assert_eq!(injected(&store), ["p_7f3a91c2", "p_0c4e2a9b"]);
+        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
+    }
+
+    #[test]
+    fn forgetting_everything_also_forgets_repositories() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        learned_and_injected(&mut store);
+        store
+            .remember_repo("/home/dev/shop", REPO)
+            .expect("repository remembered");
+
+        let deleted = store.forget(Forget::All).expect("forgotten");
+
+        assert_eq!(deleted, 1);
+        assert!(injected(&store).is_empty());
+        assert_eq!(
+            store.repo_for_root("/home/dev/shop").expect("repos read"),
+            None
+        );
+        assert_eq!(
+            store.stats().expect("stats read"),
+            Stats {
+                procedures: 0,
+                revisions: 0,
+                sessions: 0,
+                rejections: 0,
+                injections: 0,
+            }
+        );
     }
 
     #[test]
