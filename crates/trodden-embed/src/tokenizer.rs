@@ -12,12 +12,16 @@ pub(crate) trait Vocabulary {
 pub(crate) struct Tokenizer;
 
 impl Tokenizer {
-    pub(crate) fn encode(text: &str, vocab: &impl Vocabulary) -> Vec<u32> {
+    pub(crate) fn encode(text: &str, vocab: &impl Vocabulary, limit: usize) -> Vec<u32> {
         let normalized = Self::normalize(text);
         let mut ids = Vec::new();
         for word in Self::pre_tokenize(&normalized) {
+            if ids.len() >= limit {
+                break;
+            }
             Self::word_piece(word, vocab, &mut ids);
         }
+        ids.truncate(limit);
         ids
     }
 
@@ -114,7 +118,7 @@ impl Tokenizer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{cell::Cell, collections::HashMap};
 
     use super::*;
 
@@ -123,6 +127,15 @@ mod tests {
     impl Vocabulary for Tokens {
         fn id(&self, token: &str) -> Option<u32> {
             self.0.get(token).copied()
+        }
+    }
+
+    struct Counted(Tokens, Cell<usize>);
+
+    impl Vocabulary for Counted {
+        fn id(&self, token: &str) -> Option<u32> {
+            self.1.set(self.1.get() + 1);
+            self.0.id(token)
         }
     }
 
@@ -138,7 +151,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            Tokenizer::encode("Paginate(items) Café", &vocab),
+            Tokenizer::encode("Paginate(items) Café", &vocab, usize::MAX),
             [1, 2, 3, 5, 4, 6]
         );
     }
@@ -147,6 +160,17 @@ mod tests {
     fn drops_words_with_unknown_pieces() {
         let vocab = Tokens(HashMap::from([("fix", 1), ("it", 2)]));
 
-        assert_eq!(Tokenizer::encode("fix zzz it", &vocab), [1, 2]);
+        assert_eq!(Tokenizer::encode("fix zzz it", &vocab, usize::MAX), [1, 2]);
+    }
+
+    #[test]
+    fn stops_looking_up_pieces_at_the_limit() {
+        let vocab = Counted(Tokens(HashMap::from([("fix", 1), ("it", 2)])), Cell::new(0));
+
+        assert_eq!(
+            Tokenizer::encode(&"fix it ".repeat(100_000), &vocab, 3),
+            [1, 2, 1]
+        );
+        assert_eq!(vocab.1.get(), 3);
     }
 }
