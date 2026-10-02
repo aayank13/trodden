@@ -89,7 +89,7 @@ impl Hook {
     fn recall_error(home: &Home, input: &HookInput) -> Result<()> {
         let signature = match (&input.tool_name, &input.error) {
             (Some(tool), Some(error)) if tool == "Bash" && !input.is_interrupt => {
-                ErrorSignature::of(error)
+                ErrorSignature::of(error, &Redactor::new())
             }
             _ => None,
         };

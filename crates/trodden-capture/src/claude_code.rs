@@ -375,8 +375,7 @@ impl<'a> TraceBuilder<'a> {
             ToolOutcome::Succeeded
         };
         if matches!(call.outcome, ToolOutcome::Failed { .. }) {
-            call.error = ErrorSignature::of(&text)
-                .filter(|signature| !self.redactor.contains_secret(signature));
+            call.error = ErrorSignature::of(&text, self.redactor);
         }
         call.duration_ms = result
             .and_then(|r| r.get("durationMs"))

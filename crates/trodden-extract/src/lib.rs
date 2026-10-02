@@ -88,6 +88,7 @@ pub enum Rejection {
     TooManySteps { steps: usize },
     ContainsSecret,
     Dangerous { rule: &'static str, command: String },
+    OutsideProject { path: String },
 }
 
 impl fmt::Display for Rejection {
@@ -99,6 +100,9 @@ impl fmt::Display for Rejection {
             Self::TooManySteps { steps } => write!(f, "{steps} steps is more than {MAX_STEPS}"),
             Self::ContainsSecret => f.write_str("a step depends on a redacted secret"),
             Self::Dangerous { rule, command } => write!(f, "{rule}: `{command}`"),
+            Self::OutsideProject { path } => {
+                write!(f, "a step edits a file outside the project: `{path}`")
+            }
         }
     }
 }
@@ -408,6 +412,13 @@ impl<'a> Builder<'a> {
 
     fn check_safety(steps: &[Step]) -> Result<(), Rejection> {
         for step in steps {
+            if let (StepKind::Edit | StepKind::Create, Some(target)) = (step.kind, &step.target)
+                && Self::is_outside_project(target)
+            {
+                return Err(Rejection::OutsideProject {
+                    path: target.clone(),
+                });
+            }
             let texts = step.command.iter().chain(step.target.iter());
             for text in texts {
                 if text.contains("[REDACTED:") {
@@ -422,6 +433,12 @@ impl<'a> Builder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn is_outside_project(path: &str) -> bool {
+        path.starts_with(['/', '\\', '~'])
+            || path.chars().nth(1) == Some(':')
+            || path.split(['/', '\\']).any(|part| part == "..")
     }
 
     fn avoid_lines(&self) -> Vec<String> {
@@ -892,6 +909,43 @@ mod tests {
             Err(Rejection::Dangerous { .. })
         ));
         assert_eq!(secret.extract_one(), Err(Rejection::ContainsSecret));
+    }
+
+    #[test]
+    fn rejects_edits_outside_the_project() {
+        for path in [
+            "/Users/ada/.zshrc",
+            "~/.ssh/authorized_keys",
+            "../other-client/config.js",
+            "src/../../secrets.env",
+            "C:\\Users\\ada\\.bashrc",
+        ] {
+            let sketch = Sketch::new()
+                .prompt("Fix the paging bug")
+                .edit("src/paginate.js", &["paginate"])
+                .edit(path, &[])
+                .run("npm test", 0);
+
+            assert_eq!(
+                sketch.extract_one(),
+                Err(Rejection::OutsideProject {
+                    path: path.to_owned()
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_edits_inside_the_project() {
+        let sketch = Sketch::new()
+            .prompt("Fix the paging bug")
+            .edit("src/paginate.js", &["paginate"])
+            .edit("src/..config.js", &[])
+            .edit("./test/paginate.test.js", &[])
+            .run("npm test", 0);
+
+        assert!(sketch.extract_one().is_ok());
     }
 
     #[test]

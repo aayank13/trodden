@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
+use trodden_redact::Redactor;
 
 const MAX_CHARS: usize = 120;
 
@@ -17,6 +18,11 @@ static PLAIN: LazyLock<Regex> = LazyLock::new(|| {
 static ASSERTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)assert|expected|to (?:strictly )?(?:deep-?)?equal|mismatch|test(?:s)? failed|failures?=")
         .expect("assertion pattern is valid")
+});
+
+static PASSWORD_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bpass(?:word|wd|phrase)\b\W{1,3}(?:(?:is|was|for|of)\W{1,3})?[^\s'"`]*[0-9!@#$%^&*][^\s'"`]*"#)
+        .expect("password value pattern is valid")
 });
 
 static ANSI: LazyLock<Regex> =
@@ -41,7 +47,15 @@ static VOLATILE: LazyLock<[(Regex, &str); 4]> = LazyLock::new(|| {
 pub struct ErrorSignature;
 
 impl ErrorSignature {
-    pub fn of(output: &str) -> Option<String> {
+    pub fn of(output: &str, redactor: &Redactor) -> Option<String> {
+        let signature = Self::select(&redactor.redact(output))?;
+        let leaks = signature.contains("[redacted:")
+            || PASSWORD_VALUE.is_match(&signature)
+            || redactor.contains_secret(&signature);
+        (!leaks).then_some(signature)
+    }
+
+    fn select(output: &str) -> Option<String> {
         let output = ANSI.replace_all(output, "");
         let lines: Vec<&str> = output
             .lines()
@@ -110,7 +124,7 @@ mod tests {
         ];
         for (output, signature) in cases {
             assert_eq!(
-                ErrorSignature::of(output).as_deref(),
+                ErrorSignature::of(output, &redactor()).as_deref(),
                 Some(signature),
                 "{output}"
             );
@@ -124,7 +138,43 @@ mod tests {
             "FAILED (failures=1)",
             "Exit code 1\n3 passing, 1 failing",
         ] {
-            assert_eq!(ErrorSignature::of(output), None, "{output}");
+            assert_eq!(ErrorSignature::of(output, &redactor()), None, "{output}");
         }
+    }
+
+    fn redactor() -> Redactor {
+        Redactor::with_home("/Users/ada")
+    }
+
+    #[test]
+    fn secrets_never_reach_a_signature() {
+        let long_key = format!(
+            "Error: request to the billing service was rejected for workspace eu-central-billing-prod: {}",
+            ["sk", "ant", "api03", "Zq8Lm3KpQ7vX2nB9wR4tY6uI1oP5aS0dF"].join("-")
+        );
+        for output in [
+            "Error: invalid access key AKIAIOSFODNN7EXAMPLE for bucket assets",
+            "fatal: unable to access 'https://ada:hunter2@git.example.com/repo.git/': The requested URL returned error: 403",
+            "fatal: unable to access 'https://ada:hunter2@localhost/repo.git/'",
+            "Error: login failed for ada with password hunter2",
+            "Error: API_KEY=4f9a1c2e8b7d6a5f3e2c1b0a9d8e7f6c is not valid",
+            long_key.as_str(),
+        ] {
+            assert!(ErrorSignature::select(output).is_some(), "{output}");
+            let signature = ErrorSignature::of(output, &redactor());
+            assert_eq!(signature, None, "{output} gave {signature:?}");
+        }
+    }
+
+    #[test]
+    fn errors_that_only_mention_passwords_keep_their_signature() {
+        assert_eq!(
+            ErrorSignature::of(
+                "Error: password authentication failed for user \"app\"",
+                &redactor()
+            )
+            .as_deref(),
+            Some("error: password authentication failed for user \"app\"")
+        );
     }
 }
