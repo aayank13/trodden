@@ -42,6 +42,11 @@ static SETUP: LazyLock<Regex> = LazyLock::new(|| {
     .expect("setup pattern is valid")
 });
 
+static GENERATED_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9]{3}|^[0-9a-fA-F]{8,}_|^V[0-9]+(?:[._][0-9]+)*__")
+        .expect("generated name pattern is valid")
+});
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Extraction {
     pub first_seq: u32,
@@ -183,6 +188,7 @@ struct Builder<'a> {
     repo: &'a RepoId,
     checks: &'a ProjectChecks,
     summary: &'a str,
+    start: u32,
     calls: Vec<Call<'a>>,
 }
 
@@ -203,6 +209,7 @@ impl<'a> Builder<'a> {
             repo,
             checks,
             summary: task.summary,
+            start: task.first_seq(),
             calls,
         }
     }
@@ -508,7 +515,7 @@ impl<'a> Builder<'a> {
         &self,
         mut steps: Vec<Step>,
         observed: &str,
-        verify: VerifyStep,
+        mut verify: VerifyStep,
         verified_at: Timestamp,
     ) -> Procedure {
         let mut concrete: Vec<&str> = steps
@@ -547,9 +554,9 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let preconditions = Self::preconditions(&steps, observed, &verify.command);
+        let preconditions = self.preconditions(&steps, observed, &verify.command);
 
-        let slots = Self::parameterize(&mut steps);
+        let slots = self.parameterize(&mut steps, &mut verify.command);
 
         let mut paths: Vec<&str> = steps
             .iter()
@@ -600,7 +607,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn preconditions(steps: &[Step], observed: &str, verify: &str) -> Vec<Condition> {
+    fn preconditions(&self, steps: &[Step], observed: &str, verify: &str) -> Vec<Condition> {
         let mut preconditions: Vec<Condition> = Vec::new();
         let mut require = |condition: Condition| {
             if !preconditions.contains(&condition) {
@@ -608,12 +615,16 @@ impl<'a> Builder<'a> {
             }
         };
         for step in steps {
-            match (step.kind, step.target.as_deref()) {
-                (StepKind::Edit, Some(path)) => require(Condition::FileExists {
+            let Some(path) = step.target.as_deref() else {
+                continue;
+            };
+            match step.kind {
+                StepKind::Edit if !self.is_new(path) => require(Condition::FileExists {
                     path: path.to_owned(),
                 }),
-                (StepKind::Create, Some(path)) => {
-                    if let Some((dir, _)) = path.rsplit_once('/') {
+                StepKind::Edit | StepKind::Create => {
+                    let dir = Self::stable_dir(path);
+                    if !dir.is_empty() {
                         require(Condition::FileExists {
                             path: dir.to_owned(),
                         });
@@ -623,7 +634,9 @@ impl<'a> Builder<'a> {
             }
         }
         for command in [observed, verify] {
-            if let Some(program) = command.split_whitespace().find(|word| !word.contains('=')) {
+            if let Some(program) = command.split_whitespace().find(|word| !word.contains('='))
+                && !self.is_new(program.trim_start_matches("./"))
+            {
                 require(Condition::ProgramOnPath {
                     program: program.to_owned(),
                 });
@@ -632,65 +645,197 @@ impl<'a> Builder<'a> {
         preconditions
     }
 
-    fn parameterize(steps: &mut [Step]) -> Vec<Slot> {
-        const GENERIC_DIRS: &[&str] = &["", ".", "src", "lib", "app", "pkg", "internal", "source"];
-        let mut slots: Vec<Slot> = Vec::new();
-        for step in steps
-            .iter_mut()
-            .filter(|step| step.kind == StepKind::Create)
+    fn is_new(&self, path: &str) -> bool {
+        self.created(path) || self.generated(path)
+    }
+
+    fn created(&self, path: &str) -> bool {
+        self.trace
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ToolCall(call)
+                    if call.action == ToolAction::Edit
+                        && call.outcome == ToolOutcome::Succeeded =>
+                {
+                    Some(call)
+                }
+                _ => None,
+            })
+            .flat_map(|call| &call.changes)
+            .find(|change| change.path == path)
+            .is_some_and(|change| change.created)
+    }
+
+    fn generated(&self, path: &str) -> bool {
+        if !path
+            .rsplit('/')
+            .take(2)
+            .any(|segment| GENERATED_NAME.is_match(segment))
         {
-            let Some(target) = step.target.clone() else {
+            return false;
+        }
+        let mut after_run = false;
+        for event in &self.trace.events {
+            let EventKind::ToolCall(call) = &event.kind else {
                 continue;
             };
-            let (dir, name) = target.rsplit_once('/').unwrap_or(("", &target));
-            let (stem, extension) = name.split_once('.').unwrap_or((name, ""));
-            if stem.is_empty() {
+            if call.outcome != ToolOutcome::Succeeded {
                 continue;
             }
-            let parent = dir.rsplit('/').next().unwrap_or(dir);
-            let base: String = if GENERIC_DIRS.contains(&parent) {
-                "file".to_owned()
-            } else {
-                let singular = parent
-                    .strip_suffix('s')
-                    .filter(|rest| rest.len() > 2)
-                    .unwrap_or(parent);
-                singular
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect()
-            };
-            let mut slot_name = base.clone();
-            let mut suffix = 2;
-            while slots.iter().any(|slot| slot.name == slot_name) {
-                slot_name = format!("{base}_{suffix}");
-                suffix += 1;
+            if Self::touches(call, path) {
+                return after_run;
             }
-            let file = if extension.is_empty() {
-                format!("{{{slot_name}}}")
-            } else {
-                format!("{{{slot_name}}}.{extension}")
+            after_run |= event.seq >= self.start
+                && call.action == ToolAction::Run
+                && call
+                    .args
+                    .command
+                    .as_deref()
+                    .is_some_and(Self::is_project_task);
+        }
+        false
+    }
+
+    fn touches(call: &ToolCall, path: &str) -> bool {
+        call.args.path.as_deref() == Some(path)
+            || call.changes.iter().any(|change| change.path == path)
+            || call
+                .args
+                .command
+                .as_deref()
+                .is_some_and(|command| Self::mentions(command, path).next().is_some())
+    }
+
+    fn mentions<'t>(text: &'t str, path: &'t str) -> impl Iterator<Item = usize> + 't {
+        let part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+        text.match_indices(path)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                let before = &text[..at];
+                !before.strip_suffix("./").unwrap_or(before).ends_with(part)
+                    && !text[at + path.len()..].starts_with(part)
+            })
+    }
+
+    fn substitute(command: &str, path: &str, template: &str) -> String {
+        let mut substituted = String::with_capacity(command.len());
+        let mut copied = 0;
+        for at in Self::mentions(command, path) {
+            substituted.push_str(&command[copied..at]);
+            substituted.push_str(template);
+            copied = at + path.len();
+        }
+        substituted.push_str(&command[copied..]);
+        substituted
+    }
+
+    fn parameterize(&self, steps: &mut [Step], verify: &mut String) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut templates: Vec<(String, String)> = Vec::new();
+        for step in steps.iter_mut() {
+            let Some(path) = step.target.clone() else {
+                continue;
             };
-            let template = if dir.is_empty() {
-                file
-            } else {
-                format!("{dir}/{file}")
+            let is_new = match step.kind {
+                StepKind::Create => true,
+                StepKind::Edit => self.is_new(&path),
+                _ => false,
+            };
+            if !is_new {
+                continue;
+            }
+            let template = match templates.iter().find(|(known, _)| *known == path) {
+                Some((_, template)) => template.clone(),
+                None => {
+                    let Some((slot, template)) = Self::slot(&path, &slots) else {
+                        continue;
+                    };
+                    slots.push(slot);
+                    templates.push((path, template.clone()));
+                    template
+                }
             };
             step.writes = vec![Resource::File(template.clone())];
             step.target = Some(template);
-            slots.push(Slot {
-                name: slot_name,
-                kind: SlotKind::Identifier,
-                examples: vec![stem.to_owned()],
-            });
+        }
+        for (path, template) in &templates {
+            for command in steps
+                .iter_mut()
+                .filter_map(|step| step.command.as_mut())
+                .chain([&mut *verify])
+            {
+                *command = Self::substitute(command, path, template);
+            }
         }
         slots
+    }
+
+    fn stable_dir(path: &str) -> &str {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        match dir.rsplit_once('/').unwrap_or(("", dir)) {
+            (outer, parent)
+                if GENERATED_NAME.is_match(parent) && !GENERATED_NAME.is_match(name) =>
+            {
+                outer
+            }
+            _ => dir,
+        }
+    }
+
+    fn slot(path: &str, slots: &[Slot]) -> Option<(Slot, String)> {
+        const GENERIC_DIRS: &[&str] = &["", ".", "src", "lib", "app", "pkg", "internal", "source"];
+        let dir = Self::stable_dir(path);
+        let inner = path[dir.len()..].trim_start_matches('/');
+        let (value, rest) = match inner.split_once('/') {
+            Some((generated, name)) => (generated, format!("/{name}")),
+            None => match inner.split_once('.') {
+                Some((stem, extension)) => (stem, format!(".{extension}")),
+                None => (inner, String::new()),
+            },
+        };
+        if value.is_empty() {
+            return None;
+        }
+        let parent = dir.rsplit('/').next().unwrap_or(dir);
+        let base: String = if GENERIC_DIRS.contains(&parent) {
+            "file".to_owned()
+        } else {
+            let singular = parent
+                .strip_suffix('s')
+                .filter(|rest| rest.len() > 2)
+                .unwrap_or(parent);
+            singular
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let mut slot_name = base.clone();
+        let mut suffix = 2;
+        while slots.iter().any(|slot| slot.name == slot_name) {
+            slot_name = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        let file = format!("{{{slot_name}}}{rest}");
+        let template = if dir.is_empty() {
+            file
+        } else {
+            format!("{dir}/{file}")
+        };
+        Some((
+            Slot {
+                name: slot_name,
+                kind: SlotKind::Identifier,
+                examples: vec![value.to_owned()],
+            },
+            template,
+        ))
     }
 
     fn title(summary: &str) -> String {
@@ -786,6 +931,21 @@ mod tests {
                     lines_added: 1,
                     lines_removed: 1,
                 }],
+                duration_ms: None,
+                error: None,
+            }))
+        }
+
+        fn read(self, path: &str) -> Self {
+            self.push(EventKind::ToolCall(ToolCall {
+                tool: "Read".to_owned(),
+                action: ToolAction::Read,
+                args: ToolArgs {
+                    path: Some(path.to_owned()),
+                    ..ToolArgs::default()
+                },
+                outcome: ToolOutcome::Succeeded,
+                changes: Vec::new(),
                 duration_ms: None,
                 error: None,
             }))
@@ -1150,6 +1310,277 @@ mod tests {
         assert!(first.preconditions.contains(&Condition::FileExists {
             path: "migrations".to_owned()
         }));
+    }
+
+    fn file_preconditions(procedure: &Procedure) -> Vec<&str> {
+        procedure
+            .preconditions
+            .iter()
+            .filter_map(|condition| match condition {
+                Condition::FileExists { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_files_become_slots_instead_of_preconditions() {
+        let generated = |migration: &str| {
+            Sketch::new()
+                .prompt("Add a priority field to the Task model")
+                .read("app/models.py")
+                .edit("app/models.py", &["Task"])
+                .run("python3 manage.py makemigrations", 0)
+                .read(migration)
+                .edit(migration, &["Migration"])
+                .run("python3 -m pytest", 0)
+                .extract_one()
+                .expect("admitted")
+        };
+        let first = generated("app/migrations/0005_priority.py");
+        let second = generated("app/migrations/0006_due_date.py");
+        let existing = Sketch::new()
+            .prompt("Add a priority field to the Task model")
+            .read("app/admin.py")
+            .edit("app/models.py", &["Task"])
+            .run("python3 manage.py makemigrations", 0)
+            .edit("app/admin.py", &["TaskAdmin"])
+            .run("python3 -m pytest", 0)
+            .extract_one()
+            .expect("admitted");
+
+        assert_eq!(
+            step_summary(&first),
+            [
+                "Edit app/models.py",
+                "Run python3 manage.py makemigrations",
+                "Edit app/migrations/{migration}.py",
+                "Verify python3 -m pytest"
+            ]
+        );
+        assert_eq!(first.slots[0].examples, ["0005_priority"]);
+        assert_eq!(
+            file_preconditions(&first),
+            ["app/models.py", "app/migrations"]
+        );
+        assert_eq!(first.family, second.family);
+        assert_eq!(first.steps, second.steps);
+        assert_eq!(
+            file_preconditions(&existing),
+            ["app/models.py", "app/admin.py"]
+        );
+        assert!(existing.slots.is_empty());
+    }
+
+    #[test]
+    fn files_created_earlier_in_the_session_keep_their_slot() {
+        let sketch = Sketch::new()
+            .prompt("Add a priority column to tasks")
+            .create("migrations/0005_add_priority.sql")
+            .run("python3 tools/apply.py migrations/0005_add_priority.sql", 0)
+            .edit("migrations/0005_add_priority.sql", &[])
+            .run("python3 -m unittest", 0)
+            .prompt("The priority column needs a default of zero for existing rows")
+            .edit("migrations/0005_add_priority.sql", &[])
+            .run("python3 -m unittest", 0);
+
+        let procedures: Vec<Procedure> = sketch
+            .extract()
+            .into_iter()
+            .map(|result| result.expect("admitted"))
+            .collect();
+
+        assert_eq!(
+            step_summary(&procedures[0]),
+            [
+                "Create migrations/{migration}.sql",
+                "Run python3 tools/apply.py migrations/{migration}.sql",
+                "Edit migrations/{migration}.sql",
+                "Verify python3 -m unittest"
+            ]
+        );
+        assert_eq!(procedures[0].slots.len(), 1);
+        assert_eq!(
+            step_summary(&procedures[1]),
+            [
+                "Edit migrations/{migration}.sql",
+                "Verify python3 -m unittest"
+            ]
+        );
+        for procedure in &procedures {
+            assert_eq!(file_preconditions(procedure), ["migrations"]);
+        }
+    }
+
+    #[test]
+    fn files_opened_after_a_repro_script_stay_literal() {
+        for repro in ["python3 repro.py", "node scripts/check.js", "make"] {
+            let procedure = Sketch::new()
+                .prompt("Page 2 of the product listing repeats the last product from page 1")
+                .run(repro, 0)
+                .read("src/paginate.py")
+                .edit("src/paginate.py", &["paginate"])
+                .run("python3 -m pytest", 0)
+                .extract_one()
+                .expect("admitted");
+
+            assert_eq!(
+                procedure.steps[1].target.as_deref(),
+                Some("src/paginate.py"),
+                "{repro}"
+            );
+            assert_eq!(
+                file_preconditions(&procedure),
+                ["src/paginate.py"],
+                "{repro}"
+            );
+            assert!(procedure.slots.is_empty(), "{repro}");
+        }
+    }
+
+    #[test]
+    fn generated_names_carry_a_sequence_or_revision() {
+        for path in [
+            "app/migrations/0005_priority.py",
+            "db/migrate/20240101120000_add_users.rb",
+            "db/migration/V2__init.sql",
+            "alembic/versions/3f2a1b9c4d5e_add_col.py",
+            "prisma/migrations/20240101120000_add_priority/migration.sql",
+        ] {
+            let procedure = Sketch::new()
+                .prompt("Add a priority column to tasks")
+                .run("make migration", 0)
+                .read(path)
+                .edit(path, &[])
+                .run("make test", 0)
+                .extract_one()
+                .expect("admitted");
+
+            assert_eq!(procedure.slots.len(), 1, "{path}");
+            assert!(
+                !file_preconditions(&procedure).contains(&path),
+                "{path}: {:?}",
+                procedure.preconditions
+            );
+        }
+        for name in [
+            "paginate.py",
+            "http2.py",
+            "check.js",
+            "deadbeef.py",
+            "cafe_add.py",
+        ] {
+            assert!(!GENERATED_NAME.is_match(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn prisma_style_migrations_slot_their_directory() {
+        let procedure = Sketch::new()
+            .prompt("Add a priority column to tasks")
+            .run("npm run migrate:create", 0)
+            .read("prisma/migrations/20240101120000_add_priority/migration.sql")
+            .edit(
+                "prisma/migrations/20240101120000_add_priority/migration.sql",
+                &[],
+            )
+            .run("npm test", 0)
+            .extract_one()
+            .expect("admitted");
+
+        assert_eq!(
+            procedure.steps[1].target.as_deref(),
+            Some("prisma/migrations/{migration}/migration.sql")
+        );
+        assert_eq!(procedure.slots[0].examples, ["20240101120000_add_priority"]);
+        assert_eq!(file_preconditions(&procedure), ["prisma/migrations"]);
+    }
+
+    #[test]
+    fn commands_use_the_slot_of_the_file_they_name() {
+        let procedure = Sketch::new()
+            .prompt("Add a priority column to tasks")
+            .create("migrations/0005_add_priority.sql")
+            .edit("app/models.py", &["Task"])
+            .run("python3 tools/apply.py migrations/0005_add_priority.sql", 0)
+            .run(
+                "python3 tools/check_migration.py ./migrations/0005_add_priority.sql",
+                0,
+            )
+            .extract_one()
+            .expect("admitted");
+
+        assert_eq!(
+            step_summary(&procedure),
+            [
+                "Create migrations/{migration}.sql",
+                "Edit app/models.py",
+                "Run python3 tools/apply.py migrations/{migration}.sql",
+                "Verify python3 tools/check_migration.py ./migrations/{migration}.sql"
+            ]
+        );
+        assert_eq!(
+            procedure.verify.map(|verify| verify.command).as_deref(),
+            Some("python3 tools/check_migration.py ./migrations/{migration}.sql")
+        );
+    }
+
+    #[test]
+    fn slots_replace_whole_paths_only() {
+        let path = "migrations/0005_add_priority.sql";
+        let template = "migrations/{migration}.sql";
+        for (command, expected) in [
+            (
+                "psql -f migrations/0005_add_priority.sql",
+                "psql -f migrations/{migration}.sql",
+            ),
+            (
+                "psql --file=\"./migrations/0005_add_priority.sql\"",
+                "psql --file=\"./migrations/{migration}.sql\"",
+            ),
+            (
+                "cp migrations/0005_add_priority.sql migrations/0005_add_priority.sql.bak",
+                "cp migrations/{migration}.sql migrations/0005_add_priority.sql.bak",
+            ),
+            (
+                "diff ../migrations/0005_add_priority.sql old/migrations/0005_add_priority.sql",
+                "diff ../migrations/0005_add_priority.sql old/migrations/0005_add_priority.sql",
+            ),
+        ] {
+            assert_eq!(
+                Builder::substitute(command, path, template),
+                expected,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            Builder::substitute(
+                "pytest tests/test_priority.py::test_default",
+                "tests/test_priority.py",
+                "tests/{test}.py"
+            ),
+            "pytest tests/{test}.py::test_default"
+        );
+    }
+
+    #[test]
+    fn commands_naming_created_files_are_still_linted() {
+        let sketch = Sketch::new()
+            .prompt("Add a priority column to tasks")
+            .create("migrations/0005_add_priority.sql")
+            .run(
+                "./scripts/apply.sh migrations/0005_add_priority.sql && chmod 777 migrations/0005_add_priority.sql",
+                0,
+            )
+            .run("python3 -m unittest", 0);
+
+        assert_eq!(
+            sketch.extract_one(),
+            Err(Rejection::Dangerous {
+                rule: "world-writable permissions",
+                command: "./scripts/apply.sh migrations/0005_add_priority.sql && chmod 777 migrations/0005_add_priority.sql".to_owned()
+            })
+        );
     }
 
     #[test]
