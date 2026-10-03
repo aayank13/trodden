@@ -1,6 +1,7 @@
 use std::{cmp::Reverse, fs, path::Path, sync::LazyLock};
 
 use regex::Regex;
+use serde_json::Value;
 use trodden_capture::Command;
 
 use crate::{lint::DangerLint, verify::Verification};
@@ -216,10 +217,7 @@ impl ProjectChecks {
     }
 
     fn package_scripts(root: &Path, text: &str) -> Vec<String> {
-        static SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r#""(test|check|ci|verify|validate|lint)"\s*:"#)
-                .expect("script pattern is valid")
-        });
+        const NAMES: &[&str] = &["test", "check", "ci", "verify", "validate", "lint"];
         let manager = [
             ("pnpm-lock.yaml", "pnpm"),
             ("yarn.lock", "yarn"),
@@ -229,13 +227,21 @@ impl ProjectChecks {
         .iter()
         .find(|(lockfile, _)| root.join(lockfile).is_file())
         .map_or("npm", |(_, manager)| manager);
-        let scripts = text
-            .split_once("\"scripts\"")
-            .and_then(|(_, rest)| rest.split_once('}'))
-            .map_or("", |(scripts, _)| scripts);
-        SCRIPT
-            .captures_iter(scripts)
-            .map(|script| match &script[1] {
+        let Ok(package) = serde_json::from_str::<Value>(text) else {
+            return Vec::new();
+        };
+        let Some(scripts) = package.get("scripts").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        NAMES
+            .iter()
+            .filter(|name| {
+                scripts
+                    .get(**name)
+                    .and_then(Value::as_str)
+                    .is_some_and(|script| !script.contains("Error: no test specified"))
+            })
+            .map(|name| match *name {
                 "test" => format!("{manager} test"),
                 name => format!("{manager} run {name}"),
             })
@@ -333,6 +339,60 @@ mod tests {
             strongest(&inline),
             Some(("cargo test".to_owned(), "CONTRIBUTING.md".to_owned()))
         );
+    }
+
+    #[test]
+    fn reads_every_package_script_past_braces_inside_earlier_ones() {
+        let checks = project(
+            "braces",
+            &[(
+                "package.json",
+                r#"{
+  "scripts": {
+    "build": "node -e \"if (process.env.CI) {}\" && tsc",
+    "check": "eslint . --max-warnings 0",
+    "test": "node --test"
+  }
+}"#,
+            )],
+        );
+        let strongest = checks.strongest().expect("package.json declares a check");
+
+        assert_eq!(strongest.command, "npm run check");
+        assert_eq!(strongest.source, "package.json");
+        assert!(checks.find("npm test").is_some(), "{checks:?}");
+    }
+
+    #[test]
+    fn ignores_the_npm_placeholder_test_script() {
+        let checks = project(
+            "placeholder",
+            &[
+                (
+                    "package.json",
+                    r#"{ "scripts": { "test": "echo \"Error: no test specified\" && exit 1" } }"#,
+                ),
+                ("Cargo.toml", "[package]\nname = \"invoicer\"\n"),
+            ],
+        );
+        let strongest = checks.strongest().expect("Cargo.toml declares a check");
+
+        assert_eq!(strongest.command, "cargo test");
+        assert_eq!(strongest.source, "Cargo.toml");
+        assert_eq!(checks.find("npm test"), None);
+    }
+
+    #[test]
+    fn treats_malformed_package_json_as_having_no_scripts() {
+        let checks = project(
+            "malformed",
+            &[(
+                "package.json",
+                r#"{ "scripts": { "test": "node --test", "check": "eslint ." "#,
+            )],
+        );
+
+        assert_eq!(checks.strongest(), None, "{checks:?}");
     }
 
     #[test]

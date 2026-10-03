@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 jiff.workspace = true
 regex.workspace = true
+serde_json.workspace = true
 sha2 = "0.11.0"
 trodden-capture.workspace = true
 trodden-core.workspace = true
