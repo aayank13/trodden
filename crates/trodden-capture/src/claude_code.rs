@@ -63,6 +63,8 @@ impl Transcript {
         "Caveat:",
     ];
 
+    const PASTED: &str = "<pasted_content";
+
     const BOOKKEEPING_TOOLS: &[&str] = &[
         "TodoWrite",
         "TodoRead",
@@ -105,6 +107,7 @@ struct Line {
     compact_trigger: Option<String>,
     message: Option<Message>,
     tool_use_result: Option<Value>,
+    attachment: Option<Attachment>,
 }
 
 impl Line {
@@ -129,6 +132,7 @@ impl Line {
                 .and_then(|mut metadata| metadata.string("trigger")),
             message: fields.object("message").map(Message::new),
             tool_use_result: fields.take("toolUseResult"),
+            attachment: fields.object("attachment").and_then(Attachment::new),
         })
     }
 
@@ -214,6 +218,37 @@ impl Message {
 }
 
 #[derive(Debug)]
+struct Attachment {
+    kind: String,
+    mode: Option<String>,
+    origin: Option<String>,
+    prompt: Content,
+}
+
+impl Attachment {
+    fn new(mut fields: Fields) -> Option<Self> {
+        Some(Self {
+            kind: fields.string("type")?,
+            mode: fields.string("commandMode"),
+            origin: fields
+                .object("origin")
+                .and_then(|mut origin| origin.string("kind")),
+            prompt: Content::new(fields.take("prompt")),
+        })
+    }
+
+    fn queued_prompt(self) -> Option<String> {
+        let typed = self.kind == "queued_command"
+            && self.mode.as_deref() == Some("prompt")
+            && self.origin.as_deref() == Some("human");
+        if !typed {
+            return None;
+        }
+        self.prompt.first_text()
+    }
+}
+
+#[derive(Debug)]
 enum Content {
     Text(String),
     Blocks(Vec<Block>),
@@ -227,6 +262,16 @@ impl Content {
                 Self::Blocks(blocks.into_iter().filter_map(Block::new).collect())
             }
             _ => Self::Blocks(Vec::new()),
+        }
+    }
+
+    fn first_text(self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Blocks(blocks) => blocks.into_iter().find_map(|block| match block {
+                Block::Text { text } => Some(text),
+                _ => None,
+            }),
         }
     }
 }
@@ -323,6 +368,11 @@ impl<'a> TraceBuilder<'a> {
         match line.kind.as_str() {
             "user" => self.push_user(line),
             "assistant" => self.push_assistant(line),
+            "attachment" => {
+                if let Some(text) = line.attachment.and_then(Attachment::queued_prompt) {
+                    self.push_prompt(&text);
+                }
+            }
             "system" if line.subtype.as_deref() == Some("compact_boundary") => {
                 let automatic = line
                     .compact_trigger
@@ -377,13 +427,55 @@ impl<'a> TraceBuilder<'a> {
         {
             return;
         }
-        let first_line = text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or_default();
-        let summary = self.summary(first_line);
+        let headline = Self::headline(text);
+        if headline.is_empty() {
+            return;
+        }
+        let summary = self.summary(headline);
         self.emit(EventKind::Prompt { summary });
+    }
+
+    fn headline(text: &str) -> &str {
+        let mut wrapper: Option<&str> = None;
+        let mut pasted = None;
+        for line in text.lines() {
+            let mut rest = line.trim();
+            while !rest.is_empty() {
+                if let Some(tag) = wrapper {
+                    let Some(close) = rest.find(&format!("</{}", &tag[1..])) else {
+                        if tag == Transcript::PASTED {
+                            pasted.get_or_insert(rest);
+                        }
+                        break;
+                    };
+                    let inside = rest[..close].trim();
+                    if tag == Transcript::PASTED && !inside.is_empty() {
+                        pasted.get_or_insert(inside);
+                    }
+                    wrapper = None;
+                    rest = Self::after_tag(&rest[close..]);
+                } else if let Some(tag) = Self::wrapper(rest) {
+                    wrapper = Some(tag);
+                    rest = Self::after_tag(rest);
+                } else {
+                    return rest;
+                }
+            }
+        }
+        pasted.unwrap_or_default()
+    }
+
+    fn wrapper(line: &str) -> Option<&'static str> {
+        Transcript::NON_PROMPT_PREFIXES
+            .iter()
+            .chain([&Transcript::PASTED])
+            .map(|prefix| prefix.trim_end_matches('>'))
+            .filter(|tag| tag.starts_with('<'))
+            .find(|tag| line.starts_with(tag))
+    }
+
+    fn after_tag(text: &str) -> &str {
+        text.find('>').map_or("", |end| text[end + 1..].trim())
     }
 
     fn summary(&self, line: &str) -> String {
@@ -929,6 +1021,27 @@ mod tests {
                        {"type": "tool_result", "tool_use_id": "call", "content": content, "is_error": is_error}]}})
         }
 
+        fn prompts(lines: &[Value]) -> Vec<String> {
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
+                .expect("valid transcript");
+            trace
+                .events
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    EventKind::Prompt { summary } => Some(summary),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn queued(prompt: Value, mode: &str, origin: Value, sidechain: bool) -> Value {
+            json!({"type": "attachment", "sessionId": "s", "cwd": "/work/app",
+                   "timestamp": "2026-09-21T14:02:14Z", "isSidechain": sidechain,
+                   "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": mode,
+                                  "origin": origin, "timestamp": "2026-09-21T14:02:14Z"}})
+        }
+
         fn odd_variants(line: &Value) -> Vec<String> {
             let with_block = |block: Value| {
                 let mut line = line.clone();
@@ -950,6 +1063,109 @@ mod tests {
                     .replace("SURROGATE", r"\ud83d"),
             ]
         }
+    }
+
+    #[test]
+    fn pasted_content_does_not_become_the_summary() {
+        let cases = [
+            "<pasted_content id=\"f3c9\">\nTypeError: total is undefined\n    at invoiceTotal (src/invoice.js:42:17)\n</pasted_content id=\"f3c9\">\n\nFix this crash in the invoice total",
+            "\n\n<pasted_content id=\"f3c9\">TypeError: total is undefined</pasted_content id=\"f3c9\"> Fix this crash in the invoice total\n",
+            "<pasted_content id=\"a1\">\nTypeError: total is undefined\n</pasted_content id=\"a1\">\n<pasted_content id=\"b2\">\nexpected 42\n</pasted_content id=\"b2\">\nFix this crash in the invoice total",
+            "<pasted_content id=\"a1\">\nTypeError: total is undefined\n</pasted_content id=\"a1\">\n<system-reminder>\nThe user opened src/invoice.js\n</system-reminder>\nFix this crash in the invoice total",
+            "Fix this crash in the invoice total\n<pasted_content id=\"a1\">\nTypeError: total is undefined\n</pasted_content id=\"a1\">",
+        ];
+        for prompt in cases {
+            assert_eq!(
+                summary(prompt),
+                "Fix this crash in the invoice total",
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompts_of_only_pasted_content_use_its_first_line() {
+        let lead = format!("Deploy the billing worker to staging {}", "x".repeat(148));
+        let cases = [
+            (
+                "<pasted_content id=\"a1\">\n\nRename the shipping helper to computeShippingCost\nand update callers\n</pasted_content id=\"a1\">\n\n".to_owned(),
+                "Rename the shipping helper to computeShippingCost".to_owned(),
+            ),
+            (
+                "<pasted_content id=\"a1\">Rename the shipping helper</pasted_content id=\"a1\">"
+                    .to_owned(),
+                "Rename the shipping helper".to_owned(),
+            ),
+            (
+                format!(
+                    "<pasted_content id=\"a1\">\n{lead} {} then report back\n</pasted_content id=\"a1\">",
+                    anthropic_key()
+                ),
+                lead,
+            ),
+            (
+                format!(
+                    "<pasted_content id=\"a1\">\nexport KEY={}\n</pasted_content id=\"a1\">",
+                    anthropic_key()
+                ),
+                "export KEY=[REDACTED:llm-api-key]".to_owned(),
+            ),
+        ];
+        for (prompt, expected) in cases {
+            assert_eq!(summary(&prompt), expected, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn prompts_with_nothing_of_their_own_are_skipped() {
+        let prompts = Session::prompts(&[
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                   "message": {"role": "user", "content": "<pasted_content id=\"a1\">\n\n</pasted_content id=\"a1\">\n"}}),
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:12Z",
+                   "message": {"role": "user", "content": "Fix the paging bug"}}),
+        ]);
+
+        assert_eq!(prompts, ["Fix the paging bug"]);
+    }
+
+    #[test]
+    fn prompts_typed_while_the_agent_works_are_captured() {
+        let human = json!({"kind": "human"});
+        let notification = json!({"kind": "task-notification", "producer": "session-task"});
+        let prompts = Session::prompts(&[
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                   "message": {"role": "user", "content": "Fix the paging bug"}}),
+            Session::queued(
+                json!("Also rename the shipping helper"),
+                "prompt",
+                human.clone(),
+                false,
+            ),
+            Session::queued(
+                json!([{"type": "text", "text": "Then update the changelog"}]),
+                "prompt",
+                human.clone(),
+                false,
+            ),
+            Session::queued(
+                json!("<task-notification>\nbuild finished\n</task-notification>"),
+                "task-notification",
+                notification.clone(),
+                false,
+            ),
+            Session::queued(json!("Summarize the build"), "prompt", notification, false),
+            Session::queued(json!("Summarize the build"), "prompt", Value::Null, false),
+            Session::queued(json!("Summarize the build"), "prompt", human, true),
+        ]);
+
+        assert_eq!(
+            prompts,
+            [
+                "Fix the paging bug",
+                "Also rename the shipping helper",
+                "Then update the changelog",
+            ]
+        );
     }
 
     #[test]
