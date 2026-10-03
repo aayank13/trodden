@@ -90,10 +90,12 @@ impl Store {
         {
             let stored = &mut absorber.stored;
             Self::merge(stored, candidate);
+            stored.state = Self::refreshed_state(absorber.state, absorber.rowid, &existing);
             tx.execute(
-                "UPDATE procedures SET document = ?1, signature = ?2, updated_at = ?3, used_at = ?4
-                 WHERE rowid = ?5",
+                "UPDATE procedures SET state = ?1, document = ?2, signature = ?3, updated_at = ?4, used_at = ?5
+                 WHERE rowid = ?6",
                 params![
+                    Self::state_name(stored.state),
                     Self::document(stored)?,
                     Self::signature(stored)?,
                     stored.provenance.updated_at.to_string(),
@@ -102,7 +104,7 @@ impl Store {
                 ],
             )
             .context("refresh a procedure revision")?;
-            if matches!(absorber.state, Lifecycle::Active | Lifecycle::Stale) {
+            if stored.state == Lifecycle::Active {
                 Self::reindex(&tx, stored.id.as_str())?;
             }
             let rowid = absorber.rowid;
@@ -202,6 +204,29 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    fn refreshed_state(
+        state: Lifecycle,
+        rowid: i64,
+        family: &[(i64, u32, String, String, String)],
+    ) -> Lifecycle {
+        match state {
+            Lifecycle::Stale => Lifecycle::Active,
+            Lifecycle::Archived
+                if family.iter().any(|row| {
+                    row.0 != rowid
+                        && matches!(
+                            Self::parse_state(&row.4),
+                            Lifecycle::Active | Lifecycle::Stale
+                        )
+                }) =>
+            {
+                Lifecycle::Candidate
+            }
+            Lifecycle::Archived => Lifecycle::Active,
+            other => other,
+        }
     }
 
     fn merge(stored: &mut Procedure, candidate: &Procedure) {
@@ -854,6 +879,47 @@ mod tests {
             assert_eq!(upsert, expected, "`{check}`");
             assert_eq!(states(&store), [(1, Lifecycle::Retired)], "`{check}`");
             assert!(!recallable(&store), "`{check}`");
+        }
+    }
+
+    #[test]
+    fn relearning_an_archived_procedure_brings_it_back_into_recall() {
+        let (upsert, store) = relearned(Lifecycle::Archived, "npm test");
+
+        assert_eq!(upsert, Upsert::Refreshed { rowid: 1 });
+        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
+        assert!(recallable(&store));
+    }
+
+    #[test]
+    fn relearning_an_archived_procedure_beside_an_active_one_makes_it_a_candidate() {
+        let (_, mut store) = relearned(Lifecycle::Archived, "npm check");
+        assert_eq!(
+            states(&store),
+            [(1, Lifecycle::Archived), (2, Lifecycle::Active)]
+        );
+
+        let upsert = store.upsert(&Procedure::example()).expect("stored");
+
+        assert_eq!(upsert, Upsert::Refreshed { rowid: 1 });
+        assert_eq!(
+            states(&store),
+            [(1, Lifecycle::Candidate), (2, Lifecycle::Active)]
+        );
+        assert!(recallable(&store));
+    }
+
+    #[test]
+    fn relearning_a_stale_procedure_makes_it_active_again() {
+        for (check, expected) in [
+            ("npm test", Upsert::Refreshed { rowid: 1 }),
+            ("npm check", Upsert::Generalized { rowid: 1 }),
+        ] {
+            let (upsert, store) = relearned(Lifecycle::Stale, check);
+
+            assert_eq!(upsert, expected, "`{check}`");
+            assert_eq!(states(&store), [(1, Lifecycle::Active)], "`{check}`");
+            assert!(recallable(&store), "`{check}`");
         }
     }
 }
