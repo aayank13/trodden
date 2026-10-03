@@ -1197,9 +1197,11 @@ dependencies = [
  "anyhow",
  "jiff",
  "rand",
+ "trodden-capture",
  "trodden-core",
  "trodden-embed",
  "trodden-learn",
+ "trodden-redact",
  "trodden-store",
 ]
 
