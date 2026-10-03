@@ -1221,6 +1221,7 @@ dependencies = [
  "serde_json",
  "trodden-core",
  "trodden-learn",
+ "unicode-normalization",
 ]
 
 [[package]]
