@@ -5,6 +5,7 @@ mod kind;
 mod skeleton;
 
 use std::{
+    cell::OnceCell,
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
@@ -14,12 +15,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
+use trodden_capture::ErrorSignature;
 use trodden_core::{
     Procedure,
     procedure::{Condition, Lifecycle},
 };
 use trodden_embed::Embedder;
 use trodden_learn::{Evidence, Holdout, Policy};
+use trodden_redact::Redactor;
 use trodden_store::{ProcedureRow, Store, Terms};
 
 pub use artifact::{Artifact, Artifacts};
@@ -37,6 +40,8 @@ const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_TERMS: usize = 512;
 
 const MAX_PHRASE_WORDS: usize = 3;
+
+const MAX_ERROR_SIGNATURES: usize = 8;
 
 const RRF_K: f64 = 60.0;
 
@@ -91,7 +96,7 @@ impl Signals {
 
     fn weight(&self, kind: &str) -> f64 {
         match kind {
-            "path" => 2.0,
+            "path" | "error" => 2.0,
             "stem" if self.cosine_confirms_topic() => 2.0,
             "stem" => 0.5,
             "symbol" => 1.5,
@@ -267,6 +272,7 @@ impl<'a> Recall<'a> {
             }
         }
         keys.extend(Self::phrases(prompt));
+        keys.extend(PastedErrors::signatures(prompt));
         keys.sort_unstable();
         keys.dedup();
         let hits = self.store.entity_hits(&keys, query.repo)?;
@@ -502,6 +508,67 @@ impl<'a> Recall<'a> {
             }
         }
         Ok(Decision::Inject(Box::new(chosen)))
+    }
+}
+
+#[derive(Debug)]
+struct PastedErrors;
+
+impl PastedErrors {
+    const MARKERS: &[&str] = &[
+        "error",
+        "exception",
+        "panic",
+        "fatal",
+        "err!",
+        "command not found",
+        "no such file or directory",
+        "cannot find module",
+        "not recognized as",
+        "permission denied",
+        "module not found",
+        "unresolved import",
+        "undefined reference",
+    ];
+
+    fn signatures(prompt: &str) -> Vec<String> {
+        let redactor = OnceCell::new();
+        let mut seen = HashSet::new();
+        prompt
+            .lines()
+            .filter(|line| Self::may_be_error(line))
+            .filter_map(|line| ErrorSignature::of(line, redactor.get_or_init(Redactor::new)))
+            .filter(|signature| seen.insert(signature.clone()))
+            .take(MAX_ERROR_SIGNATURES)
+            .collect()
+    }
+
+    fn may_be_error(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        line.contains('\x1b')
+            || Self::MARKERS.iter().any(|marker| lower.contains(marker))
+            || (0..line.len()).any(|start| Self::located_at(&line.as_bytes()[start..]))
+    }
+
+    fn located_at(rest: &[u8]) -> bool {
+        let (separator, close) = match rest.first() {
+            Some(b':') => (b':', None),
+            Some(b'(') => (b',', Some(b')')),
+            _ => return false,
+        };
+        let line = Self::digits(&rest[1..]);
+        let column = rest.get(line + 2..).map_or(0, Self::digits);
+        line > 0
+            && column > 0
+            && rest.get(line + 1) == Some(&separator)
+            && close.is_none_or(|close| rest.get(line + column + 2) == Some(&close))
+    }
+
+    fn digits(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
     }
 }
 
@@ -1168,6 +1235,155 @@ mod tests {
             ]
         );
         assert_eq!(Recall::phrases(&words).len(), MAX_TERMS);
+    }
+
+    #[test]
+    fn matches_an_error_pasted_into_the_prompt() {
+        let learned = Learned::with(&[Entity::ErrorSignature(
+            "TypeError: Cannot read properties of undefined (reading 'id')".to_owned(),
+        )]);
+        let pasted = "The listing page fails to load:\n\n/home/ada/shop/src/listing.js:3\n    const id = page.id;\n\nTypeError: Cannot read properties of undefined (reading 'id')\n    at render (/home/ada/shop/src/listing.js:3:18)";
+        let described = "The listing page throws an error when it loads, fix the error.";
+
+        assert_eq!(
+            learned.exact(pasted),
+            Learned::pairs(&[(
+                "typeerror: cannot read properties of undefined (reading 'id')",
+                "error"
+            )])
+        );
+        assert!(matches!(
+            outcome(&learned.0, pasted).decision,
+            Decision::Inject(_)
+        ));
+        assert_eq!(learned.exact(described), Learned::pairs(&[]));
+        assert_eq!(
+            outcome(&learned.0, described).decision,
+            Decision::Abstain(Abstention::NotConfident)
+        );
+    }
+
+    #[test]
+    fn finds_each_pasted_error_up_to_a_limit() {
+        let build = "cargo build fails:\n   Compiling shop v0.1.0\nwarning: unused variable: `x`\nerror[E0308]: mismatched types\n --> src/cart.rs:2:22\nerror[E0599]: no method named `totl` found for struct `Cart` in the current scope\n --> src/cart.rs:9:7\nerror[E0308]: mismatched types\n --> src/cart.rs:14:9";
+        let flood: String = (0..2 * MAX_ERROR_SIGNATURES)
+            .map(|n| format!("error: cannot find value `total{n}` in this scope\n"))
+            .collect();
+
+        assert_eq!(
+            PastedErrors::signatures(build),
+            [
+                "error[e0308]: mismatched types",
+                "error[e0599]: no method named `totl` found for struct `cart` in the current scope",
+            ]
+        );
+        let signatures = PastedErrors::signatures(&flood);
+        assert_eq!(signatures.len(), MAX_ERROR_SIGNATURES);
+        assert_eq!(
+            signatures[MAX_ERROR_SIGNATURES - 1],
+            format!(
+                "error: cannot find value `total{}` in this scope",
+                MAX_ERROR_SIGNATURES - 1
+            )
+        );
+    }
+
+    #[test]
+    fn the_prefilter_keeps_every_line_that_can_have_a_signature() {
+        let redactor = Redactor::new();
+        let outputs = [
+            "Traceback (most recent call last):\n  File \"/home/dev/app/cli.py\", line 3, in <module>\n    import yaml\nModuleNotFoundError: No module named 'yaml'",
+            "error[E0432]: unresolved import `crate::commands::total`\n --> src/cli.rs:4:5",
+            "/bin/sh: line 1: python: command not found",
+            "<path>: line N: python: command not found",
+            "Error: Cannot find module '/tmp/run-3/catalog/scripts/build.js'",
+            "\x1b[31mTypeError: Cannot read properties of undefined (reading 'id')\x1b[0m",
+            "error[E0308]: mismatched types\n --> src/main.rs:2:22\n  |\n2 |     let total: u32 = \"3\";\n  |                ---   ^^^ expected `u32`, found `&str`",
+            "   Compiling shop v0.1.0 (/home/dev/shop)\nwarning: unused variable: `x`\nerror[E0599]: no method named `totl` found for struct `Cart` in the current scope\nerror: could not compile `shop` (bin \"shop\") due to 1 previous error",
+            "error: expected one of `,`, `:`, or `}`, found `{`",
+            "error[E0277]: the trait bound `Total: Serialize` is not satisfied",
+            "SyntaxError: Unexpected token '}'",
+            "Traceback (most recent call last):\n  File \"/home/dev/app/io.py\", line 9, in <module>\n    open(None)\nTypeError: expected str, bytes or os.PathLike object, not NoneType",
+            "  File \"/home/dev/app/cli.py\", line 3\n    def main(\n            ^\nSyntaxError: '(' was never closed",
+            "Traceback (most recent call last):\n  File \"/home/dev/app/cli.py\", line 3, in <module>\n    raise ConfigMissing\nshop.errors.ConfigMissingError",
+            "# example.com/shop\n./main.go:5:2: undefined: totalPrice\n./main.go:9:7: \"fmt\" imported and not used",
+            "internal/cart/cart.go:41:12: cannot use price (variable of type float64) as int value in return statement",
+            "cannot use price (variable of type float64) as int value in return statement",
+            "panic: runtime error: index out of range [5] with length 3\n\ngoroutine 1 [running]:\nmain.main()\n\t/home/dev/shop/main.go:8 +0x1d",
+            "panic: runtime error: index out of range [N] with length N",
+            "src/cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+            "src/cart.ts:3:5 - error TS2322: Type 'string' is not assignable to type 'number'.",
+            "error TS5058: The specified path does not exist: 'tsconfig.app.json'.",
+            "/home/dev/shop/index.js:3\nconst id = order.id;\n                 ^\n\nTypeError: Cannot read properties of undefined (reading 'id')\n    at Object.<anonymous> (/home/dev/shop/index.js:3:18)",
+            "node:internal/fs/utils:347\n    throw err;\nTypeError [ERR_INVALID_ARG_TYPE]: The \"path\" argument must be of type string. Received undefined",
+            "Uncaught ReferenceError: process is not defined",
+            "npm ERR! Missing script: \"build\"\nnpm ERR!\nnpm ERR! To see a list of scripts, run:\nnpm ERR!   npm run",
+            "npm ERR! code E404\nnpm ERR! 404 Not Found - GET https://registry.npmjs.org/left-padd - Not found",
+            "npm err! N not found - get https:<path> - not found",
+            "npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree",
+            "Exception in thread \"main\" java.lang.NullPointerException: Cannot invoke \"String.length()\" because \"name\" is null\n\tat Shop.main(Shop.java:5)",
+            "Exception in thread \"main\" java.lang.IllegalStateException\n\tat Shop.main(Shop.java:5)",
+            "Shop.java:5: error: cannot find symbol\n    total = prise * 2;\n            ^\n  symbol:   variable prise",
+            "cart.c: In function 'main':\ncart.c:3:9: warning: unused variable 'n' [-Wunused-variable]\ncart.c:5:5: error: use of undeclared identifier 'totl'",
+            "cart.c:1:10: fatal error: 'shop.h' file not found\n#include \"shop.h\"\n         ^~~~~~~~",
+            "fatal error: 'shop.h' file not found",
+            "/usr/bin/ld: /tmp/ccq1.o: in function `main':\ncart.c:(.text+0x9): undefined reference to `total'\ncollect2: error: ld returned 1 exit status",
+            "cart.c:(.text+<hex>): undefined reference to `total'",
+            "shop/cart.py:12: error: Incompatible return value type (got \"str\", expected \"int\")  [return-value]\nFound 1 error in 1 file (checked 3 source files)",
+            "/home/ada/shop/src/lib/total.ts(88,13): error TS2322: Type 'string' is not assignable to type 'number'.",
+            r"Error: Cannot find module 'C:\Users\grace\shop\scripts\build.js'",
+            r"FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\grace\\shop\\cart.toml'",
+            r"Error: ENOENT: no such file or directory, open 'd:/clients/grace/cart.json'",
+            r"Error: Cannot find module '\\fileserver\grace\build.js'",
+            r"SyntaxError: invalid escape sequence '\d'",
+            r"C:\Users\grace\shop\src\cart.c:41:5: error: use of undeclared identifier 'totl'",
+            "Error: password authentication failed for user \"app\"",
+            "src/lib.rs:10:5",
+            "Exit code 1\n3 passing, 1 failing",
+            "src/cart.rs:3:5: warning: unused variable: `x`",
+            "FAILED (failures=1)",
+        ];
+        let signed: Vec<&str> = outputs
+            .iter()
+            .flat_map(|output| output.lines())
+            .filter(|line| ErrorSignature::of(line, &redactor).is_some())
+            .collect();
+
+        assert!(signed.len() > outputs.len() / 2, "{signed:?}");
+        for line in signed {
+            assert!(PastedErrors::may_be_error(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_prefilter_skips_ordinary_prose() {
+        for line in [
+            PROMPT,
+            CRASH_PROMPT,
+            "Meet at 10:30 and check the build in src/cart.rs:12 before lunch.",
+            "Call total(3, 4) and compare the result with the CSV.",
+            "w0 w1 w2 w3 w4 w5 w6 w7 w8 w9",
+        ] {
+            assert!(!PastedErrors::may_be_error(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_only_mentions_an_error_has_no_signature() {
+        for prompt in [
+            "Fix the error in src/cart.rs",
+            "Error",
+            "Why does this error happen when I run cargo build?",
+            "error handling in the cart is wrong",
+            "The TypeError is back, can you look at the listing page?",
+            "warning: unused variable: `x`",
+        ] {
+            assert_eq!(
+                PastedErrors::signatures(prompt),
+                Vec::<String>::new(),
+                "{prompt}"
+            );
+        }
     }
 
     #[derive(Debug)]

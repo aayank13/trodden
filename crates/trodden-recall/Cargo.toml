@@ -12,9 +12,11 @@ publish = false
 anyhow.workspace = true
 jiff.workspace = true
 rand = { version = "0.10.3", default-features = false, features = ["std", "sys_rng"] }
+trodden-capture.workspace = true
 trodden-core.workspace = true
 trodden-embed.workspace = true
 trodden-learn.workspace = true
+trodden-redact.workspace = true
 trodden-store.workspace = true
 
 [lints]
