@@ -14,6 +14,8 @@ const MAX_EXAMPLES: usize = 8;
 
 const MAX_AVOID: usize = 3;
 
+type FamilyRow = (i64, u32, String, String, String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upsert {
     Created { rowid: i64 },
@@ -62,35 +64,44 @@ pub struct LexicalHit {
 
 impl Store {
     pub fn upsert(&mut self, candidate: &Procedure) -> Result<Upsert> {
-        let signature = Self::signature(candidate)?;
-        let tx = self
-            .conn
-            .transaction()
-            .context("start storing a procedure")?;
-        let existing: Vec<(i64, u32, String, String, String)> = {
-            let mut statement = tx
-                .prepare_cached("SELECT rowid, revision, signature, document, state FROM procedures WHERE family = ?1")
-                .context("prepare the family lookup")?;
-            statement
-                .query_map([candidate.family.as_str()], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .context("look up the procedure family")?
-                .collect::<Result<_, _>>()
-                .context("read the procedure family")?
-        };
+        let tx = self.storing()?;
+        let existing = Self::family(&tx, candidate)?;
+        let outcome = Self::save(&tx, &existing, candidate)?;
+        tx.commit().context("commit a procedure")?;
+        Ok(outcome)
+    }
 
-        let outcome = if let Some(mut absorber) = Self::absorber(&existing, candidate, &signature)?
-        {
+    fn storing(&mut self) -> Result<Transaction<'_>> {
+        self.conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start storing a procedure")
+    }
+
+    fn family(tx: &Transaction<'_>, candidate: &Procedure) -> Result<Vec<FamilyRow>> {
+        let mut statement = tx
+            .prepare_cached("SELECT rowid, revision, signature, document, state FROM procedures WHERE family = ?1")
+            .context("prepare the family lookup")?;
+        statement
+            .query_map([candidate.family.as_str()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .context("look up the procedure family")?
+            .collect::<Result<_, _>>()
+            .context("read the procedure family")
+    }
+
+    fn save(tx: &Transaction<'_>, existing: &[FamilyRow], candidate: &Procedure) -> Result<Upsert> {
+        let signature = Self::signature(candidate)?;
+        let outcome = if let Some(mut absorber) = Self::absorber(existing, candidate, &signature)? {
             let stored = &mut absorber.stored;
             Self::merge(stored, candidate);
-            stored.state = Self::refreshed_state(absorber.state, absorber.rowid, &existing);
+            stored.state = Self::refreshed_state(absorber.state, absorber.rowid, existing);
             tx.execute(
                 "UPDATE procedures SET state = ?1, document = ?2, signature = ?3, updated_at = ?4, used_at = ?5
                  WHERE rowid = ?6",
@@ -105,7 +116,7 @@ impl Store {
             )
             .context("refresh a procedure revision")?;
             if stored.state == Lifecycle::Active {
-                Self::reindex(&tx, stored.id.as_str())?;
+                Self::reindex(tx, stored.id.as_str())?;
             }
             let rowid = absorber.rowid;
             if absorber.generalized {
@@ -156,18 +167,17 @@ impl Store {
             .context("insert a procedure revision")?;
             let rowid = tx.last_insert_rowid();
             if stored.state == Lifecycle::Active {
-                Self::reindex(&tx, stored.id.as_str())?;
+                Self::reindex(tx, stored.id.as_str())?;
                 Upsert::Created { rowid }
             } else {
                 Upsert::Revised { rowid }
             }
         };
-        tx.commit().context("commit a procedure")?;
         Ok(outcome)
     }
 
     fn absorber(
-        family: &[(i64, u32, String, String, String)],
+        family: &[FamilyRow],
         candidate: &Procedure,
         signature: &str,
     ) -> Result<Option<Absorber>> {
@@ -206,11 +216,7 @@ impl Store {
         Ok(None)
     }
 
-    fn refreshed_state(
-        state: Lifecycle,
-        rowid: i64,
-        family: &[(i64, u32, String, String, String)],
-    ) -> Lifecycle {
+    fn refreshed_state(state: Lifecycle, rowid: i64, family: &[FamilyRow]) -> Lifecycle {
         match state {
             Lifecycle::Stale => Lifecycle::Active,
             Lifecycle::Archived
@@ -658,11 +664,14 @@ pub enum Forget<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
+    use rusqlite::ErrorCode;
     use trodden_core::{FamilyId, ProcedureId, RepoId, SessionId, procedure::StepKind};
     use trodden_learn::Evidence;
 
     use super::*;
-    use crate::{Cue, ExtractionRecord, FamilyEvidence, Injection, Stats};
+    use crate::{Cue, ExtractionRecord, FamilyEvidence, Injection, Patience, Stats};
 
     const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
 
@@ -721,6 +730,49 @@ mod tests {
                         .to_owned()
                 })
                 .collect()
+        }
+    }
+
+    #[derive(Debug)]
+    struct Contention {
+        dir: PathBuf,
+    }
+
+    impl Contention {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("trodden-contention-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch directory is writable");
+            Self { dir }
+        }
+
+        fn open(&self, patience: Patience) -> Store {
+            Store::open(&self.dir.join("trodden.db"), patience).expect("store opens")
+        }
+
+        fn injection() -> Injection {
+            Injection {
+                session: SESSION.to_owned(),
+                procedure: "p_0c4e2a9b".to_owned(),
+                revision: 1,
+                holdout: false,
+                cue: Cue::Prompt,
+                at: "2026-09-21T14:03:00Z".parse().expect("timestamp is valid"),
+            }
+        }
+
+        fn is_busy(error: &anyhow::Error) -> bool {
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                == Some(ErrorCode::DatabaseBusy)
+        }
+    }
+
+    impl Drop for Contention {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -957,6 +1009,28 @@ mod tests {
             [(1, Lifecycle::Candidate), (2, Lifecycle::Active)]
         );
         assert!(recallable(&store));
+    }
+
+    #[test]
+    fn storing_a_procedure_survives_a_hook_writing_between_its_read_and_write() {
+        let scratch = Contention::new("upsert");
+        let mut ingest = scratch.open(Patience::Batch);
+        let hook = scratch.open(Patience::Interactive);
+        let candidate = Procedure::example();
+
+        let tx = ingest.storing().expect("transaction starts");
+        let existing = Store::family(&tx, &candidate).expect("family reads");
+        let interleaved = hook.record_injection(&Contention::injection());
+        let stored = Store::save(&tx, &existing, &candidate).expect("procedure is stored");
+        tx.commit().expect("procedure commits");
+
+        let refusal = interleaved.expect_err("the hook waits for the procedure to be stored");
+        assert!(Contention::is_busy(&refusal), "{refusal:?}");
+        hook.record_injection(&Contention::injection())
+            .expect("injection recorded once the procedure is stored");
+        assert!(matches!(stored, Upsert::Created { .. }));
+        assert_eq!(injected(&ingest), ["p_0c4e2a9b"]);
+        assert!(recallable(&ingest));
     }
 
     #[test]
