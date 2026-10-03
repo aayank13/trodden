@@ -176,7 +176,7 @@ impl Store {
                     (SELECT COUNT(DISTINCT id) FROM procedures WHERE state != 'retired'),
                     (SELECT COUNT(*) FROM procedures),
                     (SELECT COUNT(*) FROM sessions),
-                    (SELECT COUNT(*) FROM extractions WHERE procedure IS NULL),
+                    (SELECT COUNT(*) FROM extractions WHERE rejection IS NOT NULL),
                     (SELECT COUNT(*) FROM injections WHERE NOT holdout)",
                 [],
                 |row| {
@@ -343,6 +343,31 @@ mod tests {
             "{refusal:#}"
         );
         assert_eq!(scratch.fingerprint(), behind);
+    }
+
+    #[test]
+    fn stats_count_only_extractions_with_a_rejection_reason() {
+        let store = Store::open_in_memory().expect("store opens");
+        for (first_seq, rejection) in [(0, None), (8, Some("no files were changed"))] {
+            store
+                .record_extraction(&ExtractionRecord {
+                    session: "s_4b1d".to_owned(),
+                    first_seq,
+                    summary: "Page 2 repeats the last product".to_owned(),
+                    procedure: None,
+                    rejection: rejection.map(str::to_owned),
+                    outcome: Some("succeeded".to_owned()),
+                    tool_calls: Some(6),
+                    span: None,
+                    at: "2026-09-21T14:02:44Z".to_owned(),
+                })
+                .expect("extraction recorded");
+        }
+
+        let listed = store.rejections(10).expect("rejections read").len();
+
+        assert_eq!(store.stats().expect("stats read").rejections, 1);
+        assert_eq!(listed, 1);
     }
 
     #[test]
