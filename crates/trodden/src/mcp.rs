@@ -12,7 +12,7 @@ use rmcp::{
 use serde::Deserialize;
 use trodden::{Home, Workspace};
 use trodden_recall::{Decision, Envelope, Query, Recall};
-use trodden_store::Patience;
+use trodden_store::{Patience, Store};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Server {
@@ -123,8 +123,8 @@ impl Server {
     }
 
     fn recall_text(&self, prompt: &str, cwd: &Path, explain: bool) -> Result<String> {
-        let store = self.home.open_store(Patience::Batch)?;
-        let workspace = Workspace::resolve(cwd, &store)?;
+        let store = self.store()?;
+        let workspace = Workspace::resolve_read_only(cwd, &store)?;
         let mut recall = Recall::new(&store, self.home.semantic());
         let outcome = recall.recall(&Query {
             prompt,
@@ -159,8 +159,8 @@ impl Server {
     }
 
     fn list_text(&self, cwd: &Path) -> Result<String> {
-        let store = self.home.open_store(Patience::Batch)?;
-        let workspace = Workspace::resolve(cwd, &store)?;
+        let store = self.store()?;
+        let workspace = Workspace::resolve_read_only(cwd, &store)?;
         let rows = store.list(Some(workspace.repo.as_str()), false)?;
         Ok(rows
             .iter()
@@ -175,7 +175,7 @@ impl Server {
     }
 
     fn show_text(&self, id: &str) -> Result<String> {
-        let store = self.home.open_store(Patience::Batch)?;
+        let store = self.store()?;
         let revisions: Vec<_> = store
             .revisions(id)?
             .into_iter()
@@ -186,7 +186,7 @@ impl Server {
     }
 
     fn status_text(&self) -> Result<String> {
-        let store = self.home.open_store(Patience::Batch)?;
+        let store = self.store()?;
         let stats = store.stats()?;
         Ok(format!(
             "capture: {}; semantic matching: {}; procedures: {}; sessions: {}; injections: {}",
@@ -202,16 +202,25 @@ impl Server {
         ))
     }
 
+    fn store(&self) -> Result<Store> {
+        Store::open_read_only(&self.home.database(), Patience::Batch)
+    }
+
     fn directory(cwd: &str) -> Result<PathBuf, ErrorData> {
         let path = PathBuf::from(cwd);
-        if path.is_absolute() {
-            Ok(path)
-        } else {
-            Err(ErrorData::invalid_params(
+        if !path.is_absolute() {
+            return Err(ErrorData::invalid_params(
                 format!("`cwd` must be an absolute path, got {cwd:?}"),
                 None,
-            ))
+            ));
         }
+        if !path.is_dir() {
+            return Err(ErrorData::invalid_params(
+                format!("`cwd` must be an existing directory, got {cwd:?}"),
+                None,
+            ));
+        }
+        Ok(path)
     }
 
     fn error(error: &anyhow::Error) -> ErrorData {
@@ -231,9 +240,25 @@ mod tests {
             let error = Server::directory(cwd).expect_err("relative paths are rejected");
             assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         }
+        let here = std::env::current_dir().expect("current directory exists");
         assert_eq!(
-            Server::directory("/home/dev/shop").expect("absolute paths are accepted"),
-            PathBuf::from("/home/dev/shop")
+            Server::directory(&here.to_string_lossy()).expect("directories are accepted"),
+            here
         );
+    }
+
+    #[test]
+    fn tools_reject_working_directories_that_are_not_directories() {
+        let here = std::env::current_dir().expect("current directory exists");
+        for path in [here.join("missing/agent/path"), here.join("Cargo.toml")] {
+            let error = Server::directory(&path.to_string_lossy())
+                .expect_err("non-directories are rejected");
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert!(
+                error.message.contains("existing directory"),
+                "{}",
+                error.message
+            );
+        }
     }
 }

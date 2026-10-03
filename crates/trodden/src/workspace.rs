@@ -17,11 +17,19 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn resolve(cwd: &Path, store: &Store) -> Result<Self> {
+        Self::identify(cwd, store, true)
+    }
+
+    pub fn resolve_read_only(cwd: &Path, store: &Store) -> Result<Self> {
+        Self::identify(cwd, store, false)
+    }
+
+    fn identify(cwd: &Path, store: &Store, remember: bool) -> Result<Self> {
         let cwd = path::absolute(cwd)
             .with_context(|| format!("resolve the working directory {:?}", cwd.display()))?;
         let root = Self::find_root(&cwd);
         let repo = match Self::stamp(&root) {
-            Some(stamp) => Self::cached_id(&root, &stamp, store)?,
+            Some(stamp) => Self::cached_id(&root, &stamp, store, remember)?,
             None => Self::path_id(&root),
         };
         Ok(Self {
@@ -42,7 +50,7 @@ impl Workspace {
             .to_path_buf()
     }
 
-    fn cached_id(root: &Path, stamp: &str, store: &Store) -> Result<String> {
+    fn cached_id(root: &Path, stamp: &str, store: &Store, remember: bool) -> Result<String> {
         let key = format!("{}#{stamp}", root.to_string_lossy());
         if let Some(repo) = store.repo_for_root(&key)? {
             return Ok(repo);
@@ -53,7 +61,9 @@ impl Workspace {
         let Some(repo) = Self::history_id(root) else {
             return Ok(Self::path_id(root));
         };
-        store.remember_repo(&key, &repo)?;
+        if remember {
+            store.remember_repo(&key, &repo)?;
+        }
         Ok(repo)
     }
 
@@ -343,6 +353,30 @@ mod tests {
         assert_eq!(scratch.resolve(&shallow), root_commit(&origin));
         assert_eq!(scratch.resolve(&worktree), root_commit(&origin));
         assert_eq!(scratch.resolve(&full), root_commit(&origin));
+    }
+
+    #[test]
+    fn read_only_resolution_uses_the_cache_without_filling_it() {
+        let scratch = Scratch::new("read-only");
+        let repo = scratch.repo("shop", &["first"]);
+        let stamp = Workspace::stamp(&repo).expect("repository has a stamp");
+        let key = format!("{}#{stamp}", text(&repo));
+
+        let read_only =
+            Workspace::resolve_read_only(&repo, &scratch.store).expect("workspace resolves");
+        assert_eq!(read_only.repo.as_str(), root_commit(&repo));
+        assert_eq!(
+            scratch.store.repo_for_root(&key).expect("cache reads"),
+            None
+        );
+
+        scratch
+            .store
+            .remember_repo(&key, "cached")
+            .expect("cache writes");
+        let cached =
+            Workspace::resolve_read_only(&repo, &scratch.store).expect("workspace resolves");
+        assert_eq!(cached.repo.as_str(), "cached");
     }
 
     #[test]
