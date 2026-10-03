@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{self, Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
@@ -16,6 +16,44 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    const VERSION_CONTROL: [&str; 8] = [
+        ".hg",
+        ".jj",
+        ".svn",
+        ".bzr",
+        ".pijul",
+        "_darcs",
+        ".fslckout",
+        "_FOSSIL_",
+    ];
+
+    const MANIFESTS: [&str; 24] = [
+        "package.json",
+        "deno.json",
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
+        "setup.py",
+        "Pipfile",
+        "Gemfile",
+        "composer.json",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "build.sbt",
+        "mix.exs",
+        "rebar.config",
+        "Package.swift",
+        "pubspec.yaml",
+        "stack.yaml",
+        "dune-project",
+        "deps.edn",
+        "Project.toml",
+        "flake.nix",
+        "CMakeLists.txt",
+        "Makefile",
+    ];
+
     pub fn resolve(cwd: &Path, store: &Store) -> Result<Self> {
         Self::identify(cwd, store, true)
     }
@@ -25,9 +63,18 @@ impl Workspace {
     }
 
     fn identify(cwd: &Path, store: &Store, remember: bool) -> Result<Self> {
+        Self::identify_under(cwd, env::home_dir().as_deref(), store, remember)
+    }
+
+    fn identify_under(
+        cwd: &Path,
+        home: Option<&Path>,
+        store: &Store,
+        remember: bool,
+    ) -> Result<Self> {
         let cwd = path::absolute(cwd)
             .with_context(|| format!("resolve the working directory {:?}", cwd.display()))?;
-        let root = Self::find_root(&cwd);
+        let root = Self::find_root(&cwd, home);
         let repo = match Self::stamp(&root) {
             Some(stamp) => Self::cached_id(&root, &stamp, store, remember)?,
             None => Self::path_id(&root),
@@ -43,11 +90,35 @@ impl Workspace {
             .and_then(|out| out.lines().next().map(str::to_owned))
     }
 
-    fn find_root(cwd: &Path) -> PathBuf {
-        cwd.ancestors()
-            .find(|dir| dir.join(".git").exists())
+    fn find_root(cwd: &Path, home: Option<&Path>) -> PathBuf {
+        let ceiling = Self::enclosing_home(cwd, home);
+        let candidates: Vec<&Path> = cwd
+            .ancestors()
+            .take_while(|dir| ceiling.as_deref() != Some(*dir))
+            .collect();
+        let below_filesystem_root = match candidates.split_last() {
+            Some((last, rest)) if last.parent().is_none() => rest,
+            _ => &candidates,
+        };
+        Self::nearest(&candidates, &[".git"])
+            .or_else(|| Self::nearest(&candidates, &Self::VERSION_CONTROL))
+            .or_else(|| Self::nearest(below_filesystem_root, &Self::MANIFESTS))
             .unwrap_or(cwd)
             .to_path_buf()
+    }
+
+    fn nearest<'a>(dirs: &[&'a Path], markers: &[&str]) -> Option<&'a Path> {
+        dirs.iter()
+            .find(|dir| markers.iter().any(|name| dir.join(name).exists()))
+            .copied()
+    }
+
+    fn enclosing_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+        let home = home?;
+        [path::absolute(home).ok(), fs::canonicalize(home).ok()]
+            .into_iter()
+            .flatten()
+            .find(|home| cwd != home && cwd.starts_with(home))
     }
 
     fn cached_id(root: &Path, stamp: &str, store: &Store, remember: bool) -> Result<String> {
@@ -241,6 +312,26 @@ mod tests {
                 .repo
                 .as_str()
                 .to_owned()
+        }
+
+        fn under_home(&self, cwd: &Path, home: &Path) -> Workspace {
+            Workspace::identify_under(cwd, Some(home), &self.store, true)
+                .expect("workspace resolves")
+        }
+
+        fn directory(base: &Path, relative: &str, markers: &[&str]) -> PathBuf {
+            let dir = base.join(relative);
+            fs::create_dir_all(&dir).expect("project directory is writable");
+            for marker in markers {
+                fs::write(dir.join(marker), "").expect("marker is writable");
+            }
+            dir
+        }
+
+        fn assert_root(&self, cwd: &Path, home: &Path, root: &Path) {
+            let workspace = self.under_home(cwd, home);
+            assert_eq!(workspace.root, root, "root of {}", cwd.display());
+            assert_eq!(workspace.repo.as_str(), Workspace::path_id(root));
         }
 
         fn invalid_git_dir(repo: &Path, name: &str) -> PathBuf {
@@ -454,5 +545,79 @@ mod tests {
             Workspace::normalize_remote("file:///srv/git/shop.git"),
             Workspace::normalize_remote("/srv/git/shop"),
         );
+    }
+
+    #[test]
+    fn non_git_subdirectories_share_the_nearest_project_root() {
+        let scratch = Scratch::new("manifest");
+        let shop = Scratch::directory(&scratch.dir, "shop", &["package.json"]);
+        let deep = Scratch::directory(&shop, "src/lib", &[]);
+        for cwd in [&shop, &shop.join("src"), &deep] {
+            scratch.assert_root(cwd, &scratch.dir, &shop);
+        }
+        let worker = Scratch::directory(&shop, "worker", &["Cargo.toml"]);
+        scratch.assert_root(&worker.join("src"), &scratch.dir, &worker);
+    }
+
+    #[test]
+    fn version_control_roots_outrank_nested_manifests() {
+        let scratch = Scratch::new("vcs");
+        let mono = Scratch::directory(&scratch.dir, "mono", &[]);
+        fs::create_dir_all(mono.join(".hg")).expect("hg directory is writable");
+        let web = Scratch::directory(&mono, "packages/web", &["package.json"]);
+        scratch.assert_root(&web.join("src"), &scratch.dir, &mono);
+        scratch.assert_root(&mono, &scratch.dir, &mono);
+    }
+
+    #[test]
+    fn git_roots_outrank_nested_manifests() {
+        let scratch = Scratch::new("git-manifest");
+        let shop = scratch.repo("shop", &["shop"]);
+        let web = Scratch::directory(&shop, "web/src", &[]);
+        fs::write(shop.join("web/package.json"), "").expect("manifest is writable");
+        let workspace = scratch.under_home(&web, &scratch.dir);
+        assert_eq!(workspace.root, shop);
+        assert_eq!(workspace.repo.as_str(), root_commit(&shop));
+    }
+
+    #[test]
+    fn directories_without_markers_are_their_own_root() {
+        let scratch = Scratch::new("bare");
+        let notes = Scratch::directory(&scratch.dir, "notes", &[]);
+        let drafts = Scratch::directory(&notes, "drafts", &[]);
+        scratch.assert_root(&drafts, &scratch.dir, &drafts);
+        scratch.assert_root(&notes, &scratch.dir, &notes);
+    }
+
+    #[test]
+    fn a_repository_at_home_does_not_swallow_projects_under_it() {
+        let scratch = Scratch::new("home");
+        let home = scratch.repo("home", &["dotfiles"]);
+        fs::write(home.join("Makefile"), "").expect("manifest is writable");
+        let drafts = Scratch::directory(&home, "notes/drafts", &[]);
+        let shop = Scratch::directory(&home, "code/shop", &["Cargo.toml"]);
+        let blog = scratch.repo("home/code/blog", &["blog"]);
+        fs::create_dir_all(blog.join("src")).expect("source directory is writable");
+
+        scratch.assert_root(&drafts, &home, &drafts);
+        scratch.assert_root(&shop.join("src"), &home, &shop);
+        assert_eq!(
+            scratch.under_home(&blog.join("src"), &home).repo.as_str(),
+            root_commit(&blog)
+        );
+        let at_home = scratch.under_home(&home, &home);
+        assert_eq!(at_home.root, home);
+        assert_eq!(at_home.repo.as_str(), root_commit(&home));
+    }
+
+    #[test]
+    fn a_home_inside_a_repository_does_not_hide_it() {
+        let scratch = Scratch::new("home-inside");
+        let shop = scratch.repo("shop", &["shop"]);
+        let home = Scratch::directory(&shop, "tmp/home", &[]);
+        let src = Scratch::directory(&shop, "src", &[]);
+        let workspace = scratch.under_home(&src, &home);
+        assert_eq!(workspace.root, shop);
+        assert_eq!(workspace.repo.as_str(), root_commit(&shop));
     }
 }
