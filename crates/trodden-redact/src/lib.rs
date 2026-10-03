@@ -370,6 +370,10 @@ impl<'a> Value<'a> {
 }
 
 impl Redactor {
+    const PATH_DELIMITERS: &[char] = &[
+        '"', '\'', '`', '=', ':', ',', ';', '(', ')', '[', ']', '{', '}', '<', '>', '|', '&',
+    ];
+
     pub fn new() -> Self {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -455,17 +459,42 @@ impl Redactor {
 
     fn fold_home(text: &str, home: &str) -> String {
         let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(index) = rest.find(home) {
-            let after = &rest[index + home.len()..];
-            let at_boundary =
-                after.is_empty() || after.starts_with(['/', '\\', ' ', '"', '\'', ':']);
-            out.push_str(&rest[..index]);
-            out.push_str(if at_boundary { "~" } else { home });
-            rest = after;
+        let mut copied = 0;
+        for (start, _) in text.match_indices(home) {
+            let end = start + home.len();
+            if Self::starts_path(&text[..start]) && Self::ends_path(&text[end..]) {
+                out.push_str(&text[copied..start]);
+                out.push('~');
+                copied = end;
+            }
         }
-        out.push_str(rest);
+        out.push_str(&text[copied..]);
         out
+    }
+
+    fn starts_path(before: &str) -> bool {
+        let mut chars = before.chars().rev();
+        match chars.next() {
+            None => true,
+            Some(':') => !Self::ends_drive(chars),
+            Some(c) => Self::is_path_delimiter(c),
+        }
+    }
+
+    fn ends_drive(mut chars: impl Iterator<Item = char>) -> bool {
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.next().is_none_or(|c| !c.is_alphanumeric())
+    }
+
+    fn ends_path(after: &str) -> bool {
+        after
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '/' | '\\') || Self::is_path_delimiter(c))
+    }
+
+    fn is_path_delimiter(c: char) -> bool {
+        c.is_whitespace() || Self::PATH_DELIMITERS.contains(&c)
     }
 
     fn redact_random(token: &str) -> String {
@@ -547,6 +576,41 @@ mod tests {
             redactor.redact(&command),
             "STRIPE_KEY=[REDACTED:stripe-key] node ~/shop/seed.js",
         );
+    }
+
+    #[test]
+    fn folds_home_only_where_a_path_starts() {
+        let redactor = Redactor::with_home("/Users/ada");
+        let cases = [
+            ("/Users/ada", "~"),
+            ("/Users/ada/proj", "~/proj"),
+            ("cd /Users/ada/proj", "cd ~/proj"),
+            ("cd\t/Users/ada/proj", "cd\t~/proj"),
+            ("cargo build --out=/Users/ada/x", "cargo build --out=~/x"),
+            (r#"open("/Users/ada/x")"#, r#"open("~/x")"#),
+            ("open('/Users/ada/x')", "open('~/x')"),
+            ("echo `ls /Users/ada`", "echo `ls ~`"),
+            ("diff (/Users/ada/a) [/Users/ada/b]", "diff (~/a) [~/b]"),
+            ("cd $(echo /Users/ada);ls", "cd $(echo ~);ls"),
+            (
+                "PATH=/Users/ada/bin:/Users/ada/.cargo/bin",
+                "PATH=~/bin:~/.cargo/bin",
+            ),
+            ("ls /Users/ada:/Users/ada", "ls ~:~"),
+            ("cat a.txt,/Users/ada/b.txt", "cat a.txt,~/b.txt"),
+            ("ls /mnt/Users/ada/proj", "ls /mnt/Users/ada/proj"),
+            ("C:/Users/ada/x", "C:/Users/ada/x"),
+            ("dir --out=C:/Users/ada/x", "dir --out=C:/Users/ada/x"),
+            ("cd /Users/adam/x", "cd /Users/adam/x"),
+            ("cd x/Users/ada", "cd x/Users/ada"),
+            ("cd ~/Users/ada", "cd ~/Users/ada"),
+            ("/Users/ada/Users/ada", "~/Users/ada"),
+            ("file:///Users/ada/x", "file:///Users/ada/x"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redactor.redact(text), expected, "{text}");
+            assert_eq!(redactor.redact(expected), expected, "{expected}");
+        }
     }
 
     #[test]
@@ -917,6 +981,17 @@ mod tests {
     quickcheck! {
         fn redaction_is_idempotent(text: String) -> bool {
             let redactor = Redactor::with_home("/Users/ada");
+            let once = redactor.redact(&text).into_owned();
+            redactor.redact(&once) == once
+        }
+
+        fn home_folding_is_idempotent(picks: Vec<u8>) -> bool {
+            let redactor = Redactor::with_home("/Users/ada");
+            let pieces = ["/Users/ada", "/", "\\", ":", "C", "a", " ", "=", "~", "(", "x/"];
+            let text: String = picks
+                .iter()
+                .map(|&pick| pieces[usize::from(pick) % pieces.len()])
+                .collect();
             let once = redactor.redact(&text).into_owned();
             redactor.redact(&once) == once
         }
