@@ -112,6 +112,12 @@ enum Command {
         ended: bool,
         #[arg(long, help = "Print nothing")]
         quiet: bool,
+        #[arg(
+            long,
+            hide = true,
+            help = "Leave the transcript to an ingest that is already running instead of waiting for it"
+        )]
+        background: bool,
     },
     #[command(about = "Manage the embedding model used for semantic matching")]
     Embeddings {
@@ -196,9 +202,14 @@ impl Command {
                 transcript,
                 ended,
                 quiet,
+                background,
             } => {
-                let report = Ingest::start(&home)?.claude_code(&transcript, ended)?;
-                if !quiet {
+                let report = if background {
+                    Ingest::claude_code_or_defer(&home, &transcript, ended)?
+                } else {
+                    Some(Ingest::claude_code_waiting(&home, &transcript, ended)?)
+                };
+                if let Some(report) = report.filter(|_| !quiet) {
                     Self::print_report(&report);
                 }
                 Ok(())

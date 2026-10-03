@@ -266,7 +266,10 @@ impl Hook {
             return Ok(());
         };
         let mut command = Command::new(env::current_exe().context("find the trodden executable")?);
-        command.arg("ingest").arg(transcript).arg("--quiet");
+        command
+            .arg("ingest")
+            .arg(transcript)
+            .args(["--quiet", "--background"]);
         if ended {
             command.arg("--ended");
         }
