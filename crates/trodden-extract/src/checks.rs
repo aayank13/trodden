@@ -1,4 +1,10 @@
-use std::{cmp::Reverse, fs, path::Path, sync::LazyLock};
+use std::{
+    cmp::Reverse,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    sync::LazyLock,
+};
 
 use regex::Regex;
 use serde_json::Value;
@@ -15,6 +21,8 @@ const DOCS: &[&str] = &[
     "README.md",
     "README",
 ];
+
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 const SCRIPTS: &[(&str, &str)] = &[
     ("tools/check.py", "python3 tools/check.py"),
@@ -58,7 +66,7 @@ pub struct ProjectChecks {
 
 impl ProjectChecks {
     pub fn discover(root: &Path) -> Self {
-        let read = |name: &str| fs::read_to_string(root.join(name)).ok();
+        let read = |name: &str| Self::read(root, name);
         let mut found = Vec::new();
 
         for doc in DOCS {
@@ -99,6 +107,20 @@ impl ProjectChecks {
         }
 
         Self::from_commands(found)
+    }
+
+    fn read(root: &Path, name: &str) -> Option<String> {
+        let path = root.join(name).canonicalize().ok()?;
+        if !path.starts_with(root.canonicalize().ok()?) || !fs::metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .ok()?
+            .take(MAX_FILE_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     pub fn from_commands(commands: impl IntoIterator<Item = (String, String)>) -> Self {
@@ -470,5 +492,87 @@ mod tests {
             "cargo test {test}",
             "cargo test due_prints"
         ));
+    }
+
+    #[derive(Debug)]
+    struct Scratch {
+        root: std::path::PathBuf,
+    }
+
+    impl Scratch {
+        const CONTRIBUTING: &str = "Run `make check` before sending a change.\n";
+
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("trodden-checks-{name}-{}", std::process::id()));
+            fs::create_dir_all(&root).expect("scratch directory is creatable");
+            fs::write(root.join("CONTRIBUTING.md"), Self::CONTRIBUTING)
+                .expect("scratch file is writable");
+            Self { root }
+        }
+
+        fn commands(&self) -> Vec<(String, String)> {
+            ProjectChecks::discover(&self.root)
+                .checks
+                .into_iter()
+                .map(|check| (check.command, check.source))
+                .collect()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("scratch directory is removable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_docs_that_are_not_regular_files_inside_the_project() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new("special");
+        let elsewhere = Scratch::new("special-elsewhere");
+        fs::write(elsewhere.root.join("README.md"), "Run `npm test` first.\n")
+            .expect("scratch file is writable");
+        let status = std::process::Command::new("mkfifo")
+            .arg(scratch.root.join("README.md"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+        symlink("/dev/zero", scratch.root.join("AGENTS.md")).expect("symlink is creatable");
+        symlink(
+            elsewhere.root.join("README.md"),
+            scratch.root.join("CLAUDE.md"),
+        )
+        .expect("symlink is creatable");
+        fs::write(scratch.root.join("notes.txt"), "Run `cargo test` first.\n")
+            .expect("scratch file is writable");
+        symlink("notes.txt", scratch.root.join("README")).expect("symlink is creatable");
+
+        assert_eq!(
+            scratch.commands(),
+            [
+                ("make check".to_owned(), "CONTRIBUTING.md".to_owned()),
+                ("cargo test".to_owned(), "README".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_only_the_start_of_a_huge_doc() {
+        let scratch = Scratch::new("huge");
+        let mut readme = b"Run `cargo test` before sending a change.\n".to_vec();
+        readme.resize(4 * 1024 * 1024, b'x');
+        readme.extend(b"\nRun `npm test` too.\n");
+        fs::write(scratch.root.join("README.md"), readme).expect("scratch file is writable");
+
+        assert_eq!(
+            scratch.commands(),
+            [
+                ("make check".to_owned(), "CONTRIBUTING.md".to_owned()),
+                ("cargo test".to_owned(), "README.md".to_owned()),
+            ]
+        );
     }
 }

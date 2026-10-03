@@ -6,8 +6,10 @@ mod skeleton;
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
-    path::Path,
+    env,
+    fs::{self, File},
+    io::Read,
+    path::{Component, Path},
 };
 
 use anyhow::{Context, Result};
@@ -35,6 +37,8 @@ const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_TERMS: usize = 512;
 
 const RRF_K: f64 = 60.0;
+
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Query<'a> {
@@ -468,11 +472,11 @@ impl Preconditions {
                 Condition::FileExists { path } => {
                     (!root.join(path).exists()).then(|| format!("{path} does not exist"))
                 }
-                Condition::SymbolInFile { path, symbol } => fs::read_to_string(root.join(path))
-                    .map_or(true, |text| !text.contains(symbol.as_str()))
+                Condition::SymbolInFile { path, symbol } => Self::read(root, path)
+                    .is_none_or(|text| !text.contains(symbol.as_str()))
                     .then(|| format!("{path} no longer mentions {symbol}")),
                 Condition::ProgramOnPath { program } => {
-                    (!Self::on_path(program)).then(|| format!("{program} is not on PATH"))
+                    (!Self::on_path(program, root)).then(|| format!("{program} is not on PATH"))
                 }
                 Condition::EnvVarSet { name } => env::var_os(name)
                     .is_none()
@@ -481,16 +485,50 @@ impl Preconditions {
             })
     }
 
-    fn on_path(program: &str) -> bool {
-        if program.contains('/') {
-            return Path::new(program).exists();
+    fn read(root: &Path, path: &str) -> Option<String> {
+        let relative = Path::new(path);
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            return None;
+        }
+        let path = root.join(relative).canonicalize().ok()?;
+        if !path.starts_with(root.canonicalize().ok()?) || !fs::metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .ok()?
+            .take(MAX_FILE_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn on_path(program: &str, root: &Path) -> bool {
+        let program = Path::new(program);
+        if program.components().nth(1).is_some() {
+            return Self::runnable(&root.join(program));
         }
         env::var_os("PATH").is_some_and(|path| {
-            env::split_paths(&path).any(|dir| {
-                let candidate = dir.join(program);
-                candidate.is_file() || (cfg!(windows) && candidate.with_extension("exe").is_file())
-            })
+            env::split_paths(&path).any(|dir| Self::runnable(&dir.join(program)))
         })
+    }
+
+    fn runnable(candidate: &Path) -> bool {
+        candidate.is_file()
+            || (cfg!(windows)
+                && env::var_os("PATHEXT")
+                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .any(|extension| {
+                        let mut name = candidate.as_os_str().to_owned();
+                        name.push(extension);
+                        Path::new(&name).is_file()
+                    }))
     }
 }
 
@@ -939,5 +977,134 @@ mod tests {
         let terms = Recall::terms(&words);
         assert_eq!(terms.len(), MAX_TERMS);
         assert_eq!(terms[MAX_TERMS - 1], format!("w{}", MAX_TERMS - 1));
+    }
+
+    #[derive(Debug)]
+    struct Checkout {
+        root: std::path::PathBuf,
+    }
+
+    impl Checkout {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "trodden-preconditions-{name}-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(root.join("src")).expect("scratch directory is creatable");
+            Self { root }
+        }
+
+        fn write(&self, path: &str, contents: &[u8]) -> &Self {
+            fs::write(self.root.join(path), contents).expect("scratch file is writable");
+            self
+        }
+
+        fn failure(&self, condition: Condition) -> Option<String> {
+            let mut procedure = Procedure::example();
+            procedure.preconditions = vec![condition];
+            Preconditions::first_failure(&procedure, &self.root)
+        }
+
+        fn mentions(&self, path: &str) -> bool {
+            self.failure(Condition::SymbolInFile {
+                path: path.to_owned(),
+                symbol: "paginate".to_owned(),
+            })
+            .is_none()
+        }
+    }
+
+    impl Drop for Checkout {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("scratch directory is removable");
+        }
+    }
+
+    #[test]
+    fn reads_symbols_only_from_files_inside_the_repository() {
+        let checkout = Checkout::new("inside");
+        checkout.write("src/paginate.js", b"export function paginate() {}\n");
+        let outside = checkout
+            .root
+            .join("src/paginate.js")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(checkout.mentions("src/paginate.js"));
+        assert!(checkout.mentions("./src/paginate.js"));
+        assert!(!checkout.mentions(&outside));
+        assert!(!checkout.mentions("src/../src/paginate.js"));
+        assert!(!checkout.mentions("src/missing.js"));
+        assert!(!checkout.mentions("src"));
+    }
+
+    #[test]
+    fn reads_only_the_start_of_a_huge_file() {
+        let checkout = Checkout::new("huge");
+        let mut early = b"paginate\n".to_vec();
+        early.resize(4 * 1024 * 1024, b'x');
+        let mut late = vec![b'x'; 4 * 1024 * 1024];
+        late.extend(b"paginate\n");
+        checkout
+            .write("src/early.log", &early)
+            .write("src/late.log", &late);
+
+        assert!(checkout.mentions("src/early.log"));
+        assert!(!checkout.mentions("src/late.log"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_only_to_regular_files_inside_the_repository() {
+        use std::os::unix::fs::symlink;
+
+        let checkout = Checkout::new("symlinks");
+        let elsewhere = Checkout::new("symlinks-elsewhere");
+        checkout.write("src/paginate.js", b"export function paginate() {}\n");
+        elsewhere.write("src/paginate.js", b"export function paginate() {}\n");
+        let link = |target: &Path, name: &str| {
+            symlink(target, checkout.root.join(name)).expect("symlink is creatable");
+        };
+        link(Path::new("paginate.js"), "src/linked.js");
+        link(Path::new("/dev/zero"), "src/zero.js");
+        link(&elsewhere.root.join("src/paginate.js"), "src/outside.js");
+
+        assert!(checkout.mentions("src/linked.js"));
+        assert!(!checkout.mentions("src/zero.js"));
+        assert!(!checkout.mentions("src/outside.js"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_wait_on_a_fifo() {
+        let checkout = Checkout::new("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(checkout.root.join("src/paginate.js"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+
+        assert!(!checkout.mentions("src/paginate.js"));
+    }
+
+    #[test]
+    fn finds_relative_programs_from_the_repository_root() {
+        let checkout = Checkout::new("programs");
+        fs::create_dir_all(checkout.root.join(".venv/bin")).expect("venv is creatable");
+        checkout.write(".venv/bin/pytest", b"");
+        let program = |program: &str| Condition::ProgramOnPath {
+            program: program.to_owned(),
+        };
+
+        assert_eq!(checkout.failure(program(".venv/bin/pytest")), None);
+        assert_eq!(checkout.failure(program("./.venv/bin/pytest")), None);
+        assert_eq!(
+            checkout.failure(program(".venv/bin/ruff")),
+            Some(".venv/bin/ruff is not on PATH".to_owned())
+        );
+        assert_eq!(
+            checkout.failure(program(".venv/bin")),
+            Some(".venv/bin is not on PATH".to_owned())
+        );
     }
 }
