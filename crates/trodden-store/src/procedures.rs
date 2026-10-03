@@ -56,6 +56,20 @@ pub struct EntityHit {
     pub kind: String,
 }
 
+impl EntityHit {
+    pub fn is_stem_of(&self, procedure: &Procedure) -> bool {
+        self.kind == "path"
+            && !procedure
+                .trigger
+                .entities
+                .iter()
+                .any(|entity| match entity {
+                    Entity::Path(path) => Store::file_keys(path).contains(&self.key),
+                    _ => false,
+                })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LexicalHit {
     pub rowid: i64,
@@ -350,23 +364,39 @@ impl Store {
     fn entity_keys(entity: &Entity) -> Vec<(String, &'static str)> {
         match entity {
             Entity::Path(path) => {
-                let path = path.to_lowercase();
-                let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
-                let stem = name.split('.').next().unwrap_or(&name).to_owned();
-                let mut keys = vec![(path.clone(), "path")];
-                if name != path {
-                    keys.push((name.clone(), "path"));
-                }
-                if stem != name && stem.len() > 2 {
-                    keys.push((stem, "path"));
-                }
-                keys
+                let keys = Self::file_keys(path);
+                let name = keys.last().expect("a path has a file name key");
+                let stem = name
+                    .split('.')
+                    .next()
+                    .filter(|stem| stem != name && stem.len() > 2)
+                    .map(|stem| (stem.to_owned(), "path"));
+                keys.into_iter()
+                    .map(|key| (key, "path"))
+                    .chain(stem)
+                    .collect()
             }
             Entity::Symbol(symbol) => vec![(symbol.to_lowercase(), "symbol")],
-            Entity::Command(command) => vec![(command.to_lowercase(), "command")],
+            Entity::Command(command) => {
+                let words = Terms::normalize(command);
+                (!words.is_empty())
+                    .then_some((words, "command"))
+                    .into_iter()
+                    .collect()
+            }
             Entity::ErrorSignature(signature) => vec![(signature.to_lowercase(), "error")],
             Entity::Package(package) => vec![(package.to_lowercase(), "package")],
             _ => Vec::new(),
+        }
+    }
+
+    fn file_keys(path: &str) -> Vec<String> {
+        let path = path.to_lowercase();
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        if name == path {
+            vec![path]
+        } else {
+            vec![path, name]
         }
     }
 
@@ -1045,6 +1075,56 @@ mod tests {
             assert_eq!(states(&store), [(1, Lifecycle::Active)], "`{check}`");
             assert!(recallable(&store), "`{check}`");
         }
+    }
+
+    #[test]
+    fn indexes_files_by_path_name_and_stem() {
+        let keys = |path: &str| Store::entity_keys(&Entity::Path(path.to_owned()));
+
+        assert_eq!(
+            keys("src/Index.js"),
+            [
+                ("src/index.js".to_owned(), "path"),
+                ("index.js".to_owned(), "path"),
+                ("index".to_owned(), "path"),
+            ]
+        );
+        assert_eq!(keys("Makefile"), [("makefile".to_owned(), "path")]);
+        assert_eq!(keys("db.rs"), [("db.rs".to_owned(), "path")]);
+    }
+
+    #[test]
+    fn indexes_commands_by_the_words_a_prompt_would_use() {
+        let keys = |command: &str| Store::entity_keys(&Entity::Command(command.to_owned()));
+
+        assert_eq!(keys("npm test"), [("npm test".to_owned(), "command")]);
+        assert_eq!(
+            keys("Python -m pytest"),
+            [("python m pytest".to_owned(), "command")]
+        );
+        assert!(keys("--").is_empty());
+    }
+
+    #[test]
+    fn tells_a_file_name_stem_from_a_whole_file_name() {
+        let mut procedure = Procedure::example();
+        procedure.trigger.entities = vec![
+            Entity::Path("src/Index.js".to_owned()),
+            Entity::Path("Makefile".to_owned()),
+            Entity::Path("makefile.am".to_owned()),
+            Entity::Symbol("paginate".to_owned()),
+        ];
+        let hit = |key: &str, kind: &str| EntityHit {
+            rowid: 1,
+            key: key.to_owned(),
+            kind: kind.to_owned(),
+        };
+
+        assert!(hit("index", "path").is_stem_of(&procedure));
+        assert!(!hit("index.js", "path").is_stem_of(&procedure));
+        assert!(!hit("src/index.js", "path").is_stem_of(&procedure));
+        assert!(!hit("makefile", "path").is_stem_of(&procedure));
+        assert!(!hit("paginate", "symbol").is_stem_of(&procedure));
     }
 
     #[test]
