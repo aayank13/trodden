@@ -73,6 +73,10 @@ impl VectorIndex {
 
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("read the size of {}", path.display()))?
+            .len();
         let mut header = [0; HEADER_LEN];
         file.read_exact(&mut header)
             .context("read the vector index header")?;
@@ -81,24 +85,44 @@ impl VectorIndex {
             "{} is not a vector index",
             path.display()
         );
-        let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-        let group_count =
-            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let group_count = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
 
-        let mut table = vec![0; group_count * GROUP_LEN];
+        let table_len = u64::from(group_count) * GROUP_LEN as u64;
+        let index_len = HEADER_LEN as u64
+            + table_len
+            + u64::from(count) * (8 + CODE_LEN + QUANTIZED_LEN) as u64;
+        ensure!(
+            index_len <= file_len,
+            "{} is truncated: its header describes {index_len} bytes but the file has {file_len}",
+            path.display()
+        );
+        let mut table =
+            vec![0; usize::try_from(table_len).context("size the vector index groups")?];
         file.read_exact(&mut table)
             .context("read the vector index groups")?;
-        let groups = table
+        let count = count as usize;
+        let groups: BTreeMap<u64, (usize, usize)> = table
             .as_chunks::<GROUP_LEN>()
             .0
             .iter()
             .map(|group| {
                 let hash = u64::from_le_bytes(std::array::from_fn(|i| group[i]));
-                let start = u32::from_le_bytes(std::array::from_fn(|i| group[8 + i]));
-                let len = u32::from_le_bytes(std::array::from_fn(|i| group[12 + i]));
-                (hash, (start as usize, len as usize))
+                let start = u32::from_le_bytes(std::array::from_fn(|i| group[8 + i])) as usize;
+                let len = u32::from_le_bytes(std::array::from_fn(|i| group[12 + i])) as usize;
+                ensure!(
+                    start.checked_add(len).is_some_and(|end| end <= count),
+                    "{} has a repository group outside its {count} procedures",
+                    path.display()
+                );
+                Ok((hash, (start, len)))
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        ensure!(
+            groups.len() == group_count as usize,
+            "{} lists a repository group twice",
+            path.display()
+        );
         Ok(Self {
             file,
             count,
@@ -242,6 +266,102 @@ mod tests {
             embedding[*axis] = *weight;
         }
         embedding
+    }
+
+    #[derive(Debug)]
+    struct Fixture;
+
+    impl Fixture {
+        fn index(name: &str) -> Vec<u8> {
+            let rows: Vec<(i64, String, Vec<u8>)> = [(1, "repo-a"), (2, "repo-b"), (3, "")]
+                .into_iter()
+                .map(|(rowid, repo)| {
+                    (
+                        rowid,
+                        repo.to_owned(),
+                        Quantized::new(&direction(&[(0, 1.0)])).to_bytes(),
+                    )
+                })
+                .collect();
+            let path = Self::path(&format!("{name}-built"));
+            VectorIndex::build(&rows, &path).expect("index builds");
+            let index = fs::read(&path).expect("index is readable");
+            fs::remove_file(&path).expect("index is removable");
+            index
+        }
+
+        fn path(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!("trodden-index-{name}-{}.index", std::process::id()))
+        }
+
+        fn patch(index: &mut [u8], at: usize, value: u32) {
+            index[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn open(name: &str, index: &[u8]) -> Result<VectorIndex> {
+            let path = Self::path(name);
+            fs::write(&path, index).expect("index is writable");
+            let opened = VectorIndex::open(&path);
+            fs::remove_file(&path).expect("index is removable");
+            opened
+        }
+
+        fn rejects(name: &str, index: &[u8], reason: &str) {
+            let error = Self::open(name, index).expect_err("corrupt index is rejected");
+            let message = format!("{error:#}");
+            assert!(message.contains(reason), "{message}");
+        }
+    }
+
+    #[test]
+    fn searches_a_valid_index() {
+        let mut index = Fixture::open("search", &Fixture::index("search")).expect("index opens");
+
+        let neighbors = index
+            .search(&direction(&[(0, 1.0)]), "repo-a", 10)
+            .expect("index searches");
+
+        let mut rowids: Vec<i64> = neighbors.iter().map(|neighbor| neighbor.rowid).collect();
+        rowids.sort_unstable();
+        assert_eq!(rowids, [1, 3]);
+    }
+
+    #[test]
+    fn rejects_counts_larger_than_the_file_before_allocating() {
+        for (name, at) in [("groups", 12), ("count", 8)] {
+            let mut index = Fixture::index(name);
+            Fixture::patch(&mut index, at, u32::MAX);
+            Fixture::rejects(name, &index, "is truncated");
+        }
+    }
+
+    #[test]
+    fn rejects_a_group_outside_the_procedures() {
+        for (name, at) in [("start", HEADER_LEN + 8), ("len", HEADER_LEN + 12)] {
+            let mut index = Fixture::index(name);
+            Fixture::patch(&mut index, at, 0x7fff_ffff);
+            Fixture::rejects(name, &index, "repository group outside");
+        }
+    }
+
+    #[test]
+    fn rejects_a_repeated_group() {
+        let mut index = Fixture::index("repeated");
+        let first: Vec<u8> = index[HEADER_LEN..HEADER_LEN + 8].to_vec();
+        index[HEADER_LEN + GROUP_LEN..HEADER_LEN + GROUP_LEN + 8].copy_from_slice(&first);
+        Fixture::rejects("repeated", &index, "repository group twice");
+    }
+
+    #[test]
+    fn rejects_a_truncated_index() {
+        let index = Fixture::index("truncated");
+        Fixture::rejects("truncated", &index[..index.len() - 1], "is truncated");
+        Fixture::rejects(
+            "header",
+            &index[..HEADER_LEN - 1],
+            "read the vector index header",
+        );
+        Fixture::rejects("empty", &[], "read the vector index header");
     }
 
     #[test]
