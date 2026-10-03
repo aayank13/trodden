@@ -7,8 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
-use trodden::{Home, Ingest, IngestReport, Workspace};
-use trodden_capture::claude_code::HARNESS;
+use trodden::{Harness, Home, Ingest, IngestReport, Workspace};
 use trodden_core::RepoId;
 use trodden_embed::ModelPack;
 use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
@@ -129,8 +128,8 @@ enum Command {
     Mcp,
     #[command(about = "Handle a harness hook (used by the Claude Code plugin)")]
     Hook {
-        #[arg(help = "Harness name: `claude-code`")]
-        harness: String,
+        #[arg(help = "Harness name")]
+        harness: Harness,
     },
 }
 
@@ -206,9 +205,9 @@ impl Command {
                 background,
             } => {
                 let report = if background {
-                    Ingest::run_or_defer(&home, HARNESS, &transcript, ended)?
+                    Ingest::run_or_defer(&home, Harness::ClaudeCode, &transcript, ended)?
                 } else {
-                    Some(Ingest::run(&home, HARNESS, &transcript, ended)?)
+                    Some(Ingest::run(&home, Harness::ClaudeCode, &transcript, ended)?)
                 };
                 if let Some(report) = report.filter(|_| !quiet) {
                     Self::print_report(&report);
@@ -618,12 +617,12 @@ impl Command {
     }
 
     fn backfill(home: &Home, projects: Option<PathBuf>) -> Result<()> {
-        let projects = match projects {
+        let harness = Harness::ClaudeCode;
+        let history = match projects {
             Some(projects) => projects,
-            None => PathBuf::from(env::var_os("HOME").context("find the home directory")?)
-                .join(".claude/projects"),
+            None => harness.history_dir()?,
         };
-        let (report, failures) = Ingest::start(home)?.backfill_claude_code(&projects)?;
+        let (report, failures) = Ingest::start(home)?.backfill(harness, &history)?;
         Self::print_report(&report);
         for (transcript, error) in &failures {
             eprintln!("skipped {}: {error}", transcript.display());

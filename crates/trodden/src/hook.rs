@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::json;
-use trodden::{Home, Workspace};
+use trodden::{Harness, Home, Workspace};
 use trodden_capture::{
     ErrorSignature,
     claude_code::{HookInput, Transcript},
@@ -38,9 +38,15 @@ impl Hook {
     }
 
     fn handle(harness: Option<&OsStr>) -> Result<()> {
-        if harness.is_none_or(|harness| harness != "claude-code") {
+        let Some(known) = harness.and_then(OsStr::to_str).and_then(Harness::from_name) else {
             bail!("unsupported harness {harness:?}");
+        };
+        match known {
+            Harness::ClaudeCode => Self::claude_code(),
         }
+    }
+
+    fn claude_code() -> Result<()> {
         let home = Home::locate()?;
         if !home.is_initialized() {
             return Ok(());

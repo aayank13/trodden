@@ -8,10 +8,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use trodden_capture::claude_code::{HARNESS, Transcript};
 use trodden_embed::{Embedder, Quantized};
 use trodden_extract::{Extractor, ProjectChecks};
 use trodden_recall::{Skeleton, VectorIndex};
@@ -19,7 +18,7 @@ use trodden_redact::Redactor;
 use trodden_store::{ExtractionRecord, Patience, Progress, Store, Upsert};
 
 use crate::{
-    Home, Workspace,
+    Harness, Home, Workspace,
     learning::{Changes, Learning, TaskSpan},
 };
 
@@ -68,23 +67,6 @@ impl IngestReport {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TranscriptLine {
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    is_sidechain: bool,
-}
-
-impl TranscriptLine {
-    fn working_directory(text: &str) -> Option<PathBuf> {
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<Self>(line).ok())
-            .filter(|line| !line.is_sidechain)
-            .find_map(|line| line.cwd)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingIngest {
     harness: String,
@@ -106,9 +88,9 @@ impl PendingIngests {
         }
     }
 
-    fn push(&self, harness: &str, transcript: &Path, ended: bool) -> Result<()> {
+    fn push(&self, harness: Harness, transcript: &Path, ended: bool) -> Result<()> {
         let pending = PendingIngest {
-            harness: harness.to_owned(),
+            harness: harness.as_str().to_owned(),
             transcript: path::absolute(transcript)
                 .with_context(|| format!("resolve {}", transcript.display()))?,
             ended,
@@ -229,7 +211,12 @@ impl Ingest {
 
     const EMBEDDING_SCHEME: &str = "prompt-skeletons";
 
-    pub fn run(home: &Home, harness: &str, transcript: &Path, ended: bool) -> Result<IngestReport> {
+    pub fn run(
+        home: &Home,
+        harness: Harness,
+        transcript: &Path,
+        ended: bool,
+    ) -> Result<IngestReport> {
         let mut ingest = Self::start(home)?;
         let report = ingest.transcript(harness, transcript, ended);
         let drained = ingest.finish();
@@ -240,7 +227,7 @@ impl Ingest {
 
     pub fn run_or_defer(
         home: &Home,
-        harness: &str,
+        harness: Harness,
         transcript: &Path,
         ended: bool,
     ) -> Result<Option<IngestReport>> {
@@ -281,7 +268,10 @@ impl Ingest {
                 ended,
             } in batch
             {
-                if let Ok(one) = self.transcript(&harness, &transcript, ended) {
+                let Some(harness) = Harness::from_name(&harness) else {
+                    continue;
+                };
+                if let Ok(one) = self.transcript(harness, &transcript, ended) {
                     report.absorb(one);
                 }
             }
@@ -290,37 +280,30 @@ impl Ingest {
 
     fn transcript(
         &mut self,
-        harness: &str,
+        harness: Harness,
         transcript: &Path,
         ended: bool,
     ) -> Result<IngestReport> {
-        match harness {
-            HARNESS => self.claude_code(transcript, ended),
-            other => bail!("no ingest for {other} transcripts"),
-        }
-    }
-
-    pub fn claude_code(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
-        let mut report = self.session(transcript, ended)?;
-        report.absorb(self.finish_idle_sessions()?);
+        let mut report = self.session(harness, transcript, ended)?;
+        report.absorb(self.finish_idle_sessions(harness)?);
         Ok(report)
     }
 
-    fn finish_idle_sessions(&mut self) -> Result<IngestReport> {
+    fn finish_idle_sessions(&mut self, harness: Harness) -> Result<IngestReport> {
         let mut report = IngestReport::default();
         if self.store.paused()? {
             return Ok(report);
         }
         let idle: Vec<_> = self
             .store
-            .open_sessions(HARNESS)?
+            .open_sessions(harness.as_str())?
             .into_iter()
             .map(|(session, transcript)| (session, PathBuf::from(transcript)))
             .filter(|(_, transcript)| Self::is_idle(transcript) || !transcript.exists())
             .take(Self::IDLE_SESSIONS_PER_RUN)
             .collect();
         for (session, transcript) in idle {
-            match self.session(&transcript, true) {
+            match self.session(harness, &transcript, true) {
                 Ok(finished) => report.absorb(finished),
                 Err(_) => self
                     .store
@@ -330,10 +313,16 @@ impl Ingest {
         Ok(report)
     }
 
-    fn session(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
+    fn session(
+        &mut self,
+        harness: Harness,
+        transcript: &Path,
+        ended: bool,
+    ) -> Result<IngestReport> {
         let text = fs::read_to_string(transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
-        let mut trace = Transcript::parse(&text, &self.redactor)
+        let (mut trace, cwd) = harness
+            .parse(&text, &self.redactor)
             .with_context(|| format!("parse {}", transcript.display()))?;
         let ended = ended || Self::is_idle(transcript);
         let session = trace.session.as_str().to_owned();
@@ -344,7 +333,7 @@ impl Ingest {
             return Ok(IngestReport::default());
         }
 
-        let cwd = TranscriptLine::working_directory(&text)
+        let cwd = cwd
             .filter(|cwd| cwd.is_absolute())
             .with_context(|| format!("{} has no usable working directory", transcript.display()))?;
         let workspace = Workspace::resolve(&cwd, &self.store)?;
@@ -356,7 +345,7 @@ impl Ingest {
         if self.store.paused()? {
             self.store.set_progress(
                 &session,
-                HARNESS,
+                harness.as_str(),
                 &recorded,
                 Some(workspace.repo.as_str()),
                 Progress {
@@ -433,7 +422,7 @@ impl Ingest {
 
         self.store.set_progress(
             &session,
-            HARNESS,
+            harness.as_str(),
             &recorded,
             Some(workspace.repo.as_str()),
             Progress {
@@ -452,37 +441,18 @@ impl Ingest {
         Ok(report)
     }
 
-    pub fn backfill_claude_code(
+    pub fn backfill(
         &mut self,
-        projects: &Path,
+        harness: Harness,
+        history: &Path,
     ) -> Result<(IngestReport, Vec<(PathBuf, String)>)> {
         if self.store.paused()? {
             return Ok((IngestReport::default(), Vec::new()));
         }
-        let mut transcripts = Vec::new();
-        for project in
-            fs::read_dir(projects).with_context(|| format!("list {}", projects.display()))?
-        {
-            let project = project.context("read a project directory entry")?.path();
-            let Ok(entries) = fs::read_dir(&project) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-                {
-                    transcripts.push(path);
-                }
-            }
-        }
-        transcripts.sort();
-
         let mut report = IngestReport::default();
         let mut failures = Vec::new();
-        for transcript in transcripts {
-            match self.session(&transcript, false) {
+        for transcript in harness.transcripts(history)? {
+            match self.session(harness, &transcript, false) {
                 Ok(one) => report.absorb(one),
                 Err(error) => failures.push((transcript, format!("{error:#}"))),
             }
@@ -740,7 +710,7 @@ mod tests {
             "src/paginate.js",
         ));
         let first = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("first ingest");
         assert_eq!((first.sessions, first.tasks, first.created), (1, 1, 1));
 
@@ -751,7 +721,7 @@ mod tests {
         ));
         inject(&ingest, 5);
         let running = ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest while resumed");
         assert_eq!(
             (running.sessions, running.tasks, running.settled),
@@ -759,7 +729,7 @@ mod tests {
         );
 
         let resumed = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest after resuming");
         assert_eq!(
             (resumed.sessions, resumed.tasks, resumed.settled),
@@ -767,7 +737,7 @@ mod tests {
         );
 
         let again = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest with nothing new");
         assert_eq!(again, IngestReport::default());
     }
@@ -782,13 +752,13 @@ mod tests {
             "src/paginate.js",
         ));
         ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("first ingest");
 
         scratch.append(&task(5, "still failing", "src/paginate.js"));
         inject(&ingest, 5);
         let resumed = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest after resuming");
         assert_eq!(
             (resumed.sessions, resumed.tasks, resumed.settled),
@@ -796,7 +766,7 @@ mod tests {
         );
 
         let again = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest with nothing new");
         assert_eq!(again, IngestReport::default());
     }
@@ -812,13 +782,13 @@ mod tests {
             "src/paginate.js",
         ));
         let paused = ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest while paused");
         assert_eq!(paused, IngestReport::default());
 
         ingest.store.set_paused(false).expect("capture resumes");
         let ended = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest after resuming capture");
         assert_eq!((ended.sessions, ended.tasks, ended.created), (1, 0, 0));
 
@@ -828,7 +798,7 @@ mod tests {
             "src/cart.js",
         ));
         let resumed = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest a task done after resuming capture");
         assert_eq!(
             (resumed.sessions, resumed.tasks, resumed.created),
@@ -857,7 +827,7 @@ mod tests {
             "src/paginate.js",
         ));
         ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("first ingest");
 
         scratch.append(&task(
@@ -867,7 +837,7 @@ mod tests {
         ));
         inject(&ingest, 5);
         ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before pausing");
 
         ingest.store.set_paused(true).expect("capture pauses");
@@ -877,7 +847,7 @@ mod tests {
             "src/search.js",
         ));
         ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest while paused");
 
         ingest.store.set_paused(false).expect("capture resumes");
@@ -889,7 +859,7 @@ mod tests {
             "src/checkout.js",
         ));
         let resumed = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest after resuming capture");
         assert_eq!((resumed.tasks, resumed.created, resumed.settled), (1, 1, 1));
 
@@ -920,7 +890,7 @@ mod tests {
                 ),
             );
             let report = ingest
-                .claude_code(&scratch.transcript, true)
+                .transcript(Harness::ClaudeCode, &scratch.transcript, true)
                 .expect("ingest in an unusual directory");
             assert_eq!((report.sessions, report.tasks, report.created), (1, 1, 1));
             assert!(!scratch.stored().contains(email), "{cwd}");
@@ -933,7 +903,7 @@ mod tests {
         let mut ingest = scratch.ingest();
         scratch.append_in("shop", &task(0, "Fix the cart total", "src/cart.js"));
         let error = ingest
-            .claude_code(&scratch.transcript, true)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect_err("a relative directory is refused");
         assert!(
             error
@@ -964,7 +934,7 @@ mod tests {
 
         ingest.store.set_paused(true).expect("capture pauses");
         let (paused, _) = ingest
-            .backfill_claude_code(&projects)
+            .backfill(Harness::ClaudeCode, &projects)
             .expect("backfill while paused");
         assert_eq!(paused, IngestReport::default());
         assert_eq!(
@@ -974,7 +944,7 @@ mod tests {
 
         ingest.store.set_paused(false).expect("capture resumes");
         let (resumed, failures) = ingest
-            .backfill_claude_code(&projects)
+            .backfill(Harness::ClaudeCode, &projects)
             .expect("backfill after resuming capture");
         assert!(failures.is_empty());
         assert_eq!((resumed.sessions, resumed.created), (1, 1));
@@ -990,7 +960,7 @@ mod tests {
             "src/paginate.js",
         ));
         let crashed = ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before the crash");
         assert_eq!((crashed.sessions, crashed.tasks), (1, 0));
 
@@ -1000,14 +970,14 @@ mod tests {
             "src/cart.js",
         ));
         let active = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest while the crashed session is recent");
         assert_eq!((active.sessions, active.tasks), (1, 0));
         assert!(!Scratch::ended(&ingest));
 
         scratch.go_idle();
         let swept = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest after the crashed session went idle");
         assert_eq!((swept.sessions, swept.tasks, swept.created), (2, 1, 1));
         assert!(Scratch::ended(&ingest));
@@ -1024,7 +994,7 @@ mod tests {
         );
 
         let again = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest with nothing idle");
         assert_eq!((again.sessions, again.tasks), (1, 0));
     }
@@ -1039,7 +1009,7 @@ mod tests {
             "src/paginate.js",
         ));
         ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before the crash");
         scratch.go_idle();
         let other = scratch.other_session(&task(
@@ -1050,14 +1020,14 @@ mod tests {
 
         ingest.store.set_paused(true).expect("capture pauses");
         let paused = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest while paused");
         assert_eq!(paused, IngestReport::default());
         assert!(!Scratch::ended(&ingest));
 
         ingest.store.set_paused(false).expect("capture resumes");
         let resumed = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest after resuming capture");
         assert_eq!((resumed.tasks, resumed.created), (1, 1));
         assert!(Scratch::ended(&ingest));
@@ -1073,7 +1043,7 @@ mod tests {
             "src/paginate.js",
         ));
         ingest
-            .claude_code(&scratch.transcript, false)
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before the crash");
         fs::remove_file(&scratch.transcript).expect("transcript is removed");
 
@@ -1083,14 +1053,14 @@ mod tests {
             "src/cart.js",
         ));
         let report = ingest
-            .claude_code(&other, false)
+            .transcript(Harness::ClaudeCode, &other, false)
             .expect("ingest after the transcript is gone");
         assert_eq!((report.sessions, report.tasks), (1, 0));
         assert!(Scratch::ended(&ingest));
         assert_eq!(
             ingest
                 .store
-                .open_sessions(HARNESS)
+                .open_sessions(Harness::ClaudeCode.as_str())
                 .expect("open sessions list"),
             [(
                 OTHER_SESSION.to_owned(),
@@ -1109,7 +1079,7 @@ mod tests {
                 .store
                 .set_progress(
                     &format!("gone-{index}"),
-                    HARNESS,
+                    Harness::ClaudeCode.as_str(),
                     &scratch
                         .dir
                         .join(format!("gone-{index}.jsonl"))
@@ -1129,20 +1099,24 @@ mod tests {
             "src/cart.js",
         ));
 
-        ingest.claude_code(&other, false).expect("first ingest");
+        ingest
+            .transcript(Harness::ClaudeCode, &other, false)
+            .expect("first ingest");
         assert_eq!(
             ingest
                 .store
-                .open_sessions(HARNESS)
+                .open_sessions(Harness::ClaudeCode.as_str())
                 .expect("open sessions list")
                 .len(),
             2
         );
-        ingest.claude_code(&other, false).expect("second ingest");
+        ingest
+            .transcript(Harness::ClaudeCode, &other, false)
+            .expect("second ingest");
         assert_eq!(
             ingest
                 .store
-                .open_sessions(HARNESS)
+                .open_sessions(Harness::ClaudeCode.as_str())
                 .expect("open sessions list")
                 .len(),
             1
@@ -1173,12 +1147,12 @@ mod tests {
             .collect();
         assert!(relative.is_relative());
         ingest
-            .claude_code(&relative, false)
+            .transcript(Harness::ClaudeCode, &relative, false)
             .expect("ingest by relative path");
 
         let open = ingest
             .store
-            .open_sessions(HARNESS)
+            .open_sessions(Harness::ClaudeCode.as_str())
             .expect("open sessions list");
         let [(session, recorded)] = open.as_slice() else {
             panic!("one open session: {open:?}");
@@ -1202,7 +1176,7 @@ mod tests {
         ));
         let running = scratch.ingest();
 
-        let deferred = Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
+        let deferred = Ingest::run_or_defer(&home, Harness::ClaudeCode, &scratch.transcript, true)
             .expect("background ingest defers");
         assert_eq!(deferred, None);
         assert!(PendingIngests::new(&home).any().expect("markers list"));
@@ -1229,7 +1203,7 @@ mod tests {
             IngestReport::default()
         );
         assert_eq!(
-            Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
+            Ingest::run_or_defer(&home, Harness::ClaudeCode, &scratch.transcript, true)
                 .expect("background ingest defers"),
             None
         );
@@ -1247,14 +1221,16 @@ mod tests {
         let other = scratch.dir.join("other.jsonl");
         let pending = PendingIngests::new(&home);
         pending
-            .push(HARNESS, &scratch.transcript, false)
+            .push(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("marker queues");
         pending
-            .push(HARNESS, &scratch.transcript, true)
+            .push(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("marker queues");
-        pending.push(HARNESS, &other, false).expect("marker queues");
         pending
-            .push(HARNESS, &scratch.transcript, false)
+            .push(Harness::ClaudeCode, &other, false)
+            .expect("marker queues");
+        pending
+            .push(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("marker queues");
 
         let mut taken = pending.take().expect("markers are taken");
@@ -1263,12 +1239,12 @@ mod tests {
             taken,
             [
                 PendingIngest {
-                    harness: HARNESS.to_owned(),
+                    harness: Harness::ClaudeCode.as_str().to_owned(),
                     transcript: other,
                     ended: false
                 },
                 PendingIngest {
-                    harness: HARNESS.to_owned(),
+                    harness: Harness::ClaudeCode.as_str().to_owned(),
                     transcript: scratch.transcript.clone(),
                     ended: true
                 },
@@ -1287,14 +1263,52 @@ mod tests {
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
         ));
-        PendingIngests::new(&home)
-            .push("future-agent", &scratch.transcript, true)
-            .expect("marker queues");
+        let queued = home.pending_ingests();
+        fs::create_dir_all(&queued).expect("queue directory is writable");
+        fs::write(
+            queued.join("1-1-0.marker"),
+            json!({"harness": "future-agent", "transcript": scratch.transcript, "ended": true})
+                .to_string(),
+        )
+        .expect("marker is written");
 
         let report = scratch.ingest().finish().expect("running ingest finishes");
 
         assert_eq!(report, IngestReport::default());
         assert!(!PendingIngests::new(&home).any().expect("markers list"));
+    }
+
+    #[test]
+    fn queued_markers_name_their_harness_by_its_stored_id() {
+        let scratch = Scratch::new("deferred-format");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let queued = home.pending_ingests();
+        fs::create_dir_all(&queued).expect("queue directory is writable");
+        fs::write(
+            queued.join("1-1-0.marker"),
+            json!({"harness": "claude-code", "transcript": scratch.transcript, "ended": true})
+                .to_string(),
+        )
+        .expect("marker is written");
+
+        let report = scratch.ingest().finish().expect("running ingest finishes");
+
+        assert_eq!((report.sessions, report.created), (1, 1));
+        PendingIngests::new(&home)
+            .push(Harness::ClaudeCode, &scratch.transcript, false)
+            .expect("marker queues");
+        let marker = PendingIngests::new(&home)
+            .markers()
+            .expect("markers list")
+            .remove(0);
+        let written: Value = serde_json::from_slice(&fs::read(marker).expect("marker reads"))
+            .expect("marker is JSON");
+        assert_eq!(written["harness"], "claude-code");
     }
 
     #[test]
@@ -1310,7 +1324,9 @@ mod tests {
             .map(|(_, transcript)| {
                 let home = home.clone();
                 let transcript = transcript.clone();
-                std::thread::spawn(move || Ingest::run_or_defer(&home, HARNESS, &transcript, true))
+                std::thread::spawn(move || {
+                    Ingest::run_or_defer(&home, Harness::ClaudeCode, &transcript, true)
+                })
             })
             .collect();
         for worker in workers {
