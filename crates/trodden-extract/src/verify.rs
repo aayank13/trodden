@@ -34,6 +34,8 @@ const VERIFY_PROGRAMS: &[&str] = &[
     "dotnet build",
     "mvn test",
     "mvn verify",
+    "mvn package",
+    "mvn install",
     "gradle test",
     "gradle check",
     "gradle build",
@@ -103,12 +105,21 @@ impl Verification {
             _ if ["make", "just", "rake", "sh", "bash", "zsh"].contains(&runner) => {
                 CHECK_WORD.is_match(&targets)
             }
+            _ if ["mvn", "gradle"].contains(&runner) => command
+                .operands()
+                .iter()
+                .any(|task| Self::is_check_task(runner, task)),
             _ if program.starts_with("python ") => {
                 Self::is_check_script(&program, arguments.get(1))
             }
             _ if executable.contains('/') => Self::is_check_script(executable, arguments.first()),
             _ => false,
         }
+    }
+
+    fn is_check_task(runner: &str, task: &str) -> bool {
+        let task = task.rsplit(':').next().unwrap_or(task);
+        VERIFY_PROGRAMS.contains(&format!("{runner} {task}").as_str())
     }
 
     fn is_check_script(script: &str, task: Option<&String>) -> bool {
@@ -223,6 +234,33 @@ mod tests {
             "cd web && npm test -- --help",
         ] {
             assert!(!Verification::is_verify(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn recognizes_runners_given_several_tasks() {
+        let cases = [
+            ("mvn clean test", true),
+            ("mvn clean verify", true),
+            ("./mvnw -q clean install verify", true),
+            ("mvn -pl core clean surefire:test", true),
+            ("mvn clean verify -DskipTests", true),
+            ("mvn clean install", true),
+            ("./mvnw clean package", true),
+            ("./gradlew clean build", true),
+            ("./gradlew clean check -x test", true),
+            ("cd android && ./gradlew clean :app:test", true),
+            ("gradle --offline clean test --tests InvoiceTest", true),
+            ("make clean test", true),
+            ("just fmt lint", true),
+            ("mvn dependency:tree", false),
+            ("./gradlew clean assemble", false),
+            ("gradle help --task test", false),
+            ("mvn clean test --help", false),
+            ("./gradlew clean build --version", false),
+        ];
+        for (command, verifies) in cases {
+            assert_eq!(Verification::is_verify(command), verifies, "{command}");
         }
     }
 
