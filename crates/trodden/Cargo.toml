@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Procedural memory for coding agents"
+publish = false
 
 [dependencies]
 anyhow.workspace = true
