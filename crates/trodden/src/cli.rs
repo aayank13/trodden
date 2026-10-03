@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use trodden::{Home, Ingest, IngestReport, Workspace};
 use trodden_core::RepoId;
 use trodden_embed::ModelPack;
-use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query, Recall};
+use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
 use trodden_store::{Forget, Patience, Store};
 
 use crate::mcp::Server;
@@ -253,10 +253,10 @@ impl Command {
         );
         println!(
             "Semantic matching  {}",
-            if home.semantic().is_some() {
-                "on"
-            } else {
-                "off (run `trodden embeddings install`)"
+            match home.open_semantic() {
+                Ok(Some(_)) => "on",
+                Ok(None) => "off (run `trodden embeddings install`)",
+                Err(_) => "off (the model or index is unreadable; run `trodden doctor`)",
             }
         );
         println!(
@@ -302,9 +302,21 @@ impl Command {
         }
         check(
             "embedding model",
-            home.embedder()
-                .map(|_| "installed".to_owned())
-                .context("not installed; semantic matching is off"),
+            home.open_embedder().and_then(|embedder| {
+                embedder
+                    .map(|_| "installed".to_owned())
+                    .context("not installed; semantic matching is off")
+            }),
+        );
+        check(
+            "recall index",
+            home.open_index().map(|index| {
+                if index.is_some() {
+                    "readable".to_owned()
+                } else {
+                    "not built yet".to_owned()
+                }
+            }),
         );
         for program in ["trodden", "git", "claude"] {
             check(
@@ -379,8 +391,7 @@ impl Command {
     fn recall(home: &Home, prompt: &str, cwd: Option<PathBuf>, explain: bool) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let workspace = Self::workspace(&store, cwd)?;
-        let mut recall = Recall::new(&store, home.semantic());
-        let outcome = recall.recall(&Query {
+        let outcome = home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
             root: &workspace.root,
@@ -401,6 +412,9 @@ impl Command {
     }
 
     fn print_explanation(outcome: &Outcome) {
+        if let Some(error) = &outcome.semantic_error {
+            println!("Recalled without semantic matching: {error}\n");
+        }
         if outcome.candidates.is_empty() {
             return;
         }

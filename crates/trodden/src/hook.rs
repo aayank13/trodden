@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
+    fmt::Display,
     fs::OpenOptions,
     io::{self, Read, Write},
     process::{Command, ExitCode, Stdio},
@@ -77,13 +78,15 @@ impl Hook {
             return Ok(());
         }
         let workspace = Workspace::resolve(&input.cwd, &store)?;
-        let mut recall = Recall::new(&store, home.semantic());
-        let outcome = recall.recall(&Query {
+        let outcome = home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
             root: &workspace.root,
             session: Some(&input.session_id),
         })?;
+        if let Some(error) = &outcome.semantic_error {
+            Self::log(format_args!("recalled without semantic matching: {error}"));
+        }
         Self::serve(&store, input, outcome, Cue::Prompt, |envelope| {
             envelope.to_owned()
         })
@@ -280,7 +283,7 @@ impl Hook {
         Ok(())
     }
 
-    fn log(error: &anyhow::Error) {
+    fn log(message: impl Display) {
         let Ok(home) = Home::locate() else { return };
         if !home.is_initialized() {
             return;
@@ -290,7 +293,7 @@ impl Hook {
             .append(true)
             .open(home.hook_log())
         {
-            let _ = writeln!(log, "{} {error:#}", Timestamp::now());
+            let _ = writeln!(log, "{} {message:#}", Timestamp::now());
         }
     }
 }
