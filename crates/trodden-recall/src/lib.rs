@@ -36,6 +36,8 @@ const MAX_PROMPT_BYTES: usize = 16 * 1024;
 
 const MAX_TERMS: usize = 512;
 
+const MAX_PHRASE_WORDS: usize = 3;
+
 const RRF_K: f64 = 60.0;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -84,14 +86,31 @@ pub struct Signals {
 
 impl Signals {
     fn exact_weight(&self) -> f64 {
-        self.exact
-            .iter()
-            .map(|(_, kind)| match kind.as_str() {
-                "path" => 2.0,
-                "symbol" => 1.5,
-                _ => 1.0,
-            })
-            .sum()
+        self.exact.iter().map(|(_, kind)| self.weight(kind)).sum()
+    }
+
+    fn weight(&self, kind: &str) -> f64 {
+        match kind {
+            "path" => 2.0,
+            "stem" if self.cosine_confirms_topic() => 2.0,
+            "stem" => 0.5,
+            "symbol" => 1.5,
+            _ => 1.0,
+        }
+    }
+
+    fn cosine_confirms_topic(&self) -> bool {
+        self.cosine
+            .is_some_and(|cosine| cosine >= Gate::EXACT_FLOOR_COSINE)
+    }
+
+    fn add_exact(&mut self, key: String, kind: String) {
+        let weight = self.weight(&kind);
+        match self.exact.iter().position(|(known, _)| *known == key) {
+            Some(index) if weight > self.weight(&self.exact[index].1) => self.exact[index].1 = kind,
+            Some(_) => {}
+            None => self.exact.push((key, kind)),
+        }
     }
 
     fn ranked_cosine(&self) -> f32 {
@@ -247,13 +266,12 @@ impl<'a> Recall<'a> {
                 keys.push(stem.to_owned());
             }
         }
+        keys.extend(Self::phrases(prompt));
         keys.sort_unstable();
         keys.dedup();
-        for hit in self.store.entity_hits(&keys, query.repo)? {
-            let entry = signals.entry(hit.rowid).or_default();
-            if !entry.exact.iter().any(|(key, _)| *key == hit.key) {
-                entry.exact.push((hit.key, hit.kind));
-            }
+        let hits = self.store.entity_hits(&keys, query.repo)?;
+        for hit in &hits {
+            signals.entry(hit.rowid).or_default();
         }
         for (rank, hit) in self
             .store
@@ -289,41 +307,54 @@ impl<'a> Recall<'a> {
             }
         }
 
-        let mut exact: Vec<(i64, f64)> = signals
+        let mut matches: HashMap<i64, Match> = HashMap::with_capacity(signals.len());
+        for (rowid, signals) in signals {
+            if let Some(row) = self.store.recallable_procedure(rowid, query.repo)? {
+                matches.insert(rowid, Match { row, signals });
+            }
+        }
+        for hit in hits {
+            if let Some(candidate) = matches.get_mut(&hit.rowid) {
+                let kind = if hit.is_stem_of(&candidate.row.procedure) {
+                    "stem".to_owned()
+                } else {
+                    hit.kind
+                };
+                candidate.signals.add_exact(hit.key, kind);
+            }
+        }
+
+        let mut exact: Vec<(i64, f64)> = matches
             .iter()
-            .filter(|(_, s)| !s.exact.is_empty())
-            .map(|(rowid, s)| (*rowid, s.exact_weight()))
+            .filter(|(_, candidate)| !candidate.signals.exact.is_empty())
+            .map(|(rowid, candidate)| (*rowid, candidate.signals.exact_weight()))
             .collect();
         exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         for (rank, (rowid, _)) in exact.into_iter().enumerate() {
-            signals
+            matches
                 .get_mut(&rowid)
-                .expect("ranked rows have signals")
+                .expect("ranked rows are candidates")
+                .signals
                 .fused += Self::rrf(rank);
-        }
-        for s in signals.values_mut() {
-            s.fused += s.lexical.map_or(0.0, |(rank, _)| Self::rrf(rank));
-            s.fused += s.semantic.map_or(0.0, |(rank, _)| Self::rrf(rank));
         }
 
         let query_kind = TaskKind::of(prompt);
         let requested = Artifacts::requested(prompt);
-        let mut candidates = Vec::with_capacity(signals.len());
-        for (rowid, mut signals) in signals {
-            if let Some(row) = self.store.recallable_procedure(rowid, query.repo)? {
-                let trigger = &row.procedure.trigger;
-                signals.same_kind = query_kind
-                    .zip(TaskKind::of(&trigger.text))
-                    .map(|(query, procedure)| query == procedure);
-                let learned = Artifacts::mentioned(
-                    std::iter::once(trigger.text.as_str())
-                        .chain(trigger.examples.iter().map(String::as_str)),
-                );
-                signals.same_object = (!requested.is_empty() && !learned.is_empty())
-                    .then(|| requested.intersects(learned));
-                candidates.push(Match { row, signals });
-            }
+        for Match { row, signals } in matches.values_mut() {
+            signals.fused += signals.lexical.map_or(0.0, |(rank, _)| Self::rrf(rank));
+            signals.fused += signals.semantic.map_or(0.0, |(rank, _)| Self::rrf(rank));
+            let trigger = &row.procedure.trigger;
+            signals.same_kind = query_kind
+                .zip(TaskKind::of(&trigger.text))
+                .map(|(query, procedure)| query == procedure);
+            let learned = Artifacts::mentioned(
+                std::iter::once(trigger.text.as_str())
+                    .chain(trigger.examples.iter().map(String::as_str)),
+            );
+            signals.same_object = (!requested.is_empty() && !learned.is_empty())
+                .then(|| requested.intersects(learned));
         }
+        let mut candidates: Vec<Match> = matches.into_values().collect();
         candidates.sort_by(|a, b| {
             b.signals
                 .fused
@@ -382,6 +413,20 @@ impl<'a> Recall<'a> {
             .filter(|term| seen.insert(term.as_str()))
             .take(MAX_TERMS)
             .cloned()
+            .collect()
+    }
+
+    fn phrases(prompt: &str) -> Vec<String> {
+        let words = Terms::of(prompt);
+        let words = words.as_slice();
+        let mut seen = HashSet::new();
+        (0..words.len())
+            .flat_map(|start| {
+                (2..=MAX_PHRASE_WORDS).filter_map(move |length| words.get(start..start + length))
+            })
+            .map(|phrase| phrase.join(" "))
+            .filter(|phrase| seen.insert(phrase.clone()))
+            .take(MAX_TERMS)
             .collect()
     }
 
@@ -536,7 +581,7 @@ impl Preconditions {
 mod tests {
     use trodden_core::{
         FamilyId, Procedure, ProcedureId, RepoId,
-        procedure::{Scope, Trigger},
+        procedure::{Entity, Scope, Trigger},
     };
     use trodden_embed::{DIMS, Embedding, Quantized};
 
@@ -977,6 +1022,152 @@ mod tests {
         let terms = Recall::terms(&words);
         assert_eq!(terms.len(), MAX_TERMS);
         assert_eq!(terms[MAX_TERMS - 1], format!("w{}", MAX_TERMS - 1));
+    }
+
+    #[derive(Debug)]
+    struct Learned(Store);
+
+    impl Learned {
+        fn with(entities: &[Entity]) -> Self {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let mut procedure = Procedure::example();
+            procedure.preconditions.clear();
+            procedure.trigger.entities = entities.to_vec();
+            store.upsert(&procedure).expect("procedure stores");
+            Self(store)
+        }
+
+        fn exact(&self, prompt: &str) -> Vec<(String, String)> {
+            let mut exact = outcome(&self.0, prompt)
+                .candidates
+                .into_iter()
+                .next()
+                .expect("the procedure is a candidate")
+                .signals
+                .exact;
+            exact.sort_unstable();
+            exact
+        }
+
+        fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(key, kind)| ((*key).to_owned(), (*kind).to_owned()))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_file_name_stem_alone_does_not_inject() {
+        let learned = Learned::with(&[
+            Entity::Path("src/index.js".to_owned()),
+            Entity::Command("npm test".to_owned()),
+        ]);
+        let bare = "Fix the crash in index when the user logs out.";
+
+        assert_eq!(
+            outcome(&learned.0, bare).decision,
+            Decision::Abstain(Abstention::NotConfident)
+        );
+        assert_eq!(learned.exact(bare), Learned::pairs(&[("index", "stem")]));
+        for prompt in [
+            "Fix the crash in src/index.js when the user logs out.",
+            "Fix the crash in index.js when the user logs out.",
+        ] {
+            assert!(
+                matches!(outcome(&learned.0, prompt).decision, Decision::Inject(_)),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_name_stem_counts_as_a_path_only_when_the_prompt_is_on_topic() {
+        for (cosine, weight) in [(None, 0.5), (Some(0.1), 0.5), (Some(0.3), 2.0)] {
+            let mut signals = Signals {
+                cosine,
+                ..Signals::default()
+            };
+            signals.add_exact("index".to_owned(), "stem".to_owned());
+
+            assert_eq!(signals.exact_weight(), weight, "{cosine:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_an_extension_keeps_the_full_path_weight() {
+        let learned = Learned::with(&[
+            Entity::Path("Makefile".to_owned()),
+            Entity::Path("Makefile.am".to_owned()),
+        ]);
+        let prompt = "Fix the Makefile so the build passes.";
+
+        assert_eq!(
+            learned.exact(prompt),
+            Learned::pairs(&[("makefile", "path")])
+        );
+        assert!(matches!(
+            outcome(&learned.0, prompt).decision,
+            Decision::Inject(_)
+        ));
+    }
+
+    #[test]
+    fn a_key_indexed_twice_counts_with_its_strongest_kind() {
+        let learned = Learned::with(&[
+            Entity::Path("src/paginate.js".to_owned()),
+            Entity::Symbol("paginate".to_owned()),
+        ]);
+
+        assert_eq!(
+            learned.exact("Fix paginate for the last page."),
+            Learned::pairs(&[("paginate", "symbol")])
+        );
+        for order in [["stem", "symbol"], ["symbol", "stem"]] {
+            let mut signals = Signals::default();
+            for kind in order {
+                signals.add_exact("paginate".to_owned(), kind.to_owned());
+            }
+            assert_eq!(signals.exact_weight(), 1.5, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn matches_commands_written_in_the_prompt() {
+        let learned = Learned::with(&[
+            Entity::Command("npm test".to_owned()),
+            Entity::Command("python -m pytest".to_owned()),
+        ]);
+
+        assert_eq!(
+            learned.exact("Fix it: `npm test` fails after the upgrade."),
+            Learned::pairs(&[("npm test", "command")])
+        );
+        assert_eq!(
+            learned.exact("Fix it: python -m pytest fails after the upgrade."),
+            Learned::pairs(&[("python m pytest", "command")])
+        );
+    }
+
+    #[test]
+    fn looks_up_adjacent_words_as_phrases() {
+        let words: String = (0..2 * MAX_TERMS).map(|n| format!("w{n} ")).collect();
+
+        assert_eq!(
+            Recall::phrases("Run `npm test`, then python -m pytest"),
+            [
+                "run npm",
+                "run npm test",
+                "npm test",
+                "npm test python",
+                "test python",
+                "test python m",
+                "python m",
+                "python m pytest",
+                "m pytest",
+            ]
+        );
+        assert_eq!(Recall::phrases(&words).len(), MAX_TERMS);
     }
 
     #[derive(Debug)]
