@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use trodden::{Home, Ingest, IngestReport, Workspace};
+use trodden_capture::claude_code::HARNESS;
 use trodden_core::RepoId;
 use trodden_embed::ModelPack;
 use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
@@ -205,9 +206,9 @@ impl Command {
                 background,
             } => {
                 let report = if background {
-                    Ingest::claude_code_or_defer(&home, &transcript, ended)?
+                    Ingest::run_or_defer(&home, HARNESS, &transcript, ended)?
                 } else {
-                    Some(Ingest::claude_code_waiting(&home, &transcript, ended)?)
+                    Some(Ingest::run(&home, HARNESS, &transcript, ended)?)
                 };
                 if let Some(report) = report.filter(|_| !quiet) {
                     Self::print_report(&report);

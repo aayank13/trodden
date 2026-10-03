@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use trodden_capture::claude_code::{HARNESS, Transcript};
@@ -87,6 +87,7 @@ impl TranscriptLine {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingIngest {
+    harness: String,
     transcript: PathBuf,
     ended: bool,
 }
@@ -105,8 +106,9 @@ impl PendingIngests {
         }
     }
 
-    fn push(&self, transcript: &Path, ended: bool) -> Result<()> {
+    fn push(&self, harness: &str, transcript: &Path, ended: bool) -> Result<()> {
         let pending = PendingIngest {
+            harness: harness.to_owned(),
             transcript: path::absolute(transcript)
                 .with_context(|| format!("resolve {}", transcript.display()))?,
             ended,
@@ -141,12 +143,18 @@ impl PendingIngests {
             let text = fs::read(&marker).with_context(|| format!("read {}", marker.display()))?;
             fs::remove_file(&marker).with_context(|| format!("remove {}", marker.display()))?;
             if let Ok(pending) = serde_json::from_slice::<PendingIngest>(&text) {
-                *transcripts.entry(pending.transcript).or_default() |= pending.ended;
+                *transcripts
+                    .entry((pending.harness, pending.transcript))
+                    .or_default() |= pending.ended;
             }
         }
         Ok(transcripts
             .into_iter()
-            .map(|(transcript, ended)| PendingIngest { transcript, ended })
+            .map(|((harness, transcript), ended)| PendingIngest {
+                harness,
+                transcript,
+                ended,
+            })
             .collect())
     }
 
@@ -221,25 +229,22 @@ impl Ingest {
 
     const EMBEDDING_SCHEME: &str = "prompt-skeletons";
 
-    pub fn claude_code_waiting(
-        home: &Home,
-        transcript: &Path,
-        ended: bool,
-    ) -> Result<IngestReport> {
+    pub fn run(home: &Home, harness: &str, transcript: &Path, ended: bool) -> Result<IngestReport> {
         let mut ingest = Self::start(home)?;
-        let report = ingest.claude_code(transcript, ended);
+        let report = ingest.transcript(harness, transcript, ended);
         let drained = ingest.finish();
         let report = report?;
         drained?;
         Ok(report)
     }
 
-    pub fn claude_code_or_defer(
+    pub fn run_or_defer(
         home: &Home,
+        harness: &str,
         transcript: &Path,
         ended: bool,
     ) -> Result<Option<IngestReport>> {
-        PendingIngests::new(home).push(transcript, ended)?;
+        PendingIngests::new(home).push(harness, transcript, ended)?;
         Self::try_start(home)?.map(Self::finish).transpose()
     }
 
@@ -270,11 +275,28 @@ impl Ingest {
             if batch.is_empty() {
                 return Ok(report);
             }
-            for PendingIngest { transcript, ended } in batch {
-                if let Ok(one) = self.claude_code(&transcript, ended) {
+            for PendingIngest {
+                harness,
+                transcript,
+                ended,
+            } in batch
+            {
+                if let Ok(one) = self.transcript(&harness, &transcript, ended) {
                     report.absorb(one);
                 }
             }
+        }
+    }
+
+    fn transcript(
+        &mut self,
+        harness: &str,
+        transcript: &Path,
+        ended: bool,
+    ) -> Result<IngestReport> {
+        match harness {
+            HARNESS => self.claude_code(transcript, ended),
+            other => bail!("no ingest for {other} transcripts"),
         }
     }
 
@@ -1180,7 +1202,7 @@ mod tests {
         ));
         let running = scratch.ingest();
 
-        let deferred = Ingest::claude_code_or_defer(&home, &scratch.transcript, true)
+        let deferred = Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
             .expect("background ingest defers");
         assert_eq!(deferred, None);
         assert!(PendingIngests::new(&home).any().expect("markers list"));
@@ -1207,7 +1229,7 @@ mod tests {
             IngestReport::default()
         );
         assert_eq!(
-            Ingest::claude_code_or_defer(&home, &scratch.transcript, true)
+            Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
                 .expect("background ingest defers"),
             None
         );
@@ -1225,14 +1247,14 @@ mod tests {
         let other = scratch.dir.join("other.jsonl");
         let pending = PendingIngests::new(&home);
         pending
-            .push(&scratch.transcript, false)
+            .push(HARNESS, &scratch.transcript, false)
             .expect("marker queues");
         pending
-            .push(&scratch.transcript, true)
+            .push(HARNESS, &scratch.transcript, true)
             .expect("marker queues");
-        pending.push(&other, false).expect("marker queues");
+        pending.push(HARNESS, &other, false).expect("marker queues");
         pending
-            .push(&scratch.transcript, false)
+            .push(HARNESS, &scratch.transcript, false)
             .expect("marker queues");
 
         let mut taken = pending.take().expect("markers are taken");
@@ -1241,10 +1263,12 @@ mod tests {
             taken,
             [
                 PendingIngest {
+                    harness: HARNESS.to_owned(),
                     transcript: other,
                     ended: false
                 },
                 PendingIngest {
+                    harness: HARNESS.to_owned(),
                     transcript: scratch.transcript.clone(),
                     ended: true
                 },
@@ -1252,6 +1276,25 @@ mod tests {
         );
         assert!(!pending.any().expect("markers list"));
         assert_eq!(pending.take().expect("markers are taken"), []);
+    }
+
+    #[test]
+    fn queued_transcripts_of_an_unknown_harness_are_skipped() {
+        let scratch = Scratch::new("deferred-harness");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        PendingIngests::new(&home)
+            .push("future-agent", &scratch.transcript, true)
+            .expect("marker queues");
+
+        let report = scratch.ingest().finish().expect("running ingest finishes");
+
+        assert_eq!(report, IngestReport::default());
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
     }
 
     #[test]
@@ -1267,7 +1310,7 @@ mod tests {
             .map(|(_, transcript)| {
                 let home = home.clone();
                 let transcript = transcript.clone();
-                std::thread::spawn(move || Ingest::claude_code_or_defer(&home, &transcript, true))
+                std::thread::spawn(move || Ingest::run_or_defer(&home, HARNESS, &transcript, true))
             })
             .collect();
         for worker in workers {
