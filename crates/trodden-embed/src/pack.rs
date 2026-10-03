@@ -238,6 +238,10 @@ pub struct Embedder {
 impl Embedder {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("read the size of {}", path.display()))?
+            .len();
         let mut header = [0; HEADER_LEN];
         file.read_exact(&mut header)
             .context("read the pack header")?;
@@ -247,25 +251,47 @@ impl Embedder {
             path.display()
         );
         let field = |at: usize| {
-            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
-                as usize
+            u64::from(u32::from_le_bytes([
+                header[at],
+                header[at + 1],
+                header[at + 2],
+                header[at + 3],
+            ]))
         };
         let (dims, vocab, strings_len) = (field(8), field(12), field(16));
-        ensure!(dims == DIMS, "pack has {dims} dimensions, expected {DIMS}");
+        ensure!(
+            dims == DIMS as u64,
+            "pack has {dims} dimensions, expected {DIMS}"
+        );
 
-        let mut index = vec![0; vocab * INDEX_ENTRY_LEN];
+        let index_len = vocab * INDEX_ENTRY_LEN as u64;
+        let rows_offset = HEADER_LEN as u64 + index_len + strings_len;
+        let pack_len = rows_offset + vocab * ROW_LEN as u64;
+        ensure!(
+            pack_len <= file_len,
+            "{} is truncated: its header describes {pack_len} bytes but the file has {file_len}",
+            path.display()
+        );
+        let mut index = vec![0; usize::try_from(index_len).context("size the pack index")?];
         file.read_exact(&mut index).context("read the pack index")?;
-        let mut strings = vec![0; strings_len];
+        let mut strings =
+            vec![0; usize::try_from(strings_len).context("size the pack vocabulary")?];
         file.read_exact(&mut strings)
             .context("read the pack vocabulary")?;
-        let rows_offset =
-            u64::try_from(HEADER_LEN + index.len() + strings.len()).context("locate pack rows")?;
-        Ok(Self {
+        let embedder = Self {
             file,
             index,
             strings,
             rows_offset,
-        })
+        };
+        ensure!(
+            (0..embedder.vocabulary_len()).all(|position| embedder
+                .entry(position)
+                .is_some_and(|(_, id)| u64::from(id) < vocab)),
+            "{} has a corrupt vocabulary index",
+            path.display()
+        );
+        Ok(embedder)
     }
 
     pub fn embed(&mut self, text: &str) -> Result<Option<Embedding>> {
@@ -307,22 +333,27 @@ impl Embedder {
         Tokenizer::encode(text, self, MAX_TOKENS)
     }
 
-    fn entry(&self, position: usize) -> (&[u8], u32) {
-        let entry = &self.index[position * INDEX_ENTRY_LEN..(position + 1) * INDEX_ENTRY_LEN];
+    fn vocabulary_len(&self) -> usize {
+        self.index.len() / INDEX_ENTRY_LEN
+    }
+
+    fn entry(&self, position: usize) -> Option<(&[u8], u32)> {
+        let entry = self.index.as_chunks::<INDEX_ENTRY_LEN>().0.get(position)?;
         let read = |at: usize| {
             u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]])
         };
         let (offset, len) = (read(0) as usize, read(4) as usize);
-        (&self.strings[offset..offset + len], read(8))
+        let bytes = self.strings.get(offset..offset.checked_add(len)?)?;
+        Some((bytes, read(8)))
     }
 }
 
 impl Vocabulary for Embedder {
     fn id(&self, token: &str) -> Option<u32> {
-        let (mut low, mut high) = (0, self.index.len() / INDEX_ENTRY_LEN);
+        let (mut low, mut high) = (0, self.vocabulary_len());
         while low < high {
             let middle = low + (high - low) / 2;
-            let (bytes, id) = self.entry(middle);
+            let (bytes, id) = self.entry(middle)?;
             match bytes.cmp(token.as_bytes()) {
                 Ordering::Less => low = middle + 1,
                 Ordering::Greater => high = middle,
@@ -336,6 +367,117 @@ impl Vocabulary for Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct Fixture;
+
+    impl Fixture {
+        const TOKENS: [&str; 3] = ["crash", "deploy", "staging"];
+
+        fn pack() -> Vec<u8> {
+            let strings: String = Self::TOKENS.concat();
+            let mut pack = MAGIC.to_vec();
+            for field in [DIMS, Self::TOKENS.len(), strings.len(), 0] {
+                pack.extend(Self::field(field));
+            }
+            let mut offset = 0;
+            for (id, token) in Self::TOKENS.iter().enumerate() {
+                for field in [offset, token.len(), id] {
+                    pack.extend(Self::field(field));
+                }
+                offset += token.len();
+            }
+            pack.extend(strings.as_bytes());
+            for id in 0..Self::TOKENS.len() {
+                pack.extend(1.0_f32.to_le_bytes());
+                pack.extend((0..DIMS).map(|axis| u8::from(axis == id)));
+            }
+            pack
+        }
+
+        fn field(value: usize) -> [u8; 4] {
+            u32::try_from(value)
+                .expect("fixture fields are small")
+                .to_le_bytes()
+        }
+
+        fn patch(pack: &mut [u8], at: usize, value: u32) {
+            pack[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn entry(position: usize) -> usize {
+            HEADER_LEN + position * INDEX_ENTRY_LEN
+        }
+
+        fn open(name: &str, pack: &[u8]) -> Result<Embedder> {
+            let path = std::env::temp_dir()
+                .join(format!("trodden-pack-{name}-{}.pack", std::process::id()));
+            fs::write(&path, pack).expect("pack is writable");
+            let embedder = Embedder::open(&path);
+            fs::remove_file(&path).expect("pack is removable");
+            embedder
+        }
+
+        fn rejects(name: &str, pack: &[u8], reason: &str) {
+            let error = Self::open(name, pack).expect_err("corrupt pack is rejected");
+            let message = format!("{error:#}");
+            assert!(message.contains(reason), "{message}");
+        }
+    }
+
+    #[test]
+    fn looks_up_tokens_in_a_valid_pack() {
+        let mut embedder = Fixture::open("valid", &Fixture::pack()).expect("pack opens");
+
+        let ids: Vec<Option<u32>> = ["crash", "deploy", "staging", "unknown"]
+            .iter()
+            .map(|token| embedder.id(token))
+            .collect();
+        assert_eq!(ids, [Some(0), Some(1), Some(2), None]);
+        let embedding = embedder
+            .embed("deploy")
+            .expect("pack embeds")
+            .expect("token has a direction");
+        assert!((embedding[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_an_entry_pointing_outside_the_vocabulary() {
+        let mut pack = Fixture::pack();
+        Fixture::patch(&mut pack, Fixture::entry(1), 0x7fff_ffff);
+        Fixture::rejects("offset", &pack, "corrupt vocabulary index");
+    }
+
+    #[test]
+    fn rejects_an_entry_longer_than_the_vocabulary() {
+        let mut pack = Fixture::pack();
+        Fixture::patch(&mut pack, Fixture::entry(2) + 4, u32::MAX);
+        Fixture::rejects("length", &pack, "corrupt vocabulary index");
+    }
+
+    #[test]
+    fn rejects_an_entry_with_an_id_outside_the_rows() {
+        let mut pack = Fixture::pack();
+        Fixture::patch(&mut pack, Fixture::entry(0) + 8, 3);
+        Fixture::rejects("id", &pack, "corrupt vocabulary index");
+    }
+
+    #[test]
+    fn rejects_counts_larger_than_the_file_before_allocating() {
+        for (name, at) in [("vocab", 12), ("strings", 16)] {
+            let mut pack = Fixture::pack();
+            Fixture::patch(&mut pack, at, u32::MAX);
+            Fixture::rejects(name, &pack, "is truncated");
+        }
+    }
+
+    #[test]
+    fn rejects_a_truncated_pack() {
+        let pack = Fixture::pack();
+        Fixture::rejects("truncated", &pack[..pack.len() - 1], "is truncated");
+        Fixture::rejects("header", &pack[..HEADER_LEN - 1], "read the pack header");
+        Fixture::rejects("empty", &[], "read the pack header");
+    }
 
     #[test]
     fn widens_half_precision() {
