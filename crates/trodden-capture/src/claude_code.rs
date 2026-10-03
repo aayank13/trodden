@@ -44,6 +44,10 @@ pub struct Transcript;
 impl Transcript {
     const SUMMARY_CHARS: usize = 200;
 
+    const SUMMARY_SOURCE_BYTES: usize = 64 * 1024;
+
+    const REDACTED: &str = "[REDACTED:";
+
     const NON_PROMPT_PREFIXES: &[&str] = &[
         "<command-name>",
         "<command-message>",
@@ -267,9 +271,34 @@ impl<'a> TraceBuilder<'a> {
             .map(str::trim)
             .find(|line| !line.is_empty())
             .unwrap_or_default();
-        let truncated: String = first_line.chars().take(Transcript::SUMMARY_CHARS).collect();
-        let summary = self.redactor.redact(&truncated).into_owned();
+        let summary = self.summary(first_line);
         self.emit(EventKind::Prompt { summary });
+    }
+
+    fn summary(&self, line: &str) -> String {
+        let source = if line.len() > Transcript::SUMMARY_SOURCE_BYTES {
+            line[..line.floor_char_boundary(Transcript::SUMMARY_SOURCE_BYTES)]
+                .trim_end_matches(|c: char| !c.is_whitespace())
+        } else {
+            line
+        };
+        let redacted = self.redactor.redact(source);
+        Self::truncate(&redacted, Transcript::SUMMARY_CHARS)
+            .trim_end()
+            .to_owned()
+    }
+
+    fn truncate(text: &str, chars: usize) -> &str {
+        let Some((cut, _)) = text.char_indices().nth(chars) else {
+            return text;
+        };
+        let straddling = text
+            .match_indices(Transcript::REDACTED)
+            .map(|(start, _)| start)
+            .take_while(|&start| start < cut)
+            .last()
+            .filter(|&start| text[start..].find(']').is_none_or(|end| start + end >= cut));
+        &text[..straddling.unwrap_or(cut)]
     }
 
     fn push_assistant(&mut self, line: Line) {
@@ -593,6 +622,76 @@ mod tests {
         assert_eq!(
             outcome("npm run build | tee build.log", "built in 2.1s", false),
             ToolOutcome::Succeeded
+        );
+    }
+
+    fn summary(prompt: &str) -> String {
+        let line = json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                          "message": {"role": "user", "content": prompt}});
+        let trace = Transcript::parse(&format!("{line}\n"), &Redactor::with_home("/home/dev"))
+            .expect("valid transcript");
+        trace
+            .events
+            .into_iter()
+            .find_map(|event| match event.kind {
+                EventKind::Prompt { summary } => Some(summary),
+                _ => None,
+            })
+            .expect("one prompt")
+    }
+
+    fn anthropic_key() -> String {
+        ["sk", "ant", "api03", "Ab3Zq8Lm3KpQ7vX2nB9wR4tY6uI1oP5aS0dF"].join("-")
+    }
+
+    #[test]
+    fn secrets_across_the_summary_cut_leave_no_fragment() {
+        let lead = format!("Deploy the billing worker to staging {}", "x".repeat(148));
+        let prompt = format!(
+            "{lead} {} then report back\nand nothing else",
+            anthropic_key()
+        );
+
+        assert_eq!(summary(&prompt), lead);
+    }
+
+    #[test]
+    fn summaries_keep_whole_markers_or_none() {
+        let secrets = [
+            anthropic_key(),
+            ["AKIA", "IOSFODNN7EXAMPLE"].concat(),
+            ["ghp", "R4tY6uI1oP5aS0dFAb3Zq8Lm3KpQ7vX2nB9w"].join("_"),
+            "API_KEY=4f9a1c2e8b7d6a5f3e2c1b0a9d8e7f6c".to_owned(),
+            "Q7vX2nB9wR4tY6uI1oP5aS0dFAb3Zq8Lm3Kp".to_owned(),
+        ];
+        let redactor = Redactor::with_home("/home/dev");
+        for secret in &secrets {
+            for lead in 150..=Transcript::SUMMARY_CHARS {
+                let prompt = format!("{} {secret} to deploy staging", "x".repeat(lead));
+                let redacted = redactor.redact(&prompt);
+                let summary = summary(&prompt);
+                let markers = summary.matches(Transcript::REDACTED).count();
+
+                assert!(redacted.contains(Transcript::REDACTED), "{secret}");
+                assert!(summary.chars().count() <= Transcript::SUMMARY_CHARS);
+                assert!(redacted.starts_with(&summary), "{summary}");
+                assert_eq!(summary.matches('[').count(), markers, "{summary}");
+                assert_eq!(summary.matches(']').count(), markers, "{summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn huge_first_lines_drop_the_token_cut_by_the_bound() {
+        let value = "a".repeat(Transcript::SUMMARY_SOURCE_BYTES - 41);
+        let prompt = format!(
+            "Deploy with TOKEN={value} and use {} for the smoke test",
+            anthropic_key()
+        );
+
+        assert_eq!(
+            summary(&prompt),
+            "Deploy with TOKEN=[REDACTED:assignment] and use"
         );
     }
 
