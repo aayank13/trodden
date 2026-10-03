@@ -93,11 +93,13 @@ impl Command {
 
     const MAX_QUOTED_CHARS: usize = 200;
 
+    const PATH_DELIMITERS: &str = "'\"=;&|()<>`";
+
     pub fn normalize(command: &str, cwd: &str) -> Self {
         let mut text = Self::without_bodies(command.trim());
         let cwd = cwd.trim_end_matches('/');
         if cwd.len() > 1 {
-            text = text.replace(&format!("{cwd}/"), "./").replace(cwd, ".");
+            text = Self::relativize(&text, cwd);
         }
         for prefix in ["cd . && ", "cd . ; ", "cd .; "] {
             if let Some(rest) = text.strip_prefix(prefix) {
@@ -105,6 +107,33 @@ impl Command {
             }
         }
         Self { text }
+    }
+
+    fn relativize(text: &str, cwd: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (start, _) in text.match_indices(cwd) {
+            let end = start + cwd.len();
+            let opens = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(Self::is_path_delimiter);
+            let closes = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '/' | ':') || Self::is_path_delimiter(c));
+            if opens && closes {
+                out.push_str(&text[copied..start]);
+                out.push('.');
+                copied = end;
+            }
+        }
+        out.push_str(&text[copied..]);
+        out
+    }
+
+    fn is_path_delimiter(c: char) -> bool {
+        c.is_whitespace() || Self::PATH_DELIMITERS.contains(c)
     }
 
     fn without_bodies(command: &str) -> String {
@@ -587,6 +616,79 @@ mod tests {
         );
 
         assert_eq!(command.text(), "node ./scripts/build.js");
+    }
+
+    #[test]
+    fn relativizes_only_whole_paths() {
+        let cases = [
+            ("cat /Users/ada/proj/notes.txt", "cat ./notes.txt"),
+            ("ls /Users/ada/proj", "ls ."),
+            ("ls /Users/ada/proj/", "ls ./"),
+            ("/Users/ada/proj/bin/check", "./bin/check"),
+            ("cat \"/Users/ada/proj/a b.txt\"", "cat \"./a b.txt\""),
+            ("cat '/Users/ada/proj'", "cat '.'"),
+            (
+                "node build.js --out=/Users/ada/proj/dist",
+                "node build.js --out=./dist",
+            ),
+            (
+                "docker run -v /Users/ada/proj:/app node",
+                "docker run -v .:/app node",
+            ),
+            ("npm test > /Users/ada/proj/out.log", "npm test > ./out.log"),
+            ("npm test 2>/Users/ada/proj/err.log", "npm test 2>./err.log"),
+            ("(cd /Users/ada/proj/web; npm test)", "(cd ./web; npm test)"),
+            ("cd /Users/ada/proj && cargo test", "cargo test"),
+            ("cd /Users/ada/proj; cargo test", "cargo test"),
+            ("diff /Users/ada/proj/a /Users/ada/proj/b", "diff ./a ./b"),
+            (
+                "cat /Users/ada/proj-old/notes.txt",
+                "cat /Users/ada/proj-old/notes.txt",
+            ),
+            ("ls /Users/ada/project", "ls /Users/ada/project"),
+            ("/Users/ada/proj2/b", "/Users/ada/proj2/b"),
+            ("/mnt/Users/ada/proj/a", "/mnt/Users/ada/proj/a"),
+            ("cp /Users/ada/proj.bak/a .", "cp /Users/ada/proj.bak/a ."),
+            (
+                "scp host:/Users/ada/proj/a .",
+                "scp host:/Users/ada/proj/a .",
+            ),
+            (
+                "cd /Users/ada/proj-old && cargo test",
+                "cd /Users/ada/proj-old && cargo test",
+            ),
+        ];
+        for cwd in ["/Users/ada/proj", "/Users/ada/proj/"] {
+            for (command, expected) in cases {
+                assert_eq!(
+                    Command::normalize(command, cwd).text(),
+                    expected,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finds_arguments_after_relativizing() {
+        let cases: [(&str, &[&str]); 3] = [
+            ("cd /Users/ada/proj && npx jest --ci", &["jest", "--ci"]),
+            (
+                "/Users/ada/proj/bin/check --fast",
+                &["./bin/check", "--fast"],
+            ),
+            (
+                "/Users/ada/proj2/bin/check",
+                &["/Users/ada/proj2/bin/check"],
+            ),
+        ];
+        for (command, argv) in cases {
+            assert_eq!(
+                Command::normalize(command, "/Users/ada/proj").argv(),
+                argv,
+                "{command}"
+            );
+        }
     }
 
     #[test]
