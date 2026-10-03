@@ -166,6 +166,7 @@ struct TraceBuilder<'a> {
     redactor: &'a Redactor,
     session: Option<String>,
     cwd: String,
+    here: String,
     model: Option<String>,
     started_at: Option<Timestamp>,
     now: Timestamp,
@@ -179,6 +180,7 @@ impl<'a> TraceBuilder<'a> {
             redactor,
             session: None,
             cwd: String::new(),
+            here: String::new(),
             model: None,
             started_at: None,
             now: Timestamp::UNIX_EPOCH,
@@ -194,10 +196,12 @@ impl<'a> TraceBuilder<'a> {
         if self.session.is_none() {
             self.session.clone_from(&line.session_id);
         }
-        if self.cwd.is_empty()
-            && let Some(cwd) = &line.cwd
-        {
-            cwd.trim_end_matches('/').clone_into(&mut self.cwd);
+        if let Some(cwd) = &line.cwd {
+            let cwd = cwd.trim_end_matches('/');
+            if self.cwd.is_empty() {
+                cwd.clone_into(&mut self.cwd);
+            }
+            cwd.clone_into(&mut self.here);
         }
         if let Some(at) = line
             .timestamp
@@ -327,8 +331,20 @@ impl<'a> TraceBuilder<'a> {
         let mut args = ToolArgs::default();
         let action = match name {
             "Bash" => {
-                let command = Command::normalize(field("command").unwrap_or_default(), &self.cwd);
-                args.command = Some(self.redactor.redact(command.text()).into_owned());
+                let subdirectory = self.subdirectory();
+                let base = if subdirectory.is_some() {
+                    &self.here
+                } else {
+                    &self.cwd
+                };
+                let command = Command::normalize(field("command").unwrap_or_default(), base);
+                let text = match subdirectory {
+                    Some(dir) if !command.text().is_empty() => {
+                        format!("cd {} && {}", Self::quoted(dir), command.text())
+                    }
+                    _ => command.text().to_owned(),
+                };
+                args.command = Some(self.redactor.redact(&text).into_owned());
                 command.action()
             }
             "Read" | "NotebookRead" => {
@@ -510,7 +526,51 @@ impl<'a> TraceBuilder<'a> {
                 return relative.to_owned();
             }
         }
-        self.redactor.redact(path).into_owned()
+        match self.subdirectory() {
+            Some(dir) if !path.starts_with(['/', '~']) => {
+                self.redactor.redact(&Self::joined(dir, path)).into_owned()
+            }
+            _ => self.redactor.redact(path).into_owned(),
+        }
+    }
+
+    fn subdirectory(&self) -> Option<&str> {
+        if self.cwd.is_empty() {
+            return None;
+        }
+        self.here
+            .strip_prefix(&self.cwd)?
+            .strip_prefix('/')
+            .filter(|dir| !dir.is_empty())
+    }
+
+    fn joined(dir: &str, path: &str) -> String {
+        let mut parts: Vec<&str> = dir.split('/').collect();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." if parts.last().is_some_and(|last| *last != "..") => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            ".".to_owned()
+        } else {
+            parts.join("/")
+        }
+    }
+
+    fn quoted(dir: &str) -> String {
+        if dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/+@%,:=".contains(c))
+        {
+            dir.to_owned()
+        } else {
+            format!("'{}'", dir.replace('\'', r"'\''"))
+        }
     }
 
     fn emit(&mut self, kind: EventKind) -> usize {
@@ -703,6 +763,141 @@ mod tests {
         assert_eq!(
             TraceBuilder::failure(&TraceBuilder::text(&content)),
             ToolOutcome::Interrupted
+        );
+    }
+
+    #[derive(Debug)]
+    struct Session;
+
+    impl Session {
+        fn calls(steps: &[(&str, &str, Value)]) -> (Trace, Vec<ToolCall>) {
+            let text: String = steps
+                .iter()
+                .enumerate()
+                .map(|(index, (cwd, name, input))| {
+                    let line = json!({"type": "assistant", "sessionId": "s", "cwd": cwd,
+                                      "timestamp": "2026-09-21T14:02:12Z",
+                                      "message": {"role": "assistant", "content": [
+                                          {"type": "tool_use", "id": index.to_string(), "name": name, "input": input}]}});
+                    format!("{line}\n")
+                })
+                .collect();
+            let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
+                .expect("valid transcript");
+            let calls = trace
+                .events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    EventKind::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect();
+            (trace, calls)
+        }
+    }
+
+    #[test]
+    fn commands_run_in_a_subdirectory_change_into_it_first() {
+        let (trace, calls) = Session::calls(&[
+            ("/work/app", "Bash", json!({"command": "cargo test"})),
+            ("/work/app/web", "Bash", json!({"command": "npm test"})),
+            (
+                "/work/app/web/",
+                "Bash",
+                json!({"command": "cat /work/app/web/src/paginate.js"}),
+            ),
+            (
+                "/work/app/web",
+                "Bash",
+                json!({"command": "cd /work/app/web && npm run lint"}),
+            ),
+            ("/work/app/my web", "Bash", json!({"command": "npm test"})),
+            (
+                "/work/app",
+                "Bash",
+                json!({"command": "cd web && npm test"}),
+            ),
+            ("/work/other", "Bash", json!({"command": "npm test"})),
+            ("/work/application", "Bash", json!({"command": "npm test"})),
+        ]);
+        let commands: Vec<&str> = calls
+            .iter()
+            .map(|call| call.args.command.as_deref().expect("bash command"))
+            .collect();
+
+        assert_eq!(trace.cwd, "/work/app");
+        assert_eq!(
+            commands,
+            [
+                "cargo test",
+                "cd web && npm test",
+                "cd web && cat ./src/paginate.js",
+                "cd web && npm run lint",
+                "cd 'my web' && npm test",
+                "cd web && npm test",
+                "npm test",
+                "npm test",
+            ]
+        );
+        assert_eq!(calls[3].action, ToolAction::Run);
+        assert_eq!(calls[2].action, ToolAction::Read);
+    }
+
+    #[test]
+    fn paths_from_a_subdirectory_are_relative_to_the_trace_root() {
+        let (_, calls) = Session::calls(&[
+            (
+                "/work/app",
+                "Grep",
+                json!({"pattern": "paginate", "path": "src"}),
+            ),
+            (
+                "/work/app/web",
+                "Grep",
+                json!({"pattern": "paginate", "path": "src"}),
+            ),
+            (
+                "/work/app/web",
+                "Glob",
+                json!({"pattern": "*.md", "path": "../docs"}),
+            ),
+            (
+                "/work/app/web",
+                "Glob",
+                json!({"pattern": "*.md", "path": "."}),
+            ),
+            (
+                "/work/app/web",
+                "Glob",
+                json!({"pattern": "*.md", "path": "../../shared"}),
+            ),
+            (
+                "/work/app/web",
+                "Edit",
+                json!({"file_path": "/work/app/web/src/paginate.js"}),
+            ),
+            (
+                "/work/other",
+                "Grep",
+                json!({"pattern": "paginate", "path": "src"}),
+            ),
+        ]);
+        let paths: Vec<&str> = calls
+            .iter()
+            .map(|call| call.args.path.as_deref().expect("path argument"))
+            .collect();
+
+        assert_eq!(
+            paths,
+            [
+                "src",
+                "web/src",
+                "docs",
+                "web",
+                "../shared",
+                "web/src/paginate.js",
+                "src",
+            ]
         );
     }
 }
