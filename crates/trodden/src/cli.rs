@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use trodden::{Home, Ingest, IngestReport, Workspace};
+use trodden_capture::claude_code::HARNESS;
 use trodden_core::RepoId;
 use trodden_embed::ModelPack;
 use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
@@ -112,6 +113,12 @@ enum Command {
         ended: bool,
         #[arg(long, help = "Print nothing")]
         quiet: bool,
+        #[arg(
+            long,
+            hide = true,
+            help = "Leave the transcript to an ingest that is already running instead of waiting for it"
+        )]
+        background: bool,
     },
     #[command(about = "Manage the embedding model used for semantic matching")]
     Embeddings {
@@ -196,9 +203,14 @@ impl Command {
                 transcript,
                 ended,
                 quiet,
+                background,
             } => {
-                let report = Ingest::start(&home)?.claude_code(&transcript, ended)?;
-                if !quiet {
+                let report = if background {
+                    Ingest::run_or_defer(&home, HARNESS, &transcript, ended)?
+                } else {
+                    Some(Ingest::run(&home, HARNESS, &transcript, ended)?)
+                };
+                if let Some(report) = report.filter(|_| !quiet) {
                     Self::print_report(&report);
                 }
                 Ok(())

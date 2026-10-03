@@ -1,12 +1,16 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, TryLockError},
+    io::Write,
     path::{self, Path, PathBuf},
+    process,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use trodden_capture::claude_code::{HARNESS, Transcript};
 use trodden_embed::{Embedder, Quantized};
 use trodden_extract::{Extractor, ProjectChecks};
@@ -81,6 +85,104 @@ impl TranscriptLine {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingIngest {
+    harness: String,
+    transcript: PathBuf,
+    ended: bool,
+}
+
+#[derive(Debug)]
+struct PendingIngests {
+    dir: PathBuf,
+}
+
+impl PendingIngests {
+    const EXTENSION: &str = "marker";
+
+    fn new(home: &Home) -> Self {
+        Self {
+            dir: home.pending_ingests(),
+        }
+    }
+
+    fn push(&self, harness: &str, transcript: &Path, ended: bool) -> Result<()> {
+        let pending = PendingIngest {
+            harness: harness.to_owned(),
+            transcript: path::absolute(transcript)
+                .with_context(|| format!("resolve {}", transcript.display()))?,
+            ended,
+        };
+        fs::create_dir_all(&self.dir).with_context(|| format!("create {}", self.dir.display()))?;
+        static QUEUED: AtomicUsize = AtomicUsize::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let name = format!(
+            "{nanos}-{}-{}",
+            process::id(),
+            QUEUED.fetch_add(1, Ordering::Relaxed)
+        );
+        let staged = self.dir.join(format!("{name}.tmp"));
+        let bytes = serde_json::to_vec(&pending).context("encode a pending ingest")?;
+        File::create_new(&staged)
+            .and_then(|mut file| file.write_all(&bytes))
+            .with_context(|| format!("write {}", staged.display()))?;
+        let marker = self.dir.join(format!("{name}.{}", Self::EXTENSION));
+        fs::rename(&staged, &marker).with_context(|| format!("queue {}", marker.display()))
+    }
+
+    fn any(&self) -> Result<bool> {
+        Ok(!self.markers()?.is_empty())
+    }
+
+    fn take(&self) -> Result<Vec<PendingIngest>> {
+        let mut transcripts = BTreeMap::new();
+        for marker in self.markers()? {
+            let text = fs::read(&marker).with_context(|| format!("read {}", marker.display()))?;
+            fs::remove_file(&marker).with_context(|| format!("remove {}", marker.display()))?;
+            if let Ok(pending) = serde_json::from_slice::<PendingIngest>(&text) {
+                *transcripts
+                    .entry((pending.harness, pending.transcript))
+                    .or_default() |= pending.ended;
+            }
+        }
+        Ok(transcripts
+            .into_iter()
+            .map(|((harness, transcript), ended)| PendingIngest {
+                harness,
+                transcript,
+                ended,
+            })
+            .collect())
+    }
+
+    fn markers(&self) -> Result<Vec<PathBuf>> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("list {}", self.dir.display()));
+            }
+        };
+        let mut markers = Vec::new();
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("read an entry of {}", self.dir.display()))?
+                .path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == Self::EXTENSION)
+            {
+                markers.push(path);
+            }
+        }
+        markers.sort();
+        Ok(markers)
+    }
+}
+
 #[derive(Debug)]
 pub struct Ingest {
     home: Home,
@@ -97,6 +199,19 @@ impl Ingest {
     pub fn start(home: &Home) -> Result<Self> {
         let lock = File::create(home.ingest_lock()).context("create the ingest lock")?;
         lock.lock().context("wait for the ingest lock")?;
+        Self::holding(home, lock)
+    }
+
+    fn try_start(home: &Home) -> Result<Option<Self>> {
+        let lock = File::create(home.ingest_lock()).context("create the ingest lock")?;
+        match lock.try_lock() {
+            Ok(()) => Self::holding(home, lock).map(Some),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error).context("check the ingest lock"),
+        }
+    }
+
+    fn holding(home: &Home, lock: File) -> Result<Self> {
         let mut ingest = Self {
             home: home.clone(),
             store: home.open_store(Patience::Batch)?,
@@ -113,6 +228,77 @@ impl Ingest {
     }
 
     const EMBEDDING_SCHEME: &str = "prompt-skeletons";
+
+    pub fn run(home: &Home, harness: &str, transcript: &Path, ended: bool) -> Result<IngestReport> {
+        let mut ingest = Self::start(home)?;
+        let report = ingest.transcript(harness, transcript, ended);
+        let drained = ingest.finish();
+        let report = report?;
+        drained?;
+        Ok(report)
+    }
+
+    pub fn run_or_defer(
+        home: &Home,
+        harness: &str,
+        transcript: &Path,
+        ended: bool,
+    ) -> Result<Option<IngestReport>> {
+        PendingIngests::new(home).push(harness, transcript, ended)?;
+        Self::try_start(home)?.map(Self::finish).transpose()
+    }
+
+    fn finish(mut self) -> Result<IngestReport> {
+        let mut report = self.drain()?;
+        let home = self.home.clone();
+        drop(self);
+        report.absorb(Self::pick_up(&home)?);
+        Ok(report)
+    }
+
+    fn pick_up(home: &Home) -> Result<IngestReport> {
+        let mut report = IngestReport::default();
+        while PendingIngests::new(home).any()? {
+            let Some(mut ingest) = Self::try_start(home)? else {
+                break;
+            };
+            report.absorb(ingest.drain()?);
+        }
+        Ok(report)
+    }
+
+    fn drain(&mut self) -> Result<IngestReport> {
+        let pending = PendingIngests::new(&self.home);
+        let mut report = IngestReport::default();
+        loop {
+            let batch = pending.take()?;
+            if batch.is_empty() {
+                return Ok(report);
+            }
+            for PendingIngest {
+                harness,
+                transcript,
+                ended,
+            } in batch
+            {
+                if let Ok(one) = self.transcript(&harness, &transcript, ended) {
+                    report.absorb(one);
+                }
+            }
+        }
+    }
+
+    fn transcript(
+        &mut self,
+        harness: &str,
+        transcript: &Path,
+        ended: bool,
+    ) -> Result<IngestReport> {
+        match harness {
+            HARNESS => self.claude_code(transcript, ended),
+            other => bail!("no ingest for {other} transcripts"),
+        }
+    }
 
     pub fn claude_code(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
         let mut report = self.session(transcript, ended)?;
@@ -355,8 +541,6 @@ impl Ingest {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use serde_json::{Value, json};
     use trodden_store::{Cue, Injection};
 
@@ -380,10 +564,29 @@ mod tests {
             Self { dir, transcript }
         }
 
-        fn ingest(&self) -> Ingest {
+        fn home(&self) -> Home {
             let home = Home::at(self.dir.join("home"));
             home.initialize().expect("home initializes");
-            Ingest::start(&home).expect("ingest starts")
+            home
+        }
+
+        fn ingest(&self) -> Ingest {
+            Ingest::start(&self.home()).expect("ingest starts")
+        }
+
+        fn numbered_session(&self, index: usize) -> (String, PathBuf) {
+            let session = format!("0f6c1c4e-2f3a-4b8e-9d1a-{index:012}");
+            let transcript = self.dir.join(format!("{session}.jsonl"));
+            let text: String = task(
+                0,
+                &format!("The total in src/order{index}.js ignores the discount code"),
+                &format!("src/order{index}.js"),
+            )
+            .iter()
+            .map(|line| format!("{}\n", line.to_string().replace(SESSION, &session)))
+            .collect();
+            fs::write(&transcript, text).expect("transcript is writable");
+            (session, transcript)
         }
 
         fn append(&self, lines: &[Value]) {
@@ -985,6 +1188,155 @@ mod tests {
         assert_eq!(
             fs::canonicalize(recorded).expect("recorded transcript exists"),
             fs::canonicalize(&scratch.transcript).expect("transcript exists")
+        );
+    }
+
+    #[test]
+    fn background_ingests_leave_their_transcript_to_the_running_one() {
+        let scratch = Scratch::new("deferred");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let running = scratch.ingest();
+
+        let deferred = Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
+            .expect("background ingest defers");
+        assert_eq!(deferred, None);
+        assert!(PendingIngests::new(&home).any().expect("markers list"));
+
+        let report = running.finish().expect("running ingest finishes");
+        assert_eq!((report.sessions, report.tasks, report.created), (1, 1, 1));
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
+        let ingest = scratch.ingest();
+        assert!(Scratch::ended(&ingest));
+    }
+
+    #[test]
+    fn transcripts_queued_as_the_running_ingest_releases_are_picked_up() {
+        let scratch = Scratch::new("deferred-race");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let mut running = scratch.ingest();
+        assert_eq!(
+            running.drain().expect("nothing is queued yet"),
+            IngestReport::default()
+        );
+        assert_eq!(
+            Ingest::run_or_defer(&home, HARNESS, &scratch.transcript, true)
+                .expect("background ingest defers"),
+            None
+        );
+        drop(running);
+
+        let report = Ingest::pick_up(&home).expect("queued transcripts are picked up");
+        assert_eq!((report.sessions, report.created), (1, 1));
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
+    }
+
+    #[test]
+    fn queued_transcripts_are_ingested_once_and_remember_ending() {
+        let scratch = Scratch::new("deferred-merge");
+        let home = scratch.home();
+        let other = scratch.dir.join("other.jsonl");
+        let pending = PendingIngests::new(&home);
+        pending
+            .push(HARNESS, &scratch.transcript, false)
+            .expect("marker queues");
+        pending
+            .push(HARNESS, &scratch.transcript, true)
+            .expect("marker queues");
+        pending.push(HARNESS, &other, false).expect("marker queues");
+        pending
+            .push(HARNESS, &scratch.transcript, false)
+            .expect("marker queues");
+
+        let mut taken = pending.take().expect("markers are taken");
+        taken.sort_by(|left, right| left.transcript.cmp(&right.transcript));
+        assert_eq!(
+            taken,
+            [
+                PendingIngest {
+                    harness: HARNESS.to_owned(),
+                    transcript: other,
+                    ended: false
+                },
+                PendingIngest {
+                    harness: HARNESS.to_owned(),
+                    transcript: scratch.transcript.clone(),
+                    ended: true
+                },
+            ]
+        );
+        assert!(!pending.any().expect("markers list"));
+        assert_eq!(pending.take().expect("markers are taken"), []);
+    }
+
+    #[test]
+    fn queued_transcripts_of_an_unknown_harness_are_skipped() {
+        let scratch = Scratch::new("deferred-harness");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        PendingIngests::new(&home)
+            .push("future-agent", &scratch.transcript, true)
+            .expect("marker queues");
+
+        let report = scratch.ingest().finish().expect("running ingest finishes");
+
+        assert_eq!(report, IngestReport::default());
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
+    }
+
+    #[test]
+    fn concurrent_background_ingests_learn_every_session() {
+        let scratch = Scratch::new("deferred-concurrent");
+        let home = scratch.home();
+        let sessions: Vec<_> = (0..8)
+            .map(|index| scratch.numbered_session(index))
+            .collect();
+
+        let workers: Vec<_> = sessions
+            .iter()
+            .map(|(_, transcript)| {
+                let home = home.clone();
+                let transcript = transcript.clone();
+                std::thread::spawn(move || Ingest::run_or_defer(&home, HARNESS, &transcript, true))
+            })
+            .collect();
+        for worker in workers {
+            worker
+                .join()
+                .expect("worker finishes")
+                .expect("background ingest succeeds");
+        }
+
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
+        let ingest = scratch.ingest();
+        for (session, _) in &sessions {
+            let progress = ingest
+                .store
+                .progress(session)
+                .expect("progress reads")
+                .expect("session is recorded");
+            assert!(progress.ended, "{session}");
+        }
+        assert_eq!(
+            ingest
+                .store
+                .list(None, true)
+                .expect("procedures list")
+                .len(),
+            sessions.len()
         );
     }
 }

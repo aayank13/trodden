@@ -79,6 +79,10 @@ impl Home {
         self.dir.join("ingest.lock")
     }
 
+    pub fn pending_ingests(&self) -> PathBuf {
+        self.dir.join("ingest.pending")
+    }
+
     pub fn hook_log(&self) -> PathBuf {
         self.dir.join("hook.log")
     }
