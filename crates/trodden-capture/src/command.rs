@@ -1,3 +1,5 @@
+use std::mem;
+
 use trodden_core::trace::ToolAction;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -11,13 +13,9 @@ impl Command {
         "npm", "pnpm", "poetry", "uv", "yarn", "git", "docker", "kubectl",
     ];
 
-    const LAUNCHERS: &[&str] = &[
-        "sudo",
-        "env",
-        "time",
-        "nice",
-        "nohup",
-        "timeout",
+    const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "nohup", "timeout"];
+
+    const PACKAGE_RUNNERS: &[&str] = &[
         "npx",
         "bunx",
         "pnpx",
@@ -82,6 +80,8 @@ impl Command {
         ("uv", "--directory --project"),
         ("yarn", "--cwd"),
     ];
+
+    const SHELL_BUILTINS: &[&str] = &["cd", "time"];
 
     const READ_PROGRAMS: &[&str] = &[
         "cat", "head", "tail", "less", "more", "bat", "wc", "file", "stat",
@@ -262,21 +262,67 @@ impl Command {
     }
 
     pub fn argv(&self) -> Vec<String> {
-        let mut words = self.first_words();
+        self.layers().1
+    }
+
+    pub fn executables(&self) -> Vec<String> {
+        let (launchers, argv) = self.layers();
+        let mut executables = Vec::new();
+        let mut resolves_program = false;
+        for (launcher, words) in launchers {
+            executables.push(words[0].clone());
+            if Self::PACKAGE_RUNNERS.contains(&launcher.as_str()) {
+                resolves_program = true;
+                break;
+            }
+        }
+        if !resolves_program {
+            executables.extend(argv.into_iter().next());
+        }
+        executables.retain(|executable| !Self::SHELL_BUILTINS.contains(&executable.as_str()));
+        executables
+    }
+
+    pub fn locate(&self, path: &str) -> Option<String> {
+        if path.starts_with('~') {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for change in self.first_words().0 {
+            match change.as_slice() {
+                [_, dir] if !dir.starts_with(['/', '~', '-']) => parts.push(dir.clone()),
+                _ => return None,
+            }
+        }
+        parts.push(path.to_owned());
+        let parts: Vec<&str> = parts
+            .iter()
+            .flat_map(|part| part.split('/'))
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        Some(parts.join("/"))
+    }
+
+    fn layers(&self) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+        let mut words = self.first_words().1;
+        let mut launchers = Vec::new();
         loop {
             let start = words
                 .iter()
                 .position(|word| !Self::is_assignment(word))
                 .unwrap_or(words.len());
             words.drain(..start);
-            let Some(start) = Self::launched(&words) else {
-                return words;
+            let Some((launcher, start)) = Self::launched(&words) else {
+                return (launchers, words);
             };
-            words.drain(..start);
+            let program = words.split_off(start);
+            launchers.push((launcher, words));
+            words = program;
         }
     }
 
-    fn first_words(&self) -> Vec<String> {
+    fn first_words(&self) -> (Vec<Vec<String>>, Vec<String>) {
+        let mut changes = Vec::new();
         let mut words = Vec::new();
         let mut word: Option<String> = None;
         let mut quote = None;
@@ -303,9 +349,11 @@ impl Command {
                     words.extend(word.take());
                     let chained = c != '|' && (c != '&' || chars.next_if_eq(&'&').is_some());
                     if !chained || words.first().is_some_and(|first| first != "cd") {
-                        return words;
+                        return (changes, words);
                     }
-                    words.clear();
+                    if !words.is_empty() {
+                        changes.push(mem::take(&mut words));
+                    }
                 }
                 (None, _) if c.is_whitespace() => words.extend(word.take()),
                 (None, _) => word.get_or_insert_default().push(c),
@@ -313,21 +361,23 @@ impl Command {
             previous = c;
         }
         words.extend(word);
-        words
+        (changes, words)
     }
 
-    fn launched(words: &[String]) -> Option<usize> {
+    fn launched(words: &[String]) -> Option<(String, usize)> {
         let (first, arguments) = words.split_first()?;
         let name = Self::name(first);
         let (launcher, start) = match Self::subcommand(name, arguments) {
             Some(index) => (format!("{name} {}", arguments[index]), index + 2),
             None => (name.to_owned(), 1),
         };
-        if !Self::LAUNCHERS.contains(&launcher.as_str()) {
+        if !Self::WRAPPERS.contains(&launcher.as_str())
+            && !Self::PACKAGE_RUNNERS.contains(&launcher.as_str())
+        {
             return None;
         }
         let start = Self::operand(&launcher, words, start);
-        (start < words.len()).then_some(start)
+        (start < words.len()).then_some((launcher, start))
     }
 
     fn subcommand(program: &str, arguments: &[String]) -> Option<usize> {
@@ -458,6 +508,72 @@ mod tests {
             assert_eq!(
                 Command::normalize(command, "/work").argv(),
                 argv,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn lists_the_executables_the_shell_must_find() {
+        let cases: [(&str, &[&str]); 14] = [
+            ("cargo test", &["cargo"]),
+            ("cd web && npm test", &["npm"]),
+            ("time cargo test", &["cargo"]),
+            ("FOO=\"a b\" cargo test", &["cargo"]),
+            ("timeout 600 cargo test", &["timeout", "cargo"]),
+            ("env CI=1 nice -n 5 make test", &["env", "nice", "make"]),
+            ("sudo -u root /usr/bin/make", &["sudo", "/usr/bin/make"]),
+            ("timeout 60 npx jest --ci", &["timeout", "npx"]),
+            ("uv run --with pytest-cov pytest", &["uv"]),
+            ("npm exec -- jest", &["npm"]),
+            ("bundle exec rspec", &["bundle"]),
+            ("./gradlew test", &["./gradlew"]),
+            ("cd web || npm test", &[]),
+            ("", &[]),
+        ];
+        for (command, executables) in cases {
+            assert_eq!(
+                Command::normalize(command, "/work").executables(),
+                executables,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn locates_paths_from_where_the_command_starts() {
+        let cases = [
+            ("./gradlew test", "./gradlew", Some("gradlew")),
+            (
+                "cd android && ./gradlew test",
+                "./gradlew",
+                Some("android/gradlew"),
+            ),
+            (
+                "cd /work/android && ./gradlew test",
+                "./gradlew",
+                Some("android/gradlew"),
+            ),
+            (
+                "cd web; cd scripts\n./gen.sh",
+                "./gen.sh",
+                Some("web/scripts/gen.sh"),
+            ),
+            (
+                "cd .. && tools/check.sh",
+                "tools/check.sh",
+                Some("../tools/check.sh"),
+            ),
+            ("cd /opt/android && ./gradlew test", "./gradlew", None),
+            ("cd ~/src && ./check.sh", "./check.sh", None),
+            ("cd - && ./check.sh", "./check.sh", None),
+            ("cd && ./check.sh", "./check.sh", None),
+            ("~/bin/check", "~/bin/check", None),
+        ];
+        for (command, path, expected) in cases {
+            assert_eq!(
+                Command::normalize(command, "/work").locate(path).as_deref(),
+                expected,
                 "{command}"
             );
         }

@@ -410,12 +410,9 @@ impl<'a> Builder<'a> {
         }
         let parsed = Command::normalize(command, "");
         let program = parsed.program();
-        let mut words = parsed
-            .text()
-            .split_whitespace()
-            .skip_while(|word| word.contains('='));
-        let first = words.next().unwrap_or_default();
-        let second = words.next().unwrap_or_default();
+        let argv = parsed.argv();
+        let first = argv.first().map_or("", String::as_str);
+        let second = argv.get(1).map_or("", String::as_str);
         let runner = program.split_whitespace().next().unwrap_or_default();
         match program.as_str() {
             "npm run" | "pnpm run" | "yarn run" | "bun run" => true,
@@ -634,15 +631,32 @@ impl<'a> Builder<'a> {
             }
         }
         for command in [observed, verify] {
-            if let Some(program) = command.split_whitespace().find(|word| !word.contains('='))
-                && !self.is_new(program.trim_start_matches("./"))
-            {
-                require(Condition::ProgramOnPath {
-                    program: program.to_owned(),
-                });
+            for condition in Self::requirements(command) {
+                if !matches!(&condition, Condition::FileExists { path } if self.is_new(path)) {
+                    require(condition);
+                }
             }
         }
         preconditions
+    }
+
+    fn requirements(command: &str) -> Vec<Condition> {
+        let command = Command::normalize(command, "");
+        command
+            .executables()
+            .into_iter()
+            .filter_map(|executable| {
+                if executable.starts_with('/') || !executable.contains('/') {
+                    Some(Condition::ProgramOnPath {
+                        program: executable,
+                    })
+                } else {
+                    command
+                        .locate(&executable)
+                        .map(|path| Condition::FileExists { path })
+                }
+            })
+            .collect()
     }
 
     fn is_new(&self, path: &str) -> bool {
@@ -975,6 +989,24 @@ mod tests {
             let mut results = self.extract();
             assert_eq!(results.len(), 1, "expected one task");
             results.remove(0)
+        }
+
+        fn check_requirements(self, check: &str) -> Vec<String> {
+            self.prompt("Fix the off-by-one in src/paginate.js")
+                .edit("src/paginate.js", &[])
+                .run(check, 0)
+                .extract_one()
+                .expect("verified task is admitted")
+                .preconditions
+                .into_iter()
+                .filter_map(|condition| match condition {
+                    Condition::ProgramOnPath { program } => Some(format!("program {program}")),
+                    Condition::FileExists { path } if path != "src/paginate.js" => {
+                        Some(format!("file {path}"))
+                    }
+                    _ => None,
+                })
+                .collect()
         }
     }
 
@@ -1581,6 +1613,79 @@ mod tests {
                 command: "./scripts/apply.sh migrations/0005_add_priority.sql && chmod 777 migrations/0005_add_priority.sql".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn preconditions_name_what_the_check_needs_to_run() {
+        let cases: [(&str, &[&str]); 21] = [
+            ("cargo test", &["program cargo"]),
+            ("cd web && npm test", &["program npm"]),
+            ("cd web; cd app && npm test", &["program npm"]),
+            ("time cargo test", &["program cargo"]),
+            ("FOO=\"a b\" cargo test", &["program cargo"]),
+            ("RUST_LOG=debug cargo test 2>&1", &["program cargo"]),
+            (
+                "timeout 600 cargo test",
+                &["program timeout", "program cargo"],
+            ),
+            (
+                "env CI=1 nice -n 5 make test",
+                &["program env", "program nice", "program make"],
+            ),
+            ("npx jest --ci", &["program npx"]),
+            ("cd web && npx jest", &["program npx"]),
+            ("npm exec -- vitest run", &["program npm"]),
+            ("uv run --with pytest-cov pytest", &["program uv"]),
+            ("poetry run pytest", &["program poetry"]),
+            ("bundle exec rspec spec/models", &["program bundle"]),
+            ("python3 manage.py test", &["program python3"]),
+            ("./gradlew test", &["file gradlew"]),
+            ("cd android && ./gradlew test", &["file android/gradlew"]),
+            ("cd /opt/android && ./gradlew test", &[]),
+            ("scripts/check.sh", &["file scripts/check.sh"]),
+            (".venv/bin/pytest", &["file .venv/bin/pytest"]),
+            (
+                "/usr/local/bin/cargo test",
+                &["program /usr/local/bin/cargo"],
+            ),
+        ];
+        for (check, expected) in cases {
+            assert_eq!(Sketch::new().check_requirements(check), expected, "{check}");
+        }
+    }
+
+    #[test]
+    fn scripts_created_in_the_session_are_not_preconditions() {
+        let cases = [
+            ("scripts/check.sh", "./scripts/check.sh"),
+            ("web/check.sh", "cd web && ./check.sh"),
+        ];
+        for (script, check) in cases {
+            assert_eq!(
+                Sketch::new().create(script).check_requirements(check),
+                Vec::<String>::new(),
+                "{check}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_tasks_are_found_behind_cd_and_assignments() {
+        let cases = [
+            ("./gen.sh", true),
+            ("cd scripts && ./gen.sh", true),
+            ("FOO=\"a b\" ./gen.sh", true),
+            ("time make gen", true),
+            ("cd tools && python3 gen_models.py", true),
+            ("cd web && node scripts/build.js", true),
+            ("cd web && npm run gen", true),
+            ("cd web && git status", false),
+            ("FOO=\"a b\" cargo fmt", false),
+            ("cd web && npm test", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(Builder::is_project_task(command), expected, "{command}");
+        }
     }
 
     #[test]
