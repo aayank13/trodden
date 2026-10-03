@@ -96,9 +96,6 @@ impl Ingest {
     const EMBEDDING_SCHEME: &str = "prompt-skeletons";
 
     pub fn claude_code(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
-        if self.store.paused()? {
-            return Ok(IngestReport::default());
-        }
         let text = fs::read_to_string(transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
         let mut trace = Transcript::parse(&text, &self.redactor)
@@ -119,14 +116,28 @@ impl Ingest {
             transcript.display()
         );
         let workspace = Workspace::resolve(&cwd, &self.store)?;
+        let now = Timestamp::now();
+        let stamp = now.to_string();
+        if self.store.paused()? {
+            self.store.set_progress(
+                &session,
+                HARNESS,
+                &transcript.to_string_lossy(),
+                Some(workspace.repo.as_str()),
+                Progress {
+                    extracted_through: last_seq.max(already),
+                    ended,
+                },
+                &stamp,
+            )?;
+            return Ok(IngestReport::default());
+        }
         trace.commit = workspace.head();
         let mut report = IngestReport {
             sessions: 1,
             ..IngestReport::default()
         };
         let mut extracted_through = already;
-        let now = Timestamp::now();
-        let stamp = now.to_string();
         let mut tasks = Vec::new();
 
         let checks = ProjectChecks::discover(&workspace.root)
@@ -210,6 +221,9 @@ impl Ingest {
         &mut self,
         projects: &Path,
     ) -> Result<(IngestReport, Vec<(PathBuf, String)>)> {
+        if self.store.paused()? {
+            return Ok((IngestReport::default(), Vec::new()));
+        }
         let mut transcripts = Vec::new();
         for project in
             fs::read_dir(projects).with_context(|| format!("list {}", projects.display()))?
@@ -491,5 +505,144 @@ mod tests {
             .claude_code(&scratch.transcript, true)
             .expect("ingest with nothing new");
         assert_eq!(again, IngestReport::default());
+    }
+
+    #[test]
+    fn work_done_while_paused_is_never_learned() {
+        let scratch = Scratch::new("paused");
+        let mut ingest = scratch.ingest();
+        ingest.store.set_paused(true).expect("capture pauses");
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let paused = ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest while paused");
+        assert_eq!(paused, IngestReport::default());
+
+        ingest.store.set_paused(false).expect("capture resumes");
+        let ended = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest after resuming capture");
+        assert_eq!((ended.sessions, ended.tasks, ended.created), (1, 0, 0));
+
+        scratch.append(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        let resumed = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest a task done after resuming capture");
+        assert_eq!(
+            (resumed.sessions, resumed.tasks, resumed.created),
+            (1, 1, 1)
+        );
+        let titles: Vec<_> = ingest
+            .store
+            .list(None, true)
+            .expect("procedures list")
+            .into_iter()
+            .map(|row| row.procedure.title)
+            .collect();
+        assert_eq!(
+            titles,
+            ["The cart total in src/cart.js ignores the discount code"]
+        );
+    }
+
+    #[test]
+    fn sessions_spanning_a_pause_learn_only_what_followed_it() {
+        let scratch = Scratch::new("spanning-pause");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("first ingest");
+
+        scratch.append(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        inject(&ingest, 5);
+        ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest before pausing");
+
+        ingest.store.set_paused(true).expect("capture pauses");
+        scratch.append(&task(
+            10,
+            "Search in src/search.js returns archived products to shoppers",
+            "src/search.js",
+        ));
+        ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest while paused");
+
+        ingest.store.set_paused(false).expect("capture resumes");
+        scratch.append(&task(15, "still failing", "src/search.js"));
+        inject(&ingest, 15);
+        scratch.append(&task(
+            20,
+            "Checkout in src/checkout.js charges shipping twice",
+            "src/checkout.js",
+        ));
+        let resumed = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect("ingest after resuming capture");
+        assert_eq!((resumed.tasks, resumed.created, resumed.settled), (1, 1, 1));
+
+        let settled: Vec<_> = ingest
+            .store
+            .injections(Some(SESSION))
+            .expect("injections list")
+            .into_iter()
+            .map(|record| record.outcome.is_some())
+            .collect();
+        assert_eq!(settled, [false, true]);
+    }
+
+    #[test]
+    fn backfill_while_paused_leaves_history_for_later() {
+        let scratch = Scratch::new("paused-backfill");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        scratch.append(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        let projects = scratch.dir.join("projects");
+        fs::create_dir_all(projects.join("shop")).expect("projects directory is writable");
+        fs::copy(&scratch.transcript, projects.join("shop/session.jsonl"))
+            .expect("transcript is copied");
+
+        ingest.store.set_paused(true).expect("capture pauses");
+        let (paused, _) = ingest
+            .backfill_claude_code(&projects)
+            .expect("backfill while paused");
+        assert_eq!(paused, IngestReport::default());
+        assert_eq!(
+            ingest.store.progress(SESSION).expect("progress reads"),
+            None
+        );
+
+        ingest.store.set_paused(false).expect("capture resumes");
+        let (resumed, failures) = ingest
+            .backfill_claude_code(&projects)
+            .expect("backfill after resuming capture");
+        assert!(failures.is_empty());
+        assert_eq!((resumed.sessions, resumed.created), (1, 1));
     }
 }
