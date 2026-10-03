@@ -183,12 +183,12 @@ impl Workspace {
         if !root.join(".git").exists() {
             return None;
         }
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .ok()?;
+        let root = fs::canonicalize(root).ok()?;
+        let mut command = Command::new("git");
+        if let Some(parent) = root.parent() {
+            command.env("GIT_CEILING_DIRECTORIES", parent);
+        }
+        let output = command.arg("-C").arg(&root).args(args).output().ok()?;
         output
             .status
             .success()
@@ -241,6 +241,22 @@ mod tests {
                 .repo
                 .as_str()
                 .to_owned()
+        }
+
+        fn invalid_git_dir(repo: &Path, name: &str) -> PathBuf {
+            let dir = repo.join(name);
+            fs::create_dir_all(dir.join(".git")).expect("empty git directory is writable");
+            dir
+        }
+
+        fn assert_path_identified(&self, dir: &Path) {
+            let workspace = Workspace::resolve(dir, &self.store).expect("workspace resolves");
+            assert_eq!(workspace.root, dir);
+            assert_eq!(workspace.repo.as_str(), Workspace::path_id(dir));
+            assert_eq!(workspace.head(), None);
+            let stamp = Workspace::stamp(dir).expect("git entry has a stamp");
+            let key = format!("{}#{stamp}", text(dir));
+            assert_eq!(self.store.repo_for_root(&key).expect("cache reads"), None);
         }
     }
 
@@ -353,6 +369,50 @@ mod tests {
         assert_eq!(scratch.resolve(&shallow), root_commit(&origin));
         assert_eq!(scratch.resolve(&worktree), root_commit(&origin));
         assert_eq!(scratch.resolve(&full), root_commit(&origin));
+    }
+
+    #[test]
+    fn an_invalid_git_directory_does_not_borrow_the_parent_id() {
+        let scratch = Scratch::new("invalid");
+        let shop = scratch.repo("shop", &["shop"]);
+        let empty = Scratch::invalid_git_dir(&shop, "empty");
+        let broken = shop.join("broken");
+        fs::create_dir_all(&broken).expect("broken directory is writable");
+        fs::write(broken.join(".git"), "gitdir: ../missing\n").expect("git link is writable");
+
+        scratch.assert_path_identified(&empty);
+        scratch.assert_path_identified(&broken);
+        assert_eq!(scratch.resolve(&shop), root_commit(&shop));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_invalid_git_directory_behind_a_symlink_does_not_borrow_the_parent_id() {
+        let scratch = Scratch::new("invalid-symlink");
+        let shop = scratch.repo("shop", &["shop"]);
+        let empty = Scratch::invalid_git_dir(&shop, "empty");
+        let linked = scratch.dir.join("linked");
+        std::os::unix::fs::symlink(&empty, &linked).expect("symlink is writable");
+
+        scratch.assert_path_identified(&linked);
+    }
+
+    #[test]
+    fn valid_repositories_inside_another_keep_their_own_id() {
+        let scratch = Scratch::new("nested");
+        let shop = scratch.repo("shop", &["shop"]);
+        let blog = scratch.repo("blog", &["blog"]);
+        let vendor = shop.join("vendor");
+        fs::create_dir_all(&vendor).expect("vendor directory is writable");
+        git(&vendor, &["init", "-q"]);
+        commit(&vendor, "vendor");
+        let tree = shop.join("blog-tree");
+        git(&blog, &["worktree", "add", "-q", &text(&tree)]);
+
+        assert_eq!(scratch.resolve(&vendor), root_commit(&vendor));
+        assert_eq!(scratch.resolve(&tree), root_commit(&blog));
+        assert_ne!(root_commit(&blog), root_commit(&shop));
+        assert_ne!(root_commit(&vendor), root_commit(&shop));
     }
 
     #[test]
