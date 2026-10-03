@@ -5,7 +5,6 @@ use trodden_capture::Command;
 
 const VERIFY_PROGRAMS: &[&str] = &[
     "cargo test",
-    "cargo nextest",
     "cargo check",
     "cargo clippy",
     "cargo build",
@@ -36,9 +35,23 @@ const VERIFY_PROGRAMS: &[&str] = &[
     "mvn test",
     "mvn verify",
     "gradle test",
+    "gradle check",
     "gradle build",
     "swift test",
     "phpunit",
+];
+
+const NO_RUN_FLAGS: &[&str] = &[
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+    "--no-run",
+    "--collect-only",
+    "--co",
+    "--list",
+    "-list",
+    "--listTests",
 ];
 
 static CHECK_WORD: LazyLock<Regex> = LazyLock::new(|| {
@@ -62,28 +75,47 @@ pub(crate) struct Verification;
 impl Verification {
     pub(crate) fn is_verify(command: &str) -> bool {
         let command = Command::normalize(&Self::clean(command), "");
+        let argv = command.argv();
+        let Some((executable, arguments)) = argv.split_first() else {
+            return false;
+        };
+        if arguments.iter().any(|argument| {
+            NO_RUN_FLAGS.contains(
+                &argument
+                    .split_once('=')
+                    .map_or(argument.as_str(), |(flag, _)| flag),
+            )
+        }) {
+            return false;
+        }
         let program = command.program();
         if VERIFY_PROGRAMS.contains(&program.as_str()) {
             return true;
         }
-        let text = command.text();
+        let targets = arguments.join(" ");
         let runner = program.split_whitespace().next().unwrap_or_default();
         match program.as_str() {
-            "node" => text.split_whitespace().any(|word| word == "--test"),
-            "npm run" | "pnpm run" | "yarn run" | "bun run" => {
-                CHECK_WORD.is_match(text.split_once(' ').map_or("", |(_, rest)| rest))
+            "node" => arguments.iter().any(|argument| argument == "--test"),
+            "cargo nextest" => arguments
+                .iter()
+                .any(|argument| argument == "run" || argument == "r"),
+            "npm run" | "pnpm run" | "yarn run" | "bun run" => CHECK_WORD.is_match(&targets),
+            _ if ["make", "just", "rake", "sh", "bash", "zsh"].contains(&runner) => {
+                CHECK_WORD.is_match(&targets)
             }
-            _ if ["make", "just", "sh", "bash", "zsh"].contains(&runner) => {
-                CHECK_WORD.is_match(text.split_once(' ').map_or("", |(_, rest)| rest))
+            _ if program.starts_with("python ") => {
+                Self::is_check_script(&program, arguments.get(1))
             }
-            _ if program.starts_with("python ")
-                || program.starts_with("./")
-                || program.contains('/') =>
-            {
-                CHECK_WORD.is_match(&program)
-            }
+            _ if executable.contains('/') => Self::is_check_script(executable, arguments.first()),
             _ => false,
         }
+    }
+
+    fn is_check_script(script: &str, task: Option<&String>) -> bool {
+        CHECK_WORD.is_match(script)
+            || task.is_some_and(|task| {
+                !task.starts_with('-') && !task.contains(['/', '.']) && CHECK_WORD.is_match(task)
+            })
     }
 
     pub(crate) fn runs_tests(command: &str) -> bool {
@@ -126,15 +158,69 @@ mod tests {
             "python3 tools/check.py",
             "sh scripts/test.sh",
             "cargo test --lib 2>&1 | head -50",
+            "./bin/check",
+            "bin/check",
+            "./scripts/test.sh",
+            "./gradlew test",
+            "./gradlew check",
+            "./mvnw -q verify",
+            "cd crates/x && cargo test",
+            "cd web && npm test",
+            "cd web && npm run lint",
+            "npx jest",
+            "npx tsc --noEmit",
+            "uv run pytest",
+            "uv run python -m pytest",
+            "poetry run pytest",
+            "bundle exec rspec",
+            "bundle exec rake test",
+            "python3 manage.py test",
+            "./x.py test",
+            "cargo +nightly test",
+            "cargo nextest run",
+            "time cargo test",
+            "timeout 600 cargo test",
+            "FOO=\"a b\" cargo test",
+            "sudo -u ci make check",
+            "make -C web check",
         ] {
             assert!(Verification::is_verify(command), "{command}");
         }
         for command in [
             "python3 tools/gen_models.py",
+            "python3 tools/gen_models.py --check",
+            "python3 tools/seed.py tests/fixtures.json",
             "npm run gen",
             "cargo run -- count",
             "git status",
             "make install",
+            "./scripts/gen.sh",
+            "cd test && npm run build",
+            "npx prettier --write .",
+            "uv run alembic upgrade head",
+        ] {
+            assert!(!Verification::is_verify(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn ignores_check_programs_that_run_no_checks() {
+        for command in [
+            "ruff --version",
+            "ruff -V",
+            "cargo test --help",
+            "cargo test -h",
+            "cargo test --no-run",
+            "cargo test -- --list",
+            "cargo nextest list",
+            "pytest --collect-only",
+            "pytest --co -q",
+            "go test -list .",
+            "go test -list=Paging ./...",
+            "npx jest --listTests",
+            "make check --help",
+            "./bin/check --help",
+            "cd web && npm test -- --help",
         ] {
             assert!(!Verification::is_verify(command), "{command}");
         }

@@ -8,7 +8,79 @@ pub struct Command {
 impl Command {
     const SUBCOMMAND_PROGRAMS: &[&str] = &[
         "bun", "bundle", "cargo", "deno", "dotnet", "go", "gradle", "just", "make", "mix", "mvn",
-        "npm", "npx", "pnpm", "poetry", "uv", "yarn", "git", "docker", "kubectl",
+        "npm", "pnpm", "poetry", "uv", "yarn", "git", "docker", "kubectl",
+    ];
+
+    const LAUNCHERS: &[&str] = &[
+        "sudo",
+        "env",
+        "time",
+        "nice",
+        "nohup",
+        "timeout",
+        "npx",
+        "bunx",
+        "pnpx",
+        "uvx",
+        "uv run",
+        "poetry run",
+        "bundle exec",
+        "npm exec",
+        "pnpm exec",
+        "pnpm dlx",
+        "yarn exec",
+        "yarn dlx",
+    ];
+
+    const VALUE_OPTIONS: &[(&str, &str)] = &[
+        (
+            "sudo",
+            "-u --user -g --group -C --close-from -D --chdir -p --prompt",
+        ),
+        ("env", "-u --unset -C --chdir -S --split-string"),
+        ("time", "-f --format -o --output"),
+        ("nice", "-n --adjustment"),
+        ("timeout", "-s --signal -k --kill-after"),
+        ("npx", "-p --package -c --call"),
+        ("npm exec", "-p --package -c --call -w --workspace"),
+        ("bunx", "-p --package"),
+        ("uvx", "--from --with -p --python"),
+        (
+            "uv run",
+            "--with -p --python --package --extra --group --directory --project --env-file",
+        ),
+        ("pnpm dlx", "--package"),
+        ("yarn dlx", "-p --package"),
+        ("bun", "--cwd"),
+        ("cargo", "--color --config -Z -C"),
+        ("docker", "-H --host -c --context --config -l --log-level"),
+        (
+            "git",
+            "-C -c --git-dir --work-tree --namespace --config-env",
+        ),
+        ("go", "-C"),
+        (
+            "gradle",
+            "-p --project-dir -b --build-file -c --settings-file -I --init-script -x --exclude-task",
+        ),
+        ("just", "-f --justfile -d --working-directory"),
+        (
+            "kubectl",
+            "-n --namespace --context --kubeconfig --cluster --user -s --server --as",
+        ),
+        (
+            "make",
+            "-C --directory -f --file -I --include-dir -o --old-file",
+        ),
+        (
+            "mvn",
+            "-f --file -pl --projects -P --activate-profiles -s --settings -T --threads -rf --resume-from -D",
+        ),
+        ("npm", "--prefix -w --workspace --loglevel"),
+        ("pnpm", "-C --dir -F --filter"),
+        ("poetry", "-C --directory -P --project"),
+        ("uv", "--directory --project"),
+        ("yarn", "--cwd"),
     ];
 
     const READ_PROGRAMS: &[&str] = &[
@@ -158,21 +230,16 @@ impl Command {
     }
 
     pub fn program(&self) -> String {
-        let mut words = self
-            .first_segment()
-            .split_whitespace()
-            .skip_while(|word| word.contains('=') || *word == "sudo" || *word == "env");
-        let Some(program) = words.next() else {
+        let argv = self.argv();
+        let Some((first, arguments)) = argv.split_first() else {
             return String::new();
         };
-        let program = program.rsplit('/').next().unwrap_or(program);
-        if Self::SUBCOMMAND_PROGRAMS.contains(&program)
-            && let Some(sub) = words.find(|word| !word.starts_with('-'))
-        {
-            return format!("{program} {sub}");
+        let program = Self::name(first);
+        if let Some(index) = Self::subcommand(program, arguments) {
+            return format!("{program} {}", arguments[index]);
         }
         if program.starts_with("python") {
-            let rest: Vec<&str> = words.collect();
+            let rest: Vec<&str> = arguments.iter().map(String::as_str).collect();
             return match rest.as_slice() {
                 ["-m", module, ..] => format!("python -m {module}"),
                 [script, ..] => format!("python {script}"),
@@ -194,13 +261,117 @@ impl Command {
         }
     }
 
-    fn first_segment(&self) -> &str {
-        self.text
-            .split(['|', ';'])
-            .next()
-            .and_then(|segment| segment.split("&&").next())
-            .unwrap_or(&self.text)
-            .trim()
+    pub fn argv(&self) -> Vec<String> {
+        let mut words = self.first_words();
+        loop {
+            let start = words
+                .iter()
+                .position(|word| !Self::is_assignment(word))
+                .unwrap_or(words.len());
+            words.drain(..start);
+            let Some(start) = Self::launched(&words) else {
+                return words;
+            };
+            words.drain(..start);
+        }
+    }
+
+    fn first_words(&self) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut quote = None;
+        let mut previous = ' ';
+        let mut chars = self.text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some(open), _) if c == open => quote = None,
+                (Some('"'), '\\') => word.get_or_insert_default().extend(chars.next()),
+                (Some(_), _) => word.get_or_insert_default().push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    word.get_or_insert_default();
+                }
+                (None, '\\') => {
+                    if let Some(next) = chars.next().filter(|next| *next != '\n') {
+                        word.get_or_insert_default().push(next);
+                    }
+                }
+                (None, '&') if previous == '>' || chars.peek() == Some(&'>') => {
+                    word.get_or_insert_default().push(c);
+                }
+                (None, '|' | ';' | '&' | '\n') => {
+                    words.extend(word.take());
+                    let chained = c != '|' && (c != '&' || chars.next_if_eq(&'&').is_some());
+                    if !chained || words.first().is_some_and(|first| first != "cd") {
+                        return words;
+                    }
+                    words.clear();
+                }
+                (None, _) if c.is_whitespace() => words.extend(word.take()),
+                (None, _) => word.get_or_insert_default().push(c),
+            }
+            previous = c;
+        }
+        words.extend(word);
+        words
+    }
+
+    fn launched(words: &[String]) -> Option<usize> {
+        let (first, arguments) = words.split_first()?;
+        let name = Self::name(first);
+        let (launcher, start) = match Self::subcommand(name, arguments) {
+            Some(index) => (format!("{name} {}", arguments[index]), index + 2),
+            None => (name.to_owned(), 1),
+        };
+        if !Self::LAUNCHERS.contains(&launcher.as_str()) {
+            return None;
+        }
+        let start = Self::operand(&launcher, words, start);
+        (start < words.len()).then_some(start)
+    }
+
+    fn subcommand(program: &str, arguments: &[String]) -> Option<usize> {
+        if !Self::SUBCOMMAND_PROGRAMS.contains(&program) {
+            return None;
+        }
+        let index = Self::operand(program, arguments, 0);
+        (index < arguments.len()).then_some(index)
+    }
+
+    fn operand(program: &str, words: &[String], mut index: usize) -> usize {
+        let values = Self::VALUE_OPTIONS
+            .iter()
+            .find(|(name, _)| *name == program)
+            .map_or("", |(_, values)| values);
+        while let Some(word) = words.get(index) {
+            if word == "--" {
+                return index + 1;
+            }
+            if !word.starts_with(['-', '+']) && !word.starts_with(|c: char| c.is_ascii_digit()) {
+                break;
+            }
+            index += if values.split_whitespace().any(|value| value == word) {
+                2
+            } else {
+                1
+            };
+        }
+        index
+    }
+
+    fn name(word: &str) -> &str {
+        match word.rsplit('/').next().unwrap_or(word) {
+            "gradlew" => "gradle",
+            "mvnw" => "mvn",
+            name => name,
+        }
+    }
+
+    fn is_assignment(word: &str) -> bool {
+        word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
     }
 }
 
@@ -224,11 +395,69 @@ mod tests {
             ),
             ("/usr/bin/grep -rn paginate src | head", "grep"),
             ("sh scripts/test.sh", "sh"),
+            ("git -C sub status", "git status"),
+            ("cargo +nightly test", "cargo test"),
+            ("npm --prefix web test", "npm test"),
+            ("kubectl -n prod get pods", "kubectl get"),
+            ("make -j 8 -C web check", "make check"),
+            ("./mvnw -pl core -q verify", "mvn verify"),
+            ("./gradlew test", "gradle test"),
+            ("sudo -u root make", "make"),
+            ("FOO=\"a b\" cargo test", "cargo test"),
+            ("time cargo test", "cargo test"),
+            (
+                "env -u HOME RUST_LOG=info nice -n 5 cargo test",
+                "cargo test",
+            ),
+            ("timeout 300 cargo test", "cargo test"),
+            ("cd crates/x && cargo test", "cargo test"),
+            ("cd /work/web && npm test", "npm test"),
+            ("cd web; cd src\nnpm test", "npm test"),
+            ("cd web || npm test", "cd"),
+            ("npx jest --ci", "jest"),
+            ("npx -p typescript tsc --noEmit", "tsc"),
+            ("npm exec -- jest", "jest"),
+            ("uv run --with pytest-cov pytest", "pytest"),
+            ("uv run python -m pytest", "python -m pytest"),
+            ("poetry run pytest", "pytest"),
+            ("bundle exec rspec spec/models", "rspec"),
+            ("uv sync", "uv sync"),
+            ("npx", "npx"),
+            ("cargo test 2>&1 | tail -20", "cargo test"),
+            ("npm test &> out.log", "npm test"),
+            ("", ""),
         ];
         for (command, program) in cases {
             assert_eq!(
                 Command::normalize(command, "/work").program(),
                 program,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn finds_the_arguments_the_program_receives() {
+        let cases: [(&str, &[&str]); 5] = [
+            ("./bin/check", &["./bin/check"]),
+            ("cd web && npx jest --ci", &["jest", "--ci"]),
+            (
+                "FOO=\"a b\" cargo test -- --list",
+                &["cargo", "test", "--", "--list"],
+            ),
+            (
+                "python3 manage.py test 'billing.tests'",
+                &["python3", "manage.py", "test", "billing.tests"],
+            ),
+            (
+                "cargo test \\\n  --workspace",
+                &["cargo", "test", "--workspace"],
+            ),
+        ];
+        for (command, argv) in cases {
+            assert_eq!(
+                Command::normalize(command, "/work").argv(),
+                argv,
                 "{command}"
             );
         }
@@ -300,6 +529,10 @@ mod tests {
         assert_eq!(
             Command::normalize("rg -n TODO", "/w").action(),
             ToolAction::Search
+        );
+        assert_eq!(
+            Command::normalize("cd src && cat lib.rs", "/w").action(),
+            ToolAction::Read
         );
         assert_eq!(
             Command::normalize("npm test", "/w").action(),
