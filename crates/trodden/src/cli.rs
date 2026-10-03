@@ -1,5 +1,6 @@
 use std::{
-    env, fs,
+    env,
+    fs::{self, File, TryLockError},
     path::PathBuf,
     process::{Command as Process, ExitCode},
 };
@@ -486,9 +487,10 @@ impl Command {
     }
 
     fn retire(home: &Home, id: &str) -> Result<()> {
+        let ingest = Self::wait_for_ingest(home)?;
         let retired = home.open_store(Patience::Batch)?.retire(id)?;
         ensure!(retired > 0, "no procedure {id}");
-        Ingest::start(home)?.rebuild_index()?;
+        ingest.rebuild_index()?;
         println!("Retired {retired} revision(s) of {id}.");
         Ok(())
     }
@@ -548,6 +550,7 @@ impl Command {
     }
 
     fn forget(home: &Home, id: Option<&str>, repo: bool, all: bool) -> Result<()> {
+        let ingest = Self::wait_for_ingest(home)?;
         let mut store = home.open_store(Patience::Batch)?;
         let workspace = if repo {
             Some(Self::workspace(&store, None)?)
@@ -568,9 +571,24 @@ impl Command {
         if matches!(target, Forget::All) && log.exists() {
             fs::remove_file(&log).with_context(|| format!("remove {}", log.display()))?;
         }
-        Ingest::start(home)?.rebuild_index()?;
+        ingest.rebuild_index()?;
         println!("Deleted {deleted} revision(s).");
         Ok(())
+    }
+
+    fn wait_for_ingest(home: &Home) -> Result<Ingest> {
+        let lock = File::create(home.ingest_lock()).context("create the ingest lock")?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                eprintln!("Waiting for a running ingest to finish...");
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("check the ingest lock");
+            }
+        }
+        drop(lock);
+        Ingest::start(home)
     }
 
     fn backfill(home: &Home, projects: Option<PathBuf>) -> Result<()> {
@@ -723,5 +741,48 @@ mod tests {
             None
         );
         Command::forget(home, None, false, true).expect("forgetting again is harmless");
+    }
+
+    #[test]
+    fn retiring_waits_for_a_running_ingest() {
+        let scratch = Scratch::new("retire-waits");
+        let home = scratch.home.clone();
+        let procedure = trodden_core::Procedure::example();
+        let id = procedure.id.as_str().to_owned();
+        home.open_store(Patience::Batch)
+            .expect("store opens")
+            .upsert(&procedure)
+            .expect("procedure stored");
+        let ingest = Ingest::start(&home).expect("ingest starts");
+
+        let retiring = std::thread::spawn({
+            let home = home.clone();
+            let id = id.clone();
+            move || Command::retire(&home, &id)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let state_during_ingest = home
+            .open_store(Patience::Batch)
+            .expect("store opens")
+            .revisions(&id)
+            .expect("revisions read")[0]
+            .procedure
+            .state;
+        drop(ingest);
+        retiring
+            .join()
+            .expect("retire thread finishes")
+            .expect("procedure retires");
+
+        assert_eq!(state_during_ingest, procedure.state);
+        assert_eq!(
+            home.open_store(Patience::Batch)
+                .expect("store opens")
+                .revisions(&id)
+                .expect("revisions read")[0]
+                .procedure
+                .state,
+            trodden_core::procedure::Lifecycle::Retired
+        );
     }
 }

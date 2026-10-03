@@ -184,14 +184,21 @@ impl Store {
             Self::write_settlement(&tx, record, record.task, record.outcome.as_deref())?;
         }
         Self::write_outcomes(&tx, procedure)?;
-        Self::write_states(&tx, procedure, states)?;
+        let aged = Self::write_states(&tx, procedure, states, Self::is_serving)?;
         let decided = decide(&Self::read_evidence(&tx, procedure)?);
-        Self::write_states(&tx, procedure, &decided)?;
-        if !states.is_empty() || !decided.is_empty() {
+        let decided = Self::write_states(&tx, procedure, &decided, Self::is_serving)?;
+        if !aged.is_empty() || !decided.is_empty() {
             Self::reindex(&tx, procedure)?;
         }
         tx.commit().context("commit a procedure's settlement")?;
         Ok(decided)
+    }
+
+    fn is_serving(state: Lifecycle) -> bool {
+        matches!(
+            state,
+            Lifecycle::Active | Lifecycle::Stale | Lifecycle::Candidate
+        )
     }
 
     fn write_settlement(
@@ -418,7 +425,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start changing states")?;
-        Self::write_states(&tx, procedure, changes)?;
+        Self::write_states(&tx, procedure, changes, |_| true)?;
         Self::reindex(&tx, procedure)?;
         tx.commit().context("commit state changes")
     }
@@ -427,19 +434,24 @@ impl Store {
         tx: &Transaction<'_>,
         procedure: &str,
         changes: &[(u32, Lifecycle)],
-    ) -> Result<()> {
+        changes_from: impl Fn(Lifecycle) -> bool,
+    ) -> Result<Vec<(u32, Lifecycle)>> {
+        let mut written = Vec::new();
         for (revision, state) in changes {
-            let document: Option<(i64, String)> = tx
+            let current: Option<(i64, String, String)> = tx
                 .query_row(
-                    "SELECT rowid, document FROM procedures WHERE id = ?1 AND revision = ?2",
+                    "SELECT rowid, state, document FROM procedures WHERE id = ?1 AND revision = ?2",
                     params![procedure, revision],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .context("read a revision")?;
-            let Some((rowid, document)) = document else {
+            let Some((rowid, current, document)) = current else {
                 continue;
             };
+            if !changes_from(Self::parse_state(&current)) {
+                continue;
+            }
             let mut stored: Procedure =
                 serde_json::from_str(&document).context("parse a stored procedure")?;
             stored.state = *state;
@@ -448,8 +460,9 @@ impl Store {
                 params![Self::state_name(*state), Self::document(&stored)?, rowid],
             )
             .context("change a revision's state")?;
+            written.push((*revision, *state));
         }
-        Ok(())
+        Ok(written)
     }
 
     pub fn retire(&mut self, procedure: &str) -> Result<usize> {
@@ -552,6 +565,33 @@ mod tests {
         assert_eq!(
             (stored.state, stored.outcomes.failures),
             (Lifecycle::Quarantined, 1)
+        );
+    }
+
+    #[test]
+    fn decisions_made_before_a_retire_leave_the_revision_retired() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        store.upsert(&Procedure::example()).expect("stored");
+        store
+            .set_states("p_7f3a91c2", &[(1, Lifecycle::Stale)])
+            .expect("state changes");
+        let usage = store.usage().expect("usage read").remove(0);
+        let aged = [(usage.revision, Lifecycle::Active)];
+        let promoted = vec![(usage.revision, Lifecycle::Active)];
+
+        assert_eq!(store.retire("p_7f3a91c2").expect("retired"), 1);
+        let decided = store
+            .settle_procedure("p_7f3a91c2", &[], &aged, |_| promoted)
+            .expect("settles");
+
+        assert_eq!(decided, []);
+        let stored = &store.revisions("p_7f3a91c2").expect("revisions read")[0].procedure;
+        assert_eq!(stored.state, Lifecycle::Retired);
+        assert!(
+            store
+                .servable_revisions("p_7f3a91c2")
+                .expect("servable revisions read")
+                .is_empty()
         );
     }
 }
