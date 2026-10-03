@@ -4,8 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use jiff::Timestamp;
+use serde::Deserialize;
 use trodden_capture::claude_code::{HARNESS, Transcript};
 use trodden_embed::{Embedder, Quantized};
 use trodden_extract::{Extractor, ProjectChecks};
@@ -63,6 +64,23 @@ impl IngestReport {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptLine {
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    is_sidechain: bool,
+}
+
+impl TranscriptLine {
+    fn working_directory(text: &str) -> Option<PathBuf> {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Self>(line).ok())
+            .filter(|line| !line.is_sidechain)
+            .find_map(|line| line.cwd)
+    }
+}
+
 #[derive(Debug)]
 pub struct Ingest {
     home: Home,
@@ -109,12 +127,9 @@ impl Ingest {
             return Ok(IngestReport::default());
         }
 
-        let cwd = Self::expand_home(&trace.cwd);
-        ensure!(
-            cwd.is_absolute() && !trace.cwd.contains("[REDACTED"),
-            "{} has no usable working directory",
-            transcript.display()
-        );
+        let cwd = TranscriptLine::working_directory(&text)
+            .filter(|cwd| cwd.is_absolute())
+            .with_context(|| format!("{} has no usable working directory", transcript.display()))?;
         let workspace = Workspace::resolve(&cwd, &self.store)?;
         let now = Timestamp::now();
         let stamp = now.to_string();
@@ -299,13 +314,6 @@ impl Ingest {
             .is_some_and(|age| age.as_secs() > Self::IDLE_SECONDS)
     }
 
-    fn expand_home(path: &str) -> PathBuf {
-        match (path.strip_prefix('~'), std::env::var_os("HOME")) {
-            (Some(rest), Some(home)) => PathBuf::from(format!("{}{rest}", home.to_string_lossy())),
-            _ => PathBuf::from(path),
-        }
-    }
-
     fn reason_kind(reason: &str) -> String {
         reason.split(':').next().unwrap_or(reason).to_owned()
     }
@@ -352,6 +360,25 @@ mod tests {
             for line in lines {
                 writeln!(file, "{line}").expect("transcript line is written");
             }
+        }
+
+        fn append_in(&self, cwd: &str, lines: &[Value]) {
+            let moved: Vec<Value> = lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str(&line.to_string().replace(CWD, cwd))
+                        .expect("moved line is JSON")
+                })
+                .collect();
+            self.append(&moved);
+        }
+
+        fn stored(&self) -> String {
+            ["trodden.db", "trodden.db-wal"]
+                .iter()
+                .map(|name| fs::read(self.dir.join("home").join(name)).unwrap_or_default())
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .collect()
         }
     }
 
@@ -607,6 +634,46 @@ mod tests {
             .map(|record| record.outcome.is_some())
             .collect();
         assert_eq!(settled, [false, true]);
+    }
+
+    #[test]
+    fn sessions_in_directories_that_look_like_secrets_are_learned() {
+        let email = "jane.doe@gmail.com";
+        let drive = format!("/Users/jane/Library/CloudStorage/GoogleDrive-{email}/shop");
+        let worktree = "/home/dev/store/.claude/worktrees/agent-a3f9c2d17e5b4c08";
+        for (name, cwd) in [("drive", drive.as_str()), ("worktree", worktree)] {
+            let scratch = Scratch::new(name);
+            let mut ingest = scratch.ingest();
+            scratch.append_in(
+                cwd,
+                &task(
+                    0,
+                    &format!("The cart total in {cwd}/src/cart.js ignores the discount code"),
+                    "src/cart.js",
+                ),
+            );
+            let report = ingest
+                .claude_code(&scratch.transcript, true)
+                .expect("ingest in an unusual directory");
+            assert_eq!((report.sessions, report.tasks, report.created), (1, 1, 1));
+            assert!(!scratch.stored().contains(email), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn sessions_without_an_absolute_directory_are_refused() {
+        let scratch = Scratch::new("relative-cwd");
+        let mut ingest = scratch.ingest();
+        scratch.append_in("shop", &task(0, "Fix the cart total", "src/cart.js"));
+        let error = ingest
+            .claude_code(&scratch.transcript, true)
+            .expect_err("a relative directory is refused");
+        assert!(
+            error
+                .to_string()
+                .ends_with("has no usable working directory"),
+            "{error}"
+        );
     }
 
     #[test]
