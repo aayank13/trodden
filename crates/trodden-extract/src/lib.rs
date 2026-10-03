@@ -321,6 +321,7 @@ impl<'a> Builder<'a> {
             .iter()
             .filter(|call| !call.succeeded())
             .filter_map(Call::command)
+            .filter(|command| Self::is_project_task(command))
             .filter(|command| {
                 after
                     .iter()
@@ -1161,6 +1162,59 @@ mod tests {
             .expect("the build passed after the edit");
 
         assert!(procedure.avoid.is_empty(), "{:?}", procedure.avoid);
+    }
+
+    #[test]
+    fn learns_checks_only_from_commands_that_run_project_code() {
+        let cases = [
+            ("./scripts/smoke.sh", true),
+            ("bash scripts/e2e.sh", true),
+            ("make smoke", true),
+            ("npm run e2e", true),
+            ("python3 tools/repro.py", true),
+            ("node scripts/repro.js", true),
+            ("git push origin main", false),
+            ("npm install", false),
+            ("pip install -e .", false),
+            ("curl -fsS https://staging.example.com/health", false),
+            ("docker compose up -d", false),
+            ("gh pr create --fill", false),
+            ("kubectl apply -f deploy.yaml", false),
+        ];
+        for (command, learned) in cases {
+            let result = Sketch::new()
+                .prompt("Fix the pagination bug in the catalog")
+                .run(command, 1)
+                .edit("src/paginate.js", &["paginate"])
+                .run("git commit -am 'fix pagination'", 0)
+                .run(command, 0)
+                .extract_one()
+                .map(|procedure| procedure.verify.map(|verify| verify.command));
+            let expected = if learned {
+                Ok(Some(command.to_owned()))
+            } else {
+                Err(Rejection::NotVerified)
+            };
+            assert_eq!(result, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_push_after_a_real_check_keeps_that_check() {
+        let procedure = Sketch::new()
+            .prompt("Fix the pagination bug and push it")
+            .run("git push origin main", 1)
+            .edit("src/paginate.js", &["paginate"])
+            .run("npm test", 0)
+            .run("git commit -am 'fix pagination'", 0)
+            .run("git push origin main", 0)
+            .extract_one()
+            .expect("npm test passed after the edit");
+
+        assert_eq!(
+            procedure.verify.map(|verify| verify.command).as_deref(),
+            Some("npm test")
+        );
     }
 
     #[test]
