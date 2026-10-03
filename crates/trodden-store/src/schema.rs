@@ -120,8 +120,12 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 impl Store {
+    pub(crate) fn is_current(&self) -> Result<bool> {
+        Ok(applied_migrations(&self.conn)? == MIGRATIONS.len())
+    }
+
     pub(crate) fn migrate(&mut self) -> Result<()> {
-        if applied_migrations(&self.conn)? == MIGRATIONS.len() {
+        if self.is_current()? {
             return Ok(());
         }
         let tx = self

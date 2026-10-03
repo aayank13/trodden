@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 pub use ingest::{ExtractionRecord, Progress};
@@ -56,6 +56,23 @@ impl Store {
             .context("configure durability")?;
         let mut store = Self { conn };
         store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_read_only(path: &Path, patience: Patience) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)
+            .with_context(|| format!("open {} for reading", path.display()))?;
+        conn.busy_timeout(patience.timeout())
+            .context("set the busy timeout")?;
+        let store = Self { conn };
+        if !store.is_current()? {
+            bail!(
+                "the database at {} needs an upgrade before it can be read; \
+                 run any trodden command, such as `trodden status`, to upgrade it",
+                path.display()
+            );
+        }
         Ok(store)
     }
 
@@ -205,4 +222,142 @@ pub struct Stats {
     pub sessions: u64,
     pub rejections: u64,
     pub injections: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use super::*;
+
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("trodden-read-only-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch directory is writable");
+            Self { dir }
+        }
+
+        fn database(&self) -> PathBuf {
+            self.dir.join("trodden.db")
+        }
+
+        fn fingerprint(&self) -> (Vec<u8>, i64) {
+            let path = self.database();
+            let contents = fs::read(&path).expect("database reads");
+            let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("database opens");
+            let version = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("schema version reads");
+            (contents, version)
+        }
+
+        fn set_version(&self, version: i64) {
+            let store = Store::open(&self.database(), Patience::Batch).expect("store opens");
+            store
+                .conn
+                .pragma_update(None, "user_version", version)
+                .expect("schema version writes");
+            store
+                .conn
+                .pragma_update_and_check(None, "wal_checkpoint", "TRUNCATE", |_| Ok(()))
+                .expect("checkpoint runs");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn read_only_stores_read_without_writing() {
+        let scratch = Scratch::new("reads");
+        let store = Store::open(&scratch.database(), Patience::Batch).expect("store opens");
+        store
+            .remember_repo("/home/dev/shop", "shop")
+            .expect("repo caches");
+        store.set_paused(true).expect("setting writes");
+        drop(store);
+        let before = scratch.fingerprint();
+
+        let reader =
+            Store::open_read_only(&scratch.database(), Patience::Batch).expect("store opens");
+        assert!(reader.paused().expect("setting reads"));
+        assert_eq!(
+            reader.repo_for_root("/home/dev/shop").expect("repo reads"),
+            Some("shop".to_owned())
+        );
+        assert!(reader.remember_repo("/home/dev/blog", "blog").is_err());
+        drop(reader);
+
+        assert_eq!(scratch.fingerprint(), before);
+    }
+
+    #[test]
+    fn read_only_stores_read_while_a_writer_holds_the_lock() {
+        let scratch = Scratch::new("locked");
+        let writer = Store::open(&scratch.database(), Patience::Batch).expect("store opens");
+        writer.set_paused(true).expect("setting writes");
+        writer
+            .conn
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO repos (root, repo) VALUES ('a', 'b');")
+            .expect("writer locks the database");
+
+        let reader = Store::open_read_only(&scratch.database(), Patience::Interactive)
+            .expect("store opens while locked");
+        assert!(reader.paused().expect("setting reads"));
+        assert_eq!(reader.repo_for_root("a").expect("repo reads"), None);
+        writer
+            .conn
+            .execute_batch("COMMIT;")
+            .expect("writer commits");
+    }
+
+    #[test]
+    fn read_only_stores_ask_for_an_upgrade_instead_of_migrating() {
+        let scratch = Scratch::new("outdated");
+        fs::write(scratch.database(), b"").expect("database file is writable");
+        let empty = scratch.fingerprint();
+        let refusal = Store::open_read_only(&scratch.database(), Patience::Batch)
+            .expect_err("unmigrated database is refused");
+        assert!(
+            format!("{refusal:#}").contains("run any trodden command"),
+            "{refusal:#}"
+        );
+        assert_eq!(scratch.fingerprint(), empty);
+
+        scratch.set_version(1);
+        let behind = scratch.fingerprint();
+        let refusal = Store::open_read_only(&scratch.database(), Patience::Batch)
+            .expect_err("outdated schema is refused");
+        assert!(
+            format!("{refusal:#}").contains("run any trodden command"),
+            "{refusal:#}"
+        );
+        assert_eq!(scratch.fingerprint(), behind);
+    }
+
+    #[test]
+    fn read_only_stores_refuse_newer_and_missing_databases() {
+        let scratch = Scratch::new("refused");
+        let missing = Store::open_read_only(&scratch.database(), Patience::Batch);
+        assert!(missing.is_err());
+        assert!(!scratch.database().exists());
+
+        scratch.set_version(99);
+        let refusal = Store::open_read_only(&scratch.database(), Patience::Batch)
+            .expect_err("newer schema is refused");
+        assert!(
+            format!("{refusal:#}").contains("created by a newer version of trodden"),
+            "{refusal:#}"
+        );
+    }
 }
