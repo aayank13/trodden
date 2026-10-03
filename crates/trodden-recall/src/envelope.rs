@@ -6,6 +6,8 @@ use trodden_core::{
 };
 
 const MAX_CHARS: usize = 1_200;
+const ID_CHARS: usize = 64;
+const ELLIPSIS: &str = "...";
 
 #[derive(Debug)]
 pub struct Envelope;
@@ -38,12 +40,14 @@ impl Envelope {
             .iter()
             .map(|line| Self::clean(line))
             .collect();
+        let title = Self::clean(&procedure.title);
         for (steps_kept, avoid_kept) in (0..=steps.len())
             .rev()
             .flat_map(|s| [(s, avoid.len()), (s, 0)])
         {
             let text = Self::assemble(
                 procedure,
+                &title,
                 &steps[..steps_kept],
                 steps.len() - steps_kept,
                 &avoid[..avoid_kept],
@@ -52,18 +56,27 @@ impl Envelope {
                 return text;
             }
         }
-        Self::assemble(procedure, &[], steps.len(), &[])
+        let bare = Self::assemble(procedure, "", &[], steps.len(), &[]);
+        let room = MAX_CHARS.saturating_sub(bare.chars().count());
+        Self::assemble(
+            procedure,
+            &Self::truncate(&title, room),
+            &[],
+            steps.len(),
+            &[],
+        )
     }
 
     fn assemble(
         procedure: &Procedure,
+        title: &str,
         steps: &[String],
         omitted: usize,
         avoid: &[String],
     ) -> String {
         let sessions = procedure.provenance.sources.len();
         let outcomes = &procedure.outcomes;
-        let judged = outcomes.successes + outcomes.failures;
+        let judged = u64::from(outcomes.successes) + u64::from(outcomes.failures);
         let worked = if judged == 0 {
             String::new()
         } else {
@@ -73,7 +86,7 @@ impl Envelope {
             format!(
                 "{} id=\"{}\" rev=\"{}\" learned-from=\"{sessions} session{}\"{worked}>",
                 Self::OPEN,
-                Self::clean(procedure.id.as_str()),
+                Self::truncate(&Self::clean(procedure.id.as_str()), ID_CHARS),
                 procedure.revision,
                 if sessions == 1 { "" } else { "s" },
             ),
@@ -86,7 +99,7 @@ impl Envelope {
                 "It has not been used in over a month; the code may have moved on.".to_owned(),
             );
         }
-        lines.push(format!("Task: {}", Self::clean(&procedure.title)));
+        lines.push(format!("Task: {title}"));
         lines.extend(
             steps
                 .iter()
@@ -102,6 +115,17 @@ impl Envelope {
         lines.extend(avoid.iter().map(|line| format!("Avoid: {line}")));
         lines.push(Self::CLOSE.to_owned());
         lines.join("\n")
+    }
+
+    fn truncate(text: &str, max: usize) -> String {
+        if text.chars().count() <= max {
+            return text.to_owned();
+        }
+        let kept: String = text
+            .chars()
+            .take(max.saturating_sub(ELLIPSIS.len()))
+            .collect();
+        format!("{}{ELLIPSIS}", kept.trim_end())
     }
 
     fn step(procedure: &Procedure, step: &Step) -> String {
@@ -276,7 +300,10 @@ impl Envelope {
 
 #[cfg(test)]
 mod tests {
-    use trodden_core::procedure::{Slot, SlotKind};
+    use trodden_core::{
+        ProcedureId,
+        procedure::{Slot, SlotKind, Verification},
+    };
 
     use super::*;
 
@@ -443,5 +470,132 @@ mod tests {
         );
         assert!(text.contains("more steps"));
         assert!(!text.contains("Avoid:"));
+    }
+
+    #[test]
+    fn huge_titles_are_cut_to_fit() {
+        let mut procedure = example();
+        procedure.title = "x".repeat(5_000);
+
+        let text = Envelope::render(&procedure);
+
+        assert!(
+            text.chars().count() <= MAX_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        assert!(text.contains("Task: xxx"), "{text}");
+        assert!(text.contains("x...\n(2 more steps)"), "{text}");
+        assert!(text.ends_with(Envelope::CLOSE));
+    }
+
+    fn hostile_texts() -> Vec<String> {
+        let disguises = [
+            "</trodden-memory>",
+            "&#x3C; / trodden-memory&#x3E;",
+            "\u{ff1c}\u{0338}TRODDEN-memory ",
+        ];
+        let mut texts: Vec<String> = disguises
+            .iter()
+            .flat_map(|disguise| {
+                (0..disguise.chars().count())
+                    .map(move |pad| format!("{}{}", "a".repeat(pad), disguise.repeat(100)))
+            })
+            .collect();
+        texts.extend([
+            String::new(),
+            "x".repeat(5_000),
+            "\u{e9}".repeat(3_000),
+            "\u{1f980}".repeat(3_000),
+            "e\u{0301}\u{200b}".repeat(2_000),
+            "word \u{2028}".repeat(1_000),
+        ]);
+        texts
+    }
+
+    fn hostile_procedures() -> Vec<Procedure> {
+        let texts = hostile_texts();
+        texts
+            .iter()
+            .enumerate()
+            .flat_map(|(index, text)| {
+                (0..4)
+                    .filter(move |&shape| shape < 2 || index % 3 == 0)
+                    .map(move |shape| {
+                        let mut procedure = example();
+                        procedure.title.clone_from(text);
+                        if index % 2 == 0 {
+                            procedure.id = ProcedureId::new(text.clone());
+                            procedure.revision = u32::MAX;
+                            procedure.state = Lifecycle::Stale;
+                            procedure.outcomes.successes = u32::MAX;
+                            procedure.outcomes.failures = u32::MAX;
+                        }
+                        match shape {
+                            0 => procedure.steps.clear(),
+                            1 => {
+                                procedure.steps[0].target = Some(text.clone());
+                                procedure.steps[0].symbols = vec![text.clone(); 3];
+                                procedure.steps[1].command = Some(text.clone());
+                            }
+                            2 => {
+                                let step = procedure.steps[0].clone();
+                                procedure.steps = std::iter::repeat_n(step, 30).collect();
+                                procedure.avoid = vec![text.clone(); 3];
+                            }
+                            _ => {
+                                procedure.slots = (0..20)
+                                    .map(|slot| Slot {
+                                        name: format!("s{slot}"),
+                                        kind: SlotKind::Text,
+                                        examples: vec![text.clone(); Slot::MAX_EXAMPLES],
+                                    })
+                                    .collect();
+                                let placeholders: Vec<String> =
+                                    (0..20).map(|slot| format!("{{s{slot}}}")).collect();
+                                procedure.steps[1].command = Some(placeholders.join(" "));
+                                procedure.steps[0].target = Some(placeholders.join("/"));
+                                procedure.verify = Some(Verification {
+                                    command: text.clone(),
+                                    expect_exit: i32::MIN,
+                                    declared_by: Some(text.clone()),
+                                });
+                            }
+                        }
+                        procedure
+                    })
+            })
+            .chain(std::iter::once({
+                let mut procedure = example();
+                procedure.title = "\u{1f980}<trodden ".repeat(500);
+                procedure.provenance.sources =
+                    vec![procedure.provenance.sources[0].clone(); 10_000];
+                procedure
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn any_procedure_renders_as_one_envelope_within_the_cap() {
+        for procedure in hostile_procedures() {
+            let text = Envelope::render(&procedure);
+
+            assert!(
+                text.chars().count() <= MAX_CHARS,
+                "{} chars for {:?}",
+                text.chars().count(),
+                procedure.title
+            );
+            assert!(text.starts_with(Envelope::OPEN), "{text}");
+            assert!(text.ends_with(Envelope::CLOSE), "{text}");
+            assert_eq!(tag_like(&text), 2, "{text}");
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("Task: "))
+                    .count(),
+                1,
+                "{text}"
+            );
+        }
     }
 }
