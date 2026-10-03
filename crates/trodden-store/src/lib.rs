@@ -4,10 +4,14 @@ mod procedures;
 mod schema;
 mod terms;
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 pub use ingest::{ExtractionRecord, Progress};
 pub use learning::{Cue, FamilyEvidence, Injection, InjectionRecord, OutcomeSummary, Usage};
@@ -44,7 +48,8 @@ impl Store {
         conn.busy_timeout(patience.timeout())
             .context("set the busy timeout")?;
         if patience == Patience::Batch {
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            enable_wal(&conn, patience.timeout())?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")
                 .context("configure the database")?;
         }
         conn.execute_batch("PRAGMA synchronous = NORMAL;")
@@ -172,6 +177,24 @@ impl Store {
                 },
             )
             .context("count store contents")
+    }
+}
+
+fn enable_wal(conn: &Connection, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error).context("switch the database to WAL mode"),
+        }
     }
 }
 
