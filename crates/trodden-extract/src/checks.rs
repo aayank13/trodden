@@ -34,6 +34,9 @@ static TARGET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^(check|ci|verify|test|tests)\s*:(?:[^=]|$)").expect("target pattern is valid")
 });
 
+static SLOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{[A-Za-z0-9_]+\}").expect("slot pattern is valid"));
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredCheck {
     pub command: String,
@@ -143,16 +146,35 @@ impl ProjectChecks {
     }
 
     pub fn same(a: &str, b: &str) -> bool {
-        let words = |command: &str| -> Vec<String> {
-            let clean = Verification::clean(command);
-            let normalized = Command::normalize(&clean, "");
-            normalized
-                .text()
-                .split_whitespace()
-                .map(|word| if word == "python3" { "python" } else { word }.to_owned())
-                .collect()
-        };
-        words(a) == words(b)
+        Self::words(a) == Self::words(b)
+    }
+
+    pub fn ran(check: &str, command: &str) -> bool {
+        let (expected, actual) = (Self::words(check), Self::words(command));
+        expected.len() == actual.len()
+            && expected
+                .iter()
+                .zip(&actual)
+                .all(|(expected, actual)| expected == actual || Self::fills(expected, actual))
+    }
+
+    fn fills(template: &str, word: &str) -> bool {
+        if !SLOT.is_match(template) || (template.starts_with('{') && word.starts_with('-')) {
+            return false;
+        }
+        let literals: Vec<String> = SLOT.split(template).map(regex::escape).collect();
+        Regex::new(&format!("^{}$", literals.join(".+")))
+            .expect("escaped template is a valid pattern")
+            .is_match(word)
+    }
+
+    fn words(command: &str) -> Vec<String> {
+        let clean = Verification::clean(command);
+        Command::normalize(&clean, "")
+            .text()
+            .split_whitespace()
+            .map(|word| if word == "python3" { "python" } else { word }.to_owned())
+            .collect()
     }
 
     fn strength(command: &str) -> Strength {
@@ -406,5 +428,47 @@ mod tests {
 
         let order: Vec<&str> = checks.checks.iter().map(|c| c.command.as_str()).collect();
         assert_eq!(order, ["make check", "npm test", "cargo build"]);
+    }
+
+    #[test]
+    fn a_run_fills_the_slots_of_a_check() {
+        for (check, command) in [
+            ("cargo test {test}", "cargo test total_prints"),
+            ("cargo test --test={test}", "cargo test --test=report"),
+            (
+                "psql -f migrations/{migration}.sql",
+                "psql -f migrations/0042_prints.sql",
+            ),
+            (
+                "pytest {path} -k {test}",
+                "pytest tests/test_report.py -k due",
+            ),
+            ("python3 tools/check.py", "python tools/check.py"),
+        ] {
+            assert!(ProjectChecks::ran(check, command), "{check} / {command}");
+        }
+    }
+
+    #[test]
+    fn a_run_must_still_match_every_literal_word() {
+        for (check, command) in [
+            ("cargo test {test}", "cargo test"),
+            ("cargo test {test}", "cargo test due_prints -- --nocapture"),
+            ("cargo test {test}", "cargo build due_prints"),
+            ("cargo test {test}", "cargo test --release"),
+            ("cargo test --test={test}", "cargo test --lib=report"),
+            (
+                "psql -f migrations/{migration}.sql",
+                "psql -f migrations/.sql",
+            ),
+            ("cargo test", "cargo test due_prints"),
+            ("make check", "make lint"),
+        ] {
+            assert!(!ProjectChecks::ran(check, command), "{check} / {command}");
+        }
+        assert!(!ProjectChecks::same(
+            "cargo test {test}",
+            "cargo test due_prints"
+        ));
     }
 }

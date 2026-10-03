@@ -14,7 +14,10 @@ use trodden_capture::{
     ErrorSignature,
     claude_code::{HookInput, Transcript},
 };
-use trodden_core::trace::{Event, EventKind, ToolAction, ToolOutcome};
+use trodden_core::{
+    Procedure,
+    trace::{Event, EventKind, ToolAction, ToolOutcome},
+};
 use trodden_extract::ProjectChecks;
 use trodden_recall::{Decision, Envelope, ErrorQuery, Match, Outcome, Query, Recall};
 use trodden_redact::Redactor;
@@ -168,7 +171,7 @@ impl Hook {
                     .args
                     .command
                     .as_deref()
-                    .is_some_and(|command| ProjectChecks::same(command, check))
+                    .is_some_and(|command| ProjectChecks::ran(check, command))
             {
                 edited_since_check = false;
             }
@@ -197,13 +200,19 @@ impl Hook {
         else {
             return Ok(());
         };
-        let check = store
+        let Some(procedure) = store
             .revisions(&injected.injection.procedure)?
             .into_iter()
             .find(|row| row.procedure.revision == injected.injection.revision)
-            .and_then(|row| row.procedure.verify)
-            .map(|verify| verify.command);
-        let Some(check) = check else {
+            .map(|row| row.procedure)
+        else {
+            return Ok(());
+        };
+        let Some(check) = procedure
+            .verify
+            .as_ref()
+            .map(|verify| verify.command.as_str())
+        else {
             return Ok(());
         };
 
@@ -211,15 +220,42 @@ impl Hook {
             .with_context(|| format!("read {}", transcript.display()))?;
         let trace = Transcript::parse(&text, &Redactor::new()).context("parse the transcript")?;
         let edited_since_check =
-            Self::edited_since_check(&trace.events, injected.injection.at, &check);
+            Self::edited_since_check(&trace.events, injected.injection.at, check);
         if edited_since_check {
-            let reason = format!(
-                "Trodden: the procedure recalled for this task is checked with `{check}`, \
-                 which has not run since your last change. Run it once before finishing."
-            );
+            let reason = Self::reminder(&procedure, check);
             println!("{}", json!({ "decision": "block", "reason": reason }));
         }
         Ok(())
+    }
+
+    fn reminder(procedure: &Procedure, check: &str) -> String {
+        let slots: Vec<String> = procedure
+            .slots
+            .iter()
+            .filter(|slot| check.contains(&format!("{{{}}}", slot.name)))
+            .map(|slot| {
+                let examples: Vec<String> = slot
+                    .examples
+                    .iter()
+                    .take(2)
+                    .map(|example| format!("`{example}`"))
+                    .collect();
+                if examples.is_empty() {
+                    format!("{{{}}} is a placeholder", slot.name)
+                } else {
+                    format!("{{{}}} was {} before", slot.name, examples.join(" or "))
+                }
+            })
+            .collect();
+        let fill = if slots.is_empty() {
+            String::new()
+        } else {
+            format!(" ({}; fill in what fits this change)", slots.join("; "))
+        };
+        format!(
+            "Trodden: the procedure recalled for this task is checked with `{check}`{fill}, \
+             which has not run since your last change. Run it once before finishing."
+        )
     }
 
     fn spawn_ingest(input: &HookInput, ended: bool) -> Result<()> {
@@ -262,6 +298,7 @@ impl Hook {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use trodden_core::procedure::{Slot, SlotKind};
 
     use super::*;
 
@@ -326,11 +363,15 @@ mod tests {
         }
 
         fn needs_check(&self, injected: &str) -> bool {
+            self.needs(injected, "npm test")
+        }
+
+        fn needs(&self, injected: &str, check: &str) -> bool {
             let text: String = self.lines.iter().map(|line| format!("{line}\n")).collect();
             let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
                 .expect("valid transcript");
             let injected = injected.parse().expect("valid timestamp");
-            Hook::edited_since_check(&trace.events, injected, "npm test")
+            Hook::edited_since_check(&trace.events, injected, check)
         }
     }
 
@@ -391,5 +432,52 @@ mod tests {
 
         assert!(!failed.needs_check("2026-09-21T14:00:10.000Z"));
         assert!(fixed.needs_check("2026-09-21T14:00:10.000Z"));
+    }
+
+    #[test]
+    fn a_check_with_a_slot_counts_as_run_with_any_value() {
+        let edited = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "due_prints in src/report.rs counts drafts too",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/report.rs");
+        let checked = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "due_prints in src/report.rs counts drafts too",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/report.rs")
+            .run("2026-09-21T14:00:09.000Z", "cargo test due_prints");
+
+        assert!(edited.needs("2026-09-21T14:00:00.120Z", "cargo test {test}"));
+        assert!(!checked.needs("2026-09-21T14:00:00.120Z", "cargo test {test}"));
+        assert!(checked.needs("2026-09-21T14:00:00.120Z", "cargo test"));
+    }
+
+    #[test]
+    fn the_reminder_shows_what_a_slot_stood_for() {
+        let mut procedure = Procedure::example();
+        procedure.slots = vec![Slot {
+            name: "test".to_owned(),
+            kind: SlotKind::Identifier,
+            examples: vec![
+                "count_prints".to_owned(),
+                "total_prints".to_owned(),
+                "late_prints".to_owned(),
+            ],
+        }];
+
+        assert_eq!(
+            Hook::reminder(&procedure, "cargo test {test}"),
+            "Trodden: the procedure recalled for this task is checked with `cargo test {test}` \
+             ({test} was `count_prints` or `total_prints` before; fill in what fits this change), \
+             which has not run since your last change. Run it once before finishing."
+        );
+        assert_eq!(
+            Hook::reminder(&procedure, "npm test"),
+            "Trodden: the procedure recalled for this task is checked with `npm test`, \
+             which has not run since your last change. Run it once before finishing."
+        );
     }
 }
