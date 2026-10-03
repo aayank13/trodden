@@ -4,7 +4,8 @@ use std::{
     fmt::Display,
     fs::OpenOptions,
     io::{self, Read, Write},
-    process::{Command, ExitCode, Stdio},
+    panic::{self, PanicHookInfo},
+    process::{self, Command, ExitCode, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -24,6 +25,8 @@ use trodden_recall::{Decision, Envelope, ErrorQuery, Match, Outcome, Query, Reca
 use trodden_redact::Redactor;
 use trodden_store::{Cue, Injection, Patience, Store};
 
+use crate::output::Output;
+
 const MAX_INPUT_BYTES: u64 = 1 << 20;
 
 #[derive(Debug)]
@@ -31,22 +34,28 @@ pub(crate) struct Hook;
 
 impl Hook {
     pub(crate) fn run(harness: Option<&OsStr>) -> ExitCode {
-        if let Err(error) = Self::handle(harness) {
+        panic::set_hook(Box::new(Self::on_panic));
+        if let Err(error) = Self::handle(harness, &mut Output::stdout()) {
             Self::log(&error);
         }
         ExitCode::SUCCESS
     }
 
-    fn handle(harness: Option<&OsStr>) -> Result<()> {
+    fn on_panic(panic: &PanicHookInfo<'_>) {
+        Self::log(panic.to_string().replace('\n', " "));
+        process::exit(0);
+    }
+
+    fn handle(harness: Option<&OsStr>, out: &mut Output<impl Write>) -> Result<()> {
         let Some(known) = harness.and_then(OsStr::to_str).and_then(Harness::from_name) else {
             bail!("unsupported harness {harness:?}");
         };
         match known {
-            Harness::ClaudeCode => Self::claude_code(),
+            Harness::ClaudeCode => Self::claude_code(out),
         }
     }
 
-    fn claude_code() -> Result<()> {
+    fn claude_code(out: &mut Output<impl Write>) -> Result<()> {
         let home = Home::locate()?;
         if !home.is_initialized() {
             return Ok(());
@@ -59,15 +68,15 @@ impl Hook {
         let input: HookInput = serde_json::from_str(&raw).context("parse the hook payload")?;
 
         match input.hook_event_name.as_str() {
-            "UserPromptSubmit" => Self::recall(&home, &input),
+            "UserPromptSubmit" => Self::recall(&home, &input, out),
             "SessionStart" => {
                 let store = home.open_store(Patience::Interactive)?;
                 Workspace::resolve(&input.cwd, &store).map(drop)
             }
-            "PostToolUseFailure" => Self::recall_error(&home, &input),
+            "PostToolUseFailure" => Self::recall_error(&home, &input, out),
             "Stop" => {
                 Self::spawn_ingest(&input, false)?;
-                Self::remind_to_verify(&home, &input)
+                Self::remind_to_verify(&home, &input, out)
             }
             "PreCompact" => Self::spawn_ingest(&input, false),
             "SessionEnd" => Self::spawn_ingest(&input, true),
@@ -75,7 +84,7 @@ impl Hook {
         }
     }
 
-    fn recall(home: &Home, input: &HookInput) -> Result<()> {
+    fn recall(home: &Home, input: &HookInput, out: &mut Output<impl Write>) -> Result<()> {
         let Some(prompt) = input.prompt.as_deref() else {
             return Ok(());
         };
@@ -93,12 +102,12 @@ impl Hook {
         if let Some(error) = &outcome.semantic_error {
             Self::log(format_args!("recalled without semantic matching: {error}"));
         }
-        Self::serve(&store, input, outcome, Cue::Prompt, |envelope| {
+        Self::serve(&store, input, outcome, Cue::Prompt, out, |envelope| {
             envelope.to_owned()
         })
     }
 
-    fn recall_error(home: &Home, input: &HookInput) -> Result<()> {
+    fn recall_error(home: &Home, input: &HookInput, out: &mut Output<impl Write>) -> Result<()> {
         let signature = match (&input.tool_name, &input.error) {
             (Some(tool), Some(error)) if tool == "Bash" && !input.is_interrupt => {
                 ErrorSignature::of(error, &Redactor::new())
@@ -119,7 +128,7 @@ impl Hook {
             root: &workspace.root,
             session: Some(&input.session_id),
         })?;
-        Self::serve(&store, input, outcome, Cue::Failure, |envelope| {
+        Self::serve(&store, input, outcome, Cue::Failure, out, |envelope| {
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUseFailure",
@@ -135,6 +144,7 @@ impl Hook {
         input: &HookInput,
         outcome: Outcome,
         cue: Cue,
+        out: &mut Output<impl Write>,
         format: impl Fn(&str) -> String,
     ) -> Result<()> {
         let (chosen, holdout): (Box<Match>, bool) = match outcome.decision {
@@ -144,10 +154,9 @@ impl Hook {
         };
         let procedure = &chosen.row.procedure;
         if !holdout {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{}", format(&Envelope::render(procedure)))
+            writeln!(out, "{}", format(&Envelope::render(procedure)))
                 .context("print the recalled procedure")?;
-            stdout.flush().context("flush the recalled procedure")?;
+            out.flush().context("flush the recalled procedure")?;
         }
         store.record_injection(&Injection {
             session: input.session_id.clone(),
@@ -188,7 +197,11 @@ impl Hook {
         edited_since_check
     }
 
-    fn remind_to_verify(home: &Home, input: &HookInput) -> Result<()> {
+    fn remind_to_verify(
+        home: &Home,
+        input: &HookInput,
+        out: &mut Output<impl Write>,
+    ) -> Result<()> {
         if input.stop_hook_active {
             return Ok(());
         }
@@ -232,7 +245,9 @@ impl Hook {
             Self::edited_since_check(&trace.events, injected.injection.at, check);
         if edited_since_check {
             let reason = Self::reminder(&procedure, check);
-            println!("{}", json!({ "decision": "block", "reason": reason }));
+            writeln!(out, "{}", json!({ "decision": "block", "reason": reason }))
+                .context("print the verify reminder")?;
+            out.flush().context("flush the verify reminder")?;
         }
         Ok(())
     }

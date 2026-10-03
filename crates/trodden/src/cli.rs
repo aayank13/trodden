@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File, TryLockError},
+    io::Write,
     path::PathBuf,
     process::{Command as Process, ExitCode},
 };
@@ -13,7 +14,10 @@ use trodden_embed::ModelPack;
 use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
 use trodden_store::{Forget, Patience, Store};
 
-use crate::mcp::Server;
+use crate::{
+    mcp::Server,
+    output::{Closed, Output},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "trodden", version, about)]
@@ -160,10 +164,17 @@ enum EmbeddingsCommand {
 impl Cli {
     pub(crate) fn run() -> ExitCode {
         let cli = Self::parse();
-        match cli.command.execute() {
+        let mut out = Output::stdout();
+        let result = cli.command.execute(&mut out).and_then(|()| out.flush());
+        Self::exit(result, &mut Output::stderr())
+    }
+
+    fn exit(result: Result<()>, err: &mut Output<impl Write>) -> ExitCode {
+        match result {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) if Closed::caused(&error) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("trodden: {error:#}");
+                let _ = writeln!(err, "trodden: {error:#}");
                 ExitCode::FAILURE
             }
         }
@@ -171,33 +182,35 @@ impl Cli {
 }
 
 impl Command {
-    fn execute(self) -> Result<()> {
+    fn execute(self, out: &mut Output<impl Write>) -> Result<()> {
         let home = Home::locate()?;
         if !matches!(self, Self::Init | Self::Doctor | Self::Hook { .. }) {
             ensure!(home.is_initialized(), "run `trodden init` first");
         }
         match self {
-            Self::Init => Self::init(&home),
-            Self::Status => Self::status(&home),
-            Self::Doctor => Self::doctor(&home),
+            Self::Init => Self::init(&home, out),
+            Self::Status => Self::status(&home, out),
+            Self::Doctor => Self::doctor(&home, out),
             Self::List {
                 all_repos,
                 revisions,
-            } => Self::list(&home, all_repos, revisions),
-            Self::Show { id } => Self::show(&home, &id),
+            } => Self::list(&home, out, all_repos, revisions),
+            Self::Show { id } => Self::show(&home, out, &id),
             Self::Recall {
                 prompt,
                 cwd,
                 explain,
-            } => Self::recall(&home, &prompt, cwd, explain),
-            Self::Rejected { limit } => Self::rejected(&home, limit),
-            Self::Outcomes => Self::outcomes(&home),
-            Self::Retire { id } => Self::retire(&home, &id),
-            Self::Config { setting } => Self::config(&home, setting),
+            } => Self::recall(&home, out, &prompt, cwd, explain),
+            Self::Rejected { limit } => Self::rejected(&home, out, limit),
+            Self::Outcomes => Self::outcomes(&home, out),
+            Self::Retire { id } => Self::retire(&home, out, &id),
+            Self::Config { setting } => Self::config(&home, out, setting),
             Self::Pause => home.open_store(Patience::Batch)?.set_paused(true),
             Self::Resume => home.open_store(Patience::Batch)?.set_paused(false),
-            Self::Forget { id, repo, all, .. } => Self::forget(&home, id.as_deref(), repo, all),
-            Self::Backfill { projects } => Self::backfill(&home, projects),
+            Self::Forget { id, repo, all, .. } => {
+                Self::forget(&home, out, id.as_deref(), repo, all)
+            }
+            Self::Backfill { projects } => Self::backfill(&home, out, projects),
             Self::Ingest {
                 transcript,
                 ended,
@@ -210,13 +223,13 @@ impl Command {
                     Some(Ingest::run(&home, Harness::ClaudeCode, &transcript, ended)?)
                 };
                 if let Some(report) = report.filter(|_| !quiet) {
-                    Self::print_report(&report);
+                    Self::print_report(out, &report)?;
                 }
                 Ok(())
             }
             Self::Embeddings {
                 command: EmbeddingsCommand::Install { from },
-            } => Self::install_embeddings(&home, from),
+            } => Self::install_embeddings(&home, out, from),
             Self::Mcp => Server::serve(home),
             Self::Hook { .. } => {
                 bail!("hooks read their payload from stdin; see `trodden help hook`")
@@ -224,75 +237,84 @@ impl Command {
         }
     }
 
-    fn init(home: &Home) -> Result<()> {
+    fn init(home: &Home, out: &mut Output<impl Write>) -> Result<()> {
         let fresh = !home.is_initialized();
         home.initialize()?;
-        println!("Data directory: {}", home.dir().display());
+        writeln!(out, "Data directory: {}", home.dir().display())?;
         if fresh {
-            println!(
+            writeln!(
+                out,
                 "\nTrodden now learns from Claude Code sessions in this account. It stores\n\
                  the first line of each prompt (up to 200 characters), commands, file paths,\n\
                  touched function names, exit codes and one normalized line per error, with\n\
                  secrets redacted. It never stores file contents, other tool output or the\n\
                  rest of a prompt, and makes no network calls. `trodden pause` stops it;\n\
                  `trodden forget` deletes."
-            );
+            )?;
         }
-        println!("\nNext steps:");
-        println!("  1. Install the Claude Code plugin:");
-        println!("       claude plugin marketplace add aayank13/trodden");
-        println!("       claude plugin install trodden@trodden");
+        writeln!(out, "\nNext steps:")?;
+        writeln!(out, "  1. Install the Claude Code plugin:")?;
+        writeln!(out, "       claude plugin marketplace add aayank13/trodden")?;
+        writeln!(out, "       claude plugin install trodden@trodden")?;
         if home.embedder().is_none() {
-            println!("  2. Optional: enable semantic matching (one-time 32 MB download):");
-            println!("       trodden embeddings install");
+            writeln!(
+                out,
+                "  2. Optional: enable semantic matching (one-time 32 MB download):"
+            )?;
+            writeln!(out, "       trodden embeddings install")?;
         }
-        println!(
+        writeln!(
+            out,
             "  {}. Optional: learn from past sessions:",
             if home.embedder().is_none() { 3 } else { 2 }
-        );
-        println!("       trodden backfill");
+        )?;
+        writeln!(out, "       trodden backfill")?;
         Ok(())
     }
 
-    fn status(home: &Home) -> Result<()> {
+    fn status(home: &Home, out: &mut Output<impl Write>) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let stats = store.stats()?;
-        println!("Data directory     {}", home.dir().display());
-        println!(
+        writeln!(out, "Data directory     {}", home.dir().display())?;
+        writeln!(
+            out,
             "Capture and recall {}",
             if store.paused()? { "paused" } else { "on" }
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "Semantic matching  {}",
             match home.open_semantic() {
                 Ok(Some(_)) => "on",
                 Ok(None) => "off (run `trodden embeddings install`)",
                 Err(_) => "off (the model or index is unreadable; run `trodden doctor`)",
             }
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "Procedures         {} ({} revisions)",
             stats.procedures, stats.revisions
-        );
-        println!("Sessions ingested  {}", stats.sessions);
-        println!("Rejected tasks     {}", stats.rejections);
-        println!("Injections         {}", stats.injections);
-        println!(
+        )?;
+        writeln!(out, "Sessions ingested  {}", stats.sessions)?;
+        writeln!(out, "Rejected tasks     {}", stats.rejections)?;
+        writeln!(out, "Injections         {}", stats.injections)?;
+        writeln!(
+            out,
             "Holdout            {}",
             store
                 .holdout_rate()?
                 .map_or_else(|| "auto".to_owned(), |rate| format!("{:.0}%", rate * 100.0))
-        );
+        )?;
         Ok(())
     }
 
-    fn doctor(home: &Home) -> Result<()> {
+    fn doctor(home: &Home, out: &mut Output<impl Write>) -> Result<()> {
         let mut problems = 0;
         let mut check = |label: &str, result: Result<String>| match result {
-            Ok(detail) => println!("ok       {label}: {detail}"),
+            Ok(detail) => writeln!(out, "ok       {label}: {detail}"),
             Err(error) => {
                 problems += 1;
-                println!("PROBLEM  {label}: {error:#}");
+                writeln!(out, "PROBLEM  {label}: {error:#}")
             }
         };
         check(
@@ -302,14 +324,14 @@ impl Command {
             } else {
                 Err(anyhow::anyhow!("not initialized; run `trodden init`"))
             },
-        );
+        )?;
         if home.is_initialized() {
             check(
                 "database",
                 home.open_store(Patience::Batch)
                     .and_then(|store| store.stats())
                     .map(|stats| format!("{} procedures", stats.procedures)),
-            );
+            )?;
         }
         check(
             "embedding model",
@@ -318,7 +340,7 @@ impl Command {
                     .map(|_| "installed".to_owned())
                     .context("not installed; semantic matching is off")
             }),
-        );
+        )?;
         check(
             "recall index",
             home.open_index().map(|index| {
@@ -328,23 +350,28 @@ impl Command {
                     "not built yet".to_owned()
                 }
             }),
-        );
+        )?;
         for program in ["trodden", "git", "claude"] {
             check(
                 &format!("`{program}` on PATH"),
                 Self::which(program).map(|path| path.display().to_string()),
-            );
+            )?;
         }
         if let Ok(log) = fs::read_to_string(home.hook_log()) {
             for line in log.lines().rev().take(3) {
-                println!("note     recent hook error: {line}");
+                writeln!(out, "note     recent hook error: {line}")?;
             }
         }
         ensure!(problems == 0, "{problems} problem(s) found");
         Ok(())
     }
 
-    fn list(home: &Home, all_repos: bool, revisions: bool) -> Result<()> {
+    fn list(
+        home: &Home,
+        out: &mut Output<impl Write>,
+        all_repos: bool,
+        revisions: bool,
+    ) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let repo = if all_repos {
             None
@@ -353,16 +380,18 @@ impl Command {
         };
         let rows = store.list(repo.as_ref().map(RepoId::as_str), revisions)?;
         if rows.is_empty() {
-            println!(
+            writeln!(
+                out,
                 "No procedures yet{}.",
                 if all_repos { "" } else { " in this repository" }
-            );
+            )?;
             return Ok(());
         }
-        println!(
+        writeln!(
+            out,
             "{:<16} {:>3}  {:<11} {:>8} {:>7}  TITLE",
             "ID", "REV", "STATE", "SESSIONS", "WORKED"
-        );
+        )?;
         for row in rows {
             let procedure = row.procedure;
             let state = serde_json::to_value(procedure.state).context("name a lifecycle state")?;
@@ -372,7 +401,8 @@ impl Command {
             } else {
                 format!("{}/{judged}", procedure.outcomes.successes)
             };
-            println!(
+            writeln!(
+                out,
                 "{:<16} {:>3}  {:<11} {:>8} {:>7}  {}",
                 procedure.id,
                 procedure.revision,
@@ -380,26 +410,33 @@ impl Command {
                 procedure.provenance.sources.len(),
                 worked,
                 procedure.title
-            );
+            )?;
         }
         Ok(())
     }
 
-    fn show(home: &Home, id: &str) -> Result<()> {
+    fn show(home: &Home, out: &mut Output<impl Write>, id: &str) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let revisions = store.revisions(id)?;
         ensure!(!revisions.is_empty(), "no procedure {id}");
         for row in revisions {
-            println!("{}\n", Envelope::render(&row.procedure));
-            println!(
+            writeln!(out, "{}\n", Envelope::render(&row.procedure))?;
+            writeln!(
+                out,
                 "{}\n",
                 serde_json::to_string_pretty(&row.procedure).context("serialize a procedure")?
-            );
+            )?;
         }
         Ok(())
     }
 
-    fn recall(home: &Home, prompt: &str, cwd: Option<PathBuf>, explain: bool) -> Result<()> {
+    fn recall(
+        home: &Home,
+        out: &mut Output<impl Write>,
+        prompt: &str,
+        cwd: Option<PathBuf>,
+        explain: bool,
+    ) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let workspace = Self::workspace(&store, cwd)?;
         let outcome = home.recall(&store).recall(&Query {
@@ -409,30 +446,31 @@ impl Command {
             session: None,
         })?;
         if explain {
-            Self::print_explanation(&outcome);
+            Self::print_explanation(out, &outcome)?;
         }
         match outcome.decision {
             Decision::Inject(chosen) | Decision::Withhold(chosen) => {
-                println!("{}", Envelope::render(&chosen.row.procedure));
+                writeln!(out, "{}", Envelope::render(&chosen.row.procedure))?;
             }
             Decision::Abstain(reason) => {
-                println!("Nothing to inject: {}.", Self::describe(&reason));
+                writeln!(out, "Nothing to inject: {}.", Self::describe(&reason))?;
             }
         }
         Ok(())
     }
 
-    fn print_explanation(outcome: &Outcome) {
+    fn print_explanation(out: &mut Output<impl Write>, outcome: &Outcome) -> Result<()> {
         if let Some(error) = &outcome.semantic_error {
-            println!("Recalled without semantic matching: {error}\n");
+            writeln!(out, "Recalled without semantic matching: {error}\n")?;
         }
         if outcome.candidates.is_empty() {
-            return;
+            return Ok(());
         }
-        println!(
+        writeln!(
+            out,
             "{:<16} {:>7} {:>9} {:>9}  {:<24} TITLE",
             "ID", "FUSED", "LEXICAL", "COSINE", "EXACT"
-        );
+        )?;
         for Match { row, signals } in &outcome.candidates {
             let lexical = signals.lexical.map_or_else(
                 || "-".to_owned(),
@@ -443,7 +481,8 @@ impl Command {
                 |(rank, cosine)| format!("#{} {cosine:.2}", rank + 1),
             );
             let exact: Vec<&str> = signals.exact.iter().map(|(key, _)| key.as_str()).collect();
-            println!(
+            writeln!(
+                out,
                 "{:<16} {:>7.4} {:>9} {:>9}  {:<24} {}",
                 row.procedure.id,
                 signals.fused,
@@ -451,9 +490,10 @@ impl Command {
                 cosine,
                 exact.join(","),
                 row.procedure.title
-            );
+            )?;
         }
-        println!();
+        writeln!(out)?;
+        Ok(())
     }
 
     fn describe(reason: &Abstention) -> String {
@@ -471,17 +511,18 @@ impl Command {
         }
     }
 
-    fn outcomes(home: &Home) -> Result<()> {
+    fn outcomes(home: &Home, out: &mut Output<impl Write>) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let summaries = store.outcome_summaries()?;
         if summaries.is_empty() {
-            println!("No procedure has been recalled yet.");
+            writeln!(out, "No procedure has been recalled yet.")?;
             return Ok(());
         }
-        println!(
+        writeln!(
+            out,
             "{:<16} {:>10} {:>10} {:>14}  TITLE",
             "ID", "INJECTED", "HELD OUT", "TOOL CALLS"
-        );
+        )?;
         let rate = |evidence: trodden_learn::Evidence| {
             if evidence.total() == 0 {
                 "-".to_owned()
@@ -495,32 +536,34 @@ impl Command {
                 (Some(injected), None) => format!("{injected:.0} vs -"),
                 _ => "-".to_owned(),
             };
-            println!(
+            writeln!(
+                out,
                 "{:<16} {:>10} {:>10} {:>14}  {}",
                 summary.procedure,
                 rate(summary.injected),
                 rate(summary.held_out),
                 calls,
                 summary.title
-            );
+            )?;
         }
-        println!(
+        writeln!(
+            out,
             "\nINJECTED and HELD OUT count tasks that ended with a passing check, out of those\n\
              that changed files. TOOL CALLS compares the mean effort of those tasks."
-        );
+        )?;
         Ok(())
     }
 
-    fn retire(home: &Home, id: &str) -> Result<()> {
+    fn retire(home: &Home, out: &mut Output<impl Write>, id: &str) -> Result<()> {
         let ingest = Self::wait_for_ingest(home)?;
         let retired = home.open_store(Patience::Batch)?.retire(id)?;
         ensure!(retired > 0, "no procedure {id}");
         ingest.rebuild_index()?;
-        println!("Retired {retired} revision(s) of {id}.");
+        writeln!(out, "Retired {retired} revision(s) of {id}.")?;
         Ok(())
     }
 
-    fn config(home: &Home, setting: Option<Setting>) -> Result<()> {
+    fn config(home: &Home, out: &mut Output<impl Write>, setting: Option<Setting>) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         match setting {
             Some(Setting::Holdout { rate }) if rate == "auto" => store.set_holdout_rate(None)?,
@@ -545,36 +588,44 @@ impl Command {
             || "auto (10%, then 2% once a procedure's effect is known)".to_owned(),
             |rate| format!("{:.0}%", rate * 100.0),
         );
-        println!("holdout          {holdout}");
-        println!(
+        writeln!(out, "holdout          {holdout}")?;
+        writeln!(
+            out,
             "verify-reminder  {}",
             if store.verify_reminder()? {
                 "on"
             } else {
                 "off"
             }
-        );
+        )?;
         Ok(())
     }
 
-    fn rejected(home: &Home, limit: usize) -> Result<()> {
+    fn rejected(home: &Home, out: &mut Output<impl Write>, limit: usize) -> Result<()> {
         let store = home.open_store(Patience::Batch)?;
         let records = store.rejections(limit)?;
         if records.is_empty() {
-            println!("No rejected tasks.");
+            writeln!(out, "No rejected tasks.")?;
         }
         for record in records {
-            println!(
+            writeln!(
+                out,
                 "{}  {}\n    {}",
                 record.at,
                 record.summary,
                 record.rejection.unwrap_or_default()
-            );
+            )?;
         }
         Ok(())
     }
 
-    fn forget(home: &Home, id: Option<&str>, repo: bool, all: bool) -> Result<()> {
+    fn forget(
+        home: &Home,
+        out: &mut Output<impl Write>,
+        id: Option<&str>,
+        repo: bool,
+        all: bool,
+    ) -> Result<()> {
         let ingest = Self::wait_for_ingest(home)?;
         let mut store = home.open_store(Patience::Batch)?;
         let workspace = if repo {
@@ -597,7 +648,7 @@ impl Command {
             fs::remove_file(&log).with_context(|| format!("remove {}", log.display()))?;
         }
         ingest.rebuild_index()?;
-        println!("Deleted {deleted} revision(s).");
+        writeln!(out, "Deleted {deleted} revision(s).")?;
         Ok(())
     }
 
@@ -606,7 +657,10 @@ impl Command {
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                eprintln!("Waiting for a running ingest to finish...");
+                writeln!(
+                    Output::stderr(),
+                    "Waiting for a running ingest to finish..."
+                )?;
             }
             Err(TryLockError::Error(error)) => {
                 return Err(error).context("check the ingest lock");
@@ -616,22 +670,28 @@ impl Command {
         Ingest::start(home)
     }
 
-    fn backfill(home: &Home, projects: Option<PathBuf>) -> Result<()> {
+    fn backfill(
+        home: &Home,
+        out: &mut Output<impl Write>,
+        projects: Option<PathBuf>,
+    ) -> Result<()> {
         let harness = Harness::ClaudeCode;
         let history = match projects {
             Some(projects) => projects,
             None => harness.history_dir()?,
         };
         let (report, failures) = Ingest::start(home)?.backfill(harness, &history)?;
-        Self::print_report(&report);
+        Self::print_report(out, &report)?;
+        let mut err = Output::stderr();
         for (transcript, error) in &failures {
-            eprintln!("skipped {}: {error}", transcript.display());
+            writeln!(err, "skipped {}: {error}", transcript.display())?;
         }
         Ok(())
     }
 
-    fn print_report(report: &IngestReport) {
-        println!(
+    fn print_report(out: &mut Output<impl Write>, report: &IngestReport) -> Result<()> {
+        writeln!(
+            out,
             "{} session(s), {} task(s): {} new procedure(s), {} confirmed, {} new revision(s), {} rejected",
             report.sessions,
             report.tasks,
@@ -639,19 +699,25 @@ impl Command {
             report.refreshed,
             report.revised,
             report.rejected.values().sum::<usize>()
-        );
+        )?;
         for (reason, count) in &report.rejected {
-            println!("  {count:>4}  {reason}");
+            writeln!(out, "  {count:>4}  {reason}")?;
         }
         if report.settled + report.promoted + report.quarantined + report.aged > 0 {
-            println!(
+            writeln!(
+                out,
                 "{} injection(s) judged; {} revision(s) promoted, {} quarantined, {} aged",
                 report.settled, report.promoted, report.quarantined, report.aged
-            );
+            )?;
         }
+        Ok(())
     }
 
-    fn install_embeddings(home: &Home, from: Option<PathBuf>) -> Result<()> {
+    fn install_embeddings(
+        home: &Home,
+        out: &mut Output<impl Write>,
+        from: Option<PathBuf>,
+    ) -> Result<()> {
         let download = home.dir().join("model-download");
         let model_dir = if let Some(from) = from {
             from
@@ -663,7 +729,7 @@ impl Command {
                     "https://huggingface.co/{}/resolve/main/{file}",
                     ModelPack::MODEL_REPO
                 );
-                println!("Downloading {url}");
+                writeln!(out, "Downloading {url}")?;
                 let status = Process::new("curl")
                     .args([
                         "--fail",
@@ -686,7 +752,10 @@ impl Command {
                 .with_context(|| format!("remove {}", download.display()))?;
         }
         let embedded = Ingest::start(home)?.reembed()?;
-        println!("Semantic matching is on. Embedded {embedded} stored revision(s).");
+        writeln!(
+            out,
+            "Semantic matching is on. Embedded {embedded} stored revision(s)."
+        )?;
         Ok(())
     }
 
@@ -709,7 +778,10 @@ impl Command {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+
     use super::*;
+    use crate::output::Failing;
 
     struct Scratch {
         home: Home,
@@ -735,8 +807,14 @@ mod tests {
     fn forgetting_an_unknown_procedure_fails() {
         let scratch = Scratch::new("forget-unknown");
 
-        let error = Command::forget(&scratch.home, Some("p_doesnotexist"), false, false)
-            .expect_err("unknown ids are reported");
+        let error = Command::forget(
+            &scratch.home,
+            &mut Output::new(Vec::new()),
+            Some("p_doesnotexist"),
+            false,
+            false,
+        )
+        .expect_err("unknown ids are reported");
 
         assert_eq!(error.to_string(), "no procedure p_doesnotexist");
     }
@@ -755,8 +833,14 @@ mod tests {
             .remember_repo("/home/dev/shop", "path-5f0c1d2e3a4b6978")
             .expect("repository remembered");
 
-        Command::forget(home, None, false, true).expect("everything is forgotten");
+        let mut printed = Vec::new();
+        Command::forget(home, &mut Output::new(&mut printed), None, false, true)
+            .expect("everything is forgotten");
 
+        assert_eq!(
+            String::from_utf8_lossy(&printed),
+            "Deleted 0 revision(s).\n"
+        );
         assert!(!home.hook_log().exists());
         assert_eq!(
             home.open_store(Patience::Batch)
@@ -765,7 +849,8 @@ mod tests {
                 .expect("repos read"),
             None
         );
-        Command::forget(home, None, false, true).expect("forgetting again is harmless");
+        Command::forget(home, &mut Output::new(Vec::new()), None, false, true)
+            .expect("forgetting again is harmless");
     }
 
     #[test]
@@ -783,7 +868,7 @@ mod tests {
         let retiring = std::thread::spawn({
             let home = home.clone();
             let id = id.clone();
-            move || Command::retire(&home, &id)
+            move || Command::retire(&home, &mut Output::new(Vec::new()), &id)
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
         let state_during_ingest = home
@@ -808,6 +893,35 @@ mod tests {
                 .procedure
                 .state,
             trodden_core::procedure::Lifecycle::Retired
+        );
+    }
+
+    #[test]
+    fn a_closed_reader_ends_the_command_quietly() {
+        let scratch = Scratch::new("closed-reader");
+        let mut closed = Output::new(Failing(ErrorKind::BrokenPipe));
+        let mut errors = Vec::new();
+
+        let result = Command::status(&scratch.home, &mut closed);
+        let code = Cli::exit(result, &mut Output::new(&mut errors));
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn other_failures_are_reported() {
+        let mut errors = Vec::new();
+
+        let code = Cli::exit(
+            Err(anyhow::anyhow!("no procedure p_doesnotexist")),
+            &mut Output::new(&mut errors),
+        );
+
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8_lossy(&errors),
+            "trodden: no procedure p_doesnotexist\n"
         );
     }
 }
