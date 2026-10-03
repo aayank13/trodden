@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use anyhow::{Result, bail};
 use jiff::Timestamp;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use trodden_core::{
     HarnessId, SessionId, Trace,
     trace::{Event, EventKind, FileChange, ToolAction, ToolArgs, ToolCall, ToolOutcome},
@@ -85,62 +85,153 @@ impl Transcript {
 
     pub fn parse(text: &str, redactor: &Redactor) -> Result<Trace> {
         let mut builder = TraceBuilder::new(redactor);
-        for line in text.lines() {
-            if let Ok(line) = serde_json::from_str::<Line>(line) {
-                builder.push(line);
-            }
+        for line in text.lines().filter_map(Line::parse) {
+            builder.push(line);
         }
         builder.finish()
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 struct Line {
-    #[serde(rename = "type")]
     kind: String,
     session_id: Option<String>,
     cwd: Option<String>,
     timestamp: Option<String>,
-    #[serde(default)]
     is_meta: bool,
-    #[serde(default)]
     is_sidechain: bool,
-    #[serde(default)]
     is_compact_summary: bool,
     subtype: Option<String>,
-    compact_metadata: Option<CompactMetadata>,
+    compact_trigger: Option<String>,
     message: Option<Message>,
     tool_use_result: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CompactMetadata {
-    trigger: Option<String>,
+impl Line {
+    const REPLACEMENT: &str = r"�";
+
+    fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text)
+            .or_else(|_| serde_json::from_str(&Self::without_lone_surrogates(text)))
+            .ok()?;
+        let mut fields = Fields::of(value)?;
+        Some(Self {
+            kind: fields.string("type")?,
+            session_id: fields.string("sessionId"),
+            cwd: fields.string("cwd"),
+            timestamp: fields.string("timestamp"),
+            is_meta: fields.flag("isMeta"),
+            is_sidechain: fields.flag("isSidechain"),
+            is_compact_summary: fields.flag("isCompactSummary"),
+            subtype: fields.string("subtype"),
+            compact_trigger: fields
+                .object("compactMetadata")
+                .and_then(|mut metadata| metadata.string("trigger")),
+            message: fields.object("message").map(Message::new),
+            tool_use_result: fields.take("toolUseResult"),
+        })
+    }
+
+    fn without_lone_surrogates(text: &str) -> String {
+        let mut mended = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('\\') {
+            mended.push_str(&rest[..at]);
+            rest = &rest[at..];
+            let (kept, len) = match Self::code_unit(rest) {
+                Some(0xD800..=0xDBFF)
+                    if matches!(Self::code_unit(&rest[6..]), Some(0xDC00..=0xDFFF)) =>
+                {
+                    (&rest[..12], 12)
+                }
+                Some(0xD800..=0xDFFF) => (Self::REPLACEMENT, 6),
+                Some(_) => (&rest[..6], 6),
+                None => {
+                    let len = rest[1..].chars().next().map_or(1, |c| 1 + c.len_utf8());
+                    (&rest[..len], len)
+                }
+            };
+            mended.push_str(kept);
+            rest = &rest[len..];
+        }
+        mended.push_str(rest);
+        mended
+    }
+
+    fn code_unit(escape: &str) -> Option<u16> {
+        let hex = escape
+            .strip_prefix(r"\u")?
+            .get(..4)
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        u16::from_str_radix(hex, 16).ok()
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
+struct Fields(Map<String, Value>);
+
+impl Fields {
+    fn of(value: Value) -> Option<Self> {
+        match value {
+            Value::Object(map) => Some(Self(map)),
+            _ => None,
+        }
+    }
+
+    fn take(&mut self, key: &str) -> Option<Value> {
+        self.0.remove(key)
+    }
+
+    fn string(&mut self, key: &str) -> Option<String> {
+        match self.take(key)? {
+            Value::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn object(&mut self, key: &str) -> Option<Self> {
+        self.take(key).and_then(Self::of)
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.0.get(key).and_then(Value::as_bool) == Some(true)
+    }
+}
+
+#[derive(Debug)]
 struct Message {
     model: Option<String>,
-    #[serde(default)]
     content: Content,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+impl Message {
+    fn new(mut fields: Fields) -> Self {
+        Self {
+            model: fields.string("model"),
+            content: Content::new(fields.take("content")),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum Content {
     Text(String),
     Blocks(Vec<Block>),
 }
 
-impl Default for Content {
-    fn default() -> Self {
-        Self::Blocks(Vec::new())
+impl Content {
+    fn new(value: Option<Value>) -> Self {
+        match value {
+            Some(Value::String(text)) => Self::Text(text),
+            Some(Value::Array(blocks)) => {
+                Self::Blocks(blocks.into_iter().filter_map(Block::new).collect())
+            }
+            _ => Self::Blocks(Vec::new()),
+        }
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug)]
 enum Block {
     Text {
         text: String,
@@ -148,18 +239,35 @@ enum Block {
     ToolUse {
         id: String,
         name: String,
-        #[serde(default)]
         input: Value,
     },
     ToolResult {
         tool_use_id: String,
-        #[serde(default)]
         content: Value,
-        #[serde(default)]
         is_error: bool,
     },
-    #[serde(other)]
-    Other,
+}
+
+impl Block {
+    fn new(value: Value) -> Option<Self> {
+        let mut fields = Fields::of(value)?;
+        match fields.string("type")?.as_str() {
+            "text" => Some(Self::Text {
+                text: fields.string("text")?,
+            }),
+            "tool_use" => Some(Self::ToolUse {
+                id: fields.string("id")?,
+                name: fields.string("name")?,
+                input: fields.take("input").unwrap_or_default(),
+            }),
+            "tool_result" => Some(Self::ToolResult {
+                tool_use_id: fields.string("tool_use_id")?,
+                content: fields.take("content").unwrap_or_default(),
+                is_error: fields.flag("is_error"),
+            }),
+            _ => None,
+        }
+    }
 }
 
 struct TraceBuilder<'a> {
@@ -217,8 +325,7 @@ impl<'a> TraceBuilder<'a> {
             "assistant" => self.push_assistant(line),
             "system" if line.subtype.as_deref() == Some("compact_boundary") => {
                 let automatic = line
-                    .compact_metadata
-                    .and_then(|meta| meta.trigger)
+                    .compact_trigger
                     .is_some_and(|trigger| trigger == "auto");
                 self.emit(EventKind::Compaction { automatic });
             }
@@ -794,6 +901,55 @@ mod tests {
                 .collect();
             (trace, calls)
         }
+
+        fn resolved(name: &str, input: Value, result: &str) -> ToolCall {
+            let call = json!({"type": "assistant", "sessionId": "s", "cwd": "/work/app",
+                              "timestamp": "2026-09-21T14:02:12Z",
+                              "message": {"role": "assistant", "content": [
+                                  {"type": "tool_use", "id": "call", "name": name, "input": input}]}});
+            let trace = Transcript::parse(
+                &format!("{call}\n{result}\n"),
+                &Redactor::with_home("/home/dev"),
+            )
+            .expect("valid transcript");
+            trace
+                .events
+                .into_iter()
+                .find_map(|event| match event.kind {
+                    EventKind::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .expect("one tool call")
+        }
+
+        fn result(content: &str, is_error: bool, tool_use_result: Value) -> Value {
+            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:13Z",
+                   "toolUseResult": tool_use_result,
+                   "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "call", "content": content, "is_error": is_error}]}})
+        }
+
+        fn odd_variants(line: &Value) -> Vec<String> {
+            let with_block = |block: Value| {
+                let mut line = line.clone();
+                line["message"]["content"]
+                    .as_array_mut()
+                    .expect("content blocks")
+                    .insert(0, block);
+                line.to_string()
+            };
+            let mut meta = line.clone();
+            meta["isMeta"] = Value::Null;
+            vec![
+                line.to_string(),
+                meta.to_string(),
+                with_block(json!({"type": "text"})),
+                with_block(json!({"type": "text", "text": null})),
+                with_block(json!({"type": "tool_result", "tool_use_id": null, "is_error": "yes"})),
+                with_block(json!({"type": "text", "text": "cut mid emoji SURROGATE"}))
+                    .replace("SURROGATE", r"\ud83d"),
+            ]
+        }
     }
 
     #[test]
@@ -899,5 +1055,68 @@ mod tests {
                 "src",
             ]
         );
+    }
+
+    #[test]
+    fn odd_fields_keep_an_edit_and_its_changes() {
+        let input = json!({"file_path": "/work/app/src/paginate.js",
+                           "old_string": "page * 10 + 9", "new_string": "page * 10 + 10"});
+        let result = Session::result(
+            "The file /work/app/src/paginate.js has been updated.",
+            false,
+            json!({"filePath": "/work/app/src/paginate.js",
+                   "originalFile": "function paginate(items, page) {\n  return items.slice(page * 10, page * 10 + 9);\n}\n",
+                   "structuredPatch": [{"oldStart": 1, "lines": [
+                       " function paginate(items, page) {",
+                       "-  return items.slice(page * 10, page * 10 + 9);",
+                       "+  return items.slice(page * 10, page * 10 + 10);",
+                       " }"]}]}),
+        );
+        for line in Session::odd_variants(&result) {
+            let call = Session::resolved("Edit", input.clone(), &line);
+
+            assert_eq!(call.outcome, ToolOutcome::Succeeded, "{line}");
+            assert_eq!(call.changes.len(), 1, "{line}");
+            assert_eq!(call.changes[0].path, "src/paginate.js");
+            assert_eq!(
+                (call.changes[0].lines_added, call.changes[0].lines_removed),
+                (1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn odd_fields_keep_a_failure_and_its_error() {
+        let result = Session::result(
+            "Exit code 1\nError: Cannot find module 'left-pad'",
+            true,
+            json!({"stdout": "", "stderr": "Error: Cannot find module 'left-pad'", "interrupted": false}),
+        );
+        for line in Session::odd_variants(&result) {
+            let call = Session::resolved("Bash", json!({"command": "npm test"}), &line);
+
+            assert_eq!(
+                call.outcome,
+                ToolOutcome::Failed { exit_code: Some(1) },
+                "{line}"
+            );
+            assert!(call.error.is_some(), "{line}");
+        }
+    }
+
+    #[test]
+    fn only_lone_surrogates_are_replaced() {
+        let cases = [
+            (r#"{"text":"cut \ud83d"}"#, r#"{"text":"cut �"}"#),
+            (r#"{"text":"\udE00 tail"}"#, r#"{"text":"� tail"}"#),
+            (r#"{"text":"\ud83d😀"}"#, r#"{"text":"�😀"}"#),
+            (r#"{"text":"😀 é"}"#, r#"{"text":"😀 é"}"#),
+            (r#"{"text":"\\ud83d \" é\"}"#, r#"{"text":"\\ud83d \" é\"}"#),
+            (r#"{"text":"\ud83"#, r#"{"text":"\ud83"#),
+            (r"\", r"\"),
+        ];
+        for (text, mended) in cases {
+            assert_eq!(Line::without_lone_surrogates(text), mended, "{text}");
+        }
     }
 }
