@@ -8,6 +8,8 @@ const ENTROPY_MIN_LEN: usize = 32;
 
 const ENTROPY_THRESHOLD: f64 = 4.3;
 
+const PATH_WORD_MIN_LEN: usize = 3;
+
 type Check = fn(&Captures<'_>) -> bool;
 
 #[derive(Debug, Clone)]
@@ -468,24 +470,35 @@ impl Redactor {
 
     fn redact_random(token: &str) -> String {
         let marker = format!("{MARKER_PREFIX}high-entropy]");
-        if !token.starts_with(['/', '~', '.']) {
+        if !Self::is_path(token) {
             return if Self::looks_random(token) {
                 marker
             } else {
                 token.to_owned()
             };
         }
-        token
-            .split('/')
-            .map(|segment| {
-                if Self::looks_random(segment) {
-                    marker.as_str()
-                } else {
-                    segment
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("/")
+        let mut start = 0;
+        for segment in token.split('/') {
+            let end = start + segment.len();
+            if Self::looks_random(segment) {
+                return format!(
+                    "{}{marker}{}",
+                    Self::redact_random(&token[..start]),
+                    Self::redact_random(&token[end..])
+                );
+            }
+            start = end + 1;
+        }
+        token.to_owned()
+    }
+
+    fn is_path(token: &str) -> bool {
+        token.starts_with(['/', '~', '.'])
+            || (token.contains('/')
+                && token.split('/').any(|segment| {
+                    segment.len() >= PATH_WORD_MIN_LEN
+                        && segment.bytes().all(|b| b.is_ascii_lowercase())
+                }))
     }
 
     fn looks_random(token: &str) -> bool {
@@ -545,6 +558,28 @@ mod tests {
     }
 
     #[test]
+    fn keeps_relative_paths_to_generated_directories() {
+        let redactor = Redactor::with_home("/Users/ada");
+        let cases = [
+            (
+                "cd proj/.claude/worktrees/agent-a3f9c2d17e5b4c08",
+                "cd proj/.claude/worktrees/agent-a3f9c2d17e5b4c08",
+            ),
+            (
+                "cp dist/app.js worktrees/agent-a3f9c2d17e5b4c08/dist",
+                "cp dist/app.js worktrees/agent-a3f9c2d17e5b4c08/dist",
+            ),
+            (
+                "cd /Users/ada/Library/CloudStorage/GoogleDrive-ada@example.com/shop",
+                "cd ~/Library/CloudStorage/[REDACTED:email]/shop",
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(redactor.redact(text), expected);
+        }
+    }
+
+    #[test]
     fn detects_remaining_secrets() {
         let redactor = Redactor::with_home("/Users/ada");
 
@@ -575,6 +610,15 @@ mod tests {
         let aws_secret = fake(&["k3Jd9sX0pQ2mZ7vB4nR8", "tY1wE6uI5oP0aS3dF7g"]);
         let base64 = [fake(&["9j4AAQ", "SkZJRg"]), fake(&["ABAQ2w", "BDAA"])];
         let hex_path = fake(&["a1b2c3d4e5f6a7b8", "c9d0e1f2a3b4c5d6"]);
+        let slashed = [
+            fake(&["k3Jd9sX0pQ", "2mZ7vB4nR8"]),
+            fake(&["tY1wE6uI5o", "P0aS3dF7g"]),
+        ];
+        let prefix = [
+            fake(&["Q7vK2mXp", "9LzR4wT8"]),
+            fake(&["Nb3Hy6Jc1", "Fd5Gs0Wq"]),
+        ];
+        let nested = fake(&["Zx81kQp0vLm3Rt4K", "p8WzB2nY6cH9sD1fG5"]);
         let pgp_body = [fake(&["lQOYBGXk", "2fIBCADq7d"]), fake(&["=pX", "3a"])];
         let pgp = [
             fake(&["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----\n"]),
@@ -723,6 +767,14 @@ mod tests {
             ),
             case(format!("API_TOKEN=/{hex_path}"), &[&hex_path]),
             case(
+                format!("sign uploads with {}/{}", slashed[0], slashed[1]),
+                &[&slashed[0], &slashed[1]],
+            ),
+            case(
+                format!("tar xf {}/{}/{nested}/src.tar", prefix[0], prefix[1]),
+                &[&prefix[0], &prefix[1], &nested],
+            ),
+            case(
                 "TOKEN_TYPE=bearer,password=hunter2".to_owned(),
                 &["hunter2"],
             ),
@@ -738,6 +790,10 @@ mod tests {
             ),
             case(
                 "mail ada@example.com < report.txt".to_owned(),
+                &["ada@example.com"],
+            ),
+            case(
+                "ls ~/Library/CloudStorage/GoogleDrive-ada@example.com/shop".to_owned(),
                 &["ada@example.com"],
             ),
         ]
@@ -781,6 +837,8 @@ mod tests {
             "ssh -p 2222 deploy@staging",
             "cargo test -p invoicer",
             "npm test",
+            "cd .claude/worktrees/agent-a3f9c2d17e5b4c08 && cargo test",
+            "diff -r worktrees/agent-a3f9c2d17e5b4c08/src src",
         ]
         .into_iter()
         .map(str::to_owned)
