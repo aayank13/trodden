@@ -59,7 +59,7 @@ impl Command {
         ("go", "-C"),
         (
             "gradle",
-            "-p --project-dir -b --build-file -c --settings-file -I --init-script -x --exclude-task",
+            "-p --project-dir -b --build-file -c --settings-file -I --init-script -x --exclude-task --task",
         ),
         ("just", "-f --justfile -d --working-directory"),
         (
@@ -292,6 +292,21 @@ impl Command {
 
     pub fn argv(&self) -> Vec<String> {
         self.layers().1
+    }
+
+    pub fn operands(&self) -> Vec<String> {
+        let argv = self.argv();
+        let Some((first, arguments)) = argv.split_first() else {
+            return Vec::new();
+        };
+        let program = Self::name(first);
+        let mut operands = Vec::new();
+        let mut index = Self::operand(program, arguments, 0);
+        while let Some(operand) = arguments.get(index) {
+            operands.push(operand.clone());
+            index = Self::operand(program, arguments, index + 1);
+        }
+        operands
     }
 
     pub fn executables(&self) -> Vec<String> {
@@ -537,6 +552,29 @@ mod tests {
             assert_eq!(
                 Command::normalize(command, "/work").argv(),
                 argv,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn finds_the_operands_past_options_and_their_values() {
+        let cases: [(&str, &[&str]); 7] = [
+            ("mvn clean test", &["clean", "test"]),
+            (
+                "./mvnw -pl core -q clean -DskipTests verify",
+                &["clean", "verify"],
+            ),
+            ("./gradlew clean build -x test", &["clean", "build"]),
+            ("cd android && ./gradlew :app:test", &[":app:test"]),
+            ("gradle help --task test", &["help"]),
+            ("timeout 600 mvn -T 4 install", &["install"]),
+            ("", &[]),
+        ];
+        for (command, operands) in cases {
+            assert_eq!(
+                Command::normalize(command, "/work").operands(),
+                operands,
                 "{command}"
             );
         }
