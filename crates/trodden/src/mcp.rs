@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -47,7 +47,8 @@ impl Server {
         description = "Recall a procedure that worked for a similar task in this repository."
     )]
     async fn recall(&self, Parameters(args): Parameters<PromptArgs>) -> Result<String, ErrorData> {
-        self.recall_text(&args.prompt, &args.cwd, false)
+        let cwd = Self::directory(&args.cwd)?;
+        self.recall_text(&args.prompt, &cwd, false)
             .map_err(|error| Self::error(&error))
     }
 
@@ -56,7 +57,8 @@ impl Server {
         description = "Explain how every candidate procedure scored for a prompt."
     )]
     async fn explain(&self, Parameters(args): Parameters<PromptArgs>) -> Result<String, ErrorData> {
-        self.recall_text(&args.prompt, &args.cwd, true)
+        let cwd = Self::directory(&args.cwd)?;
+        self.recall_text(&args.prompt, &cwd, true)
             .map_err(|error| Self::error(&error))
     }
 
@@ -65,8 +67,8 @@ impl Server {
         description = "List the procedures learned in a repository."
     )]
     async fn list(&self, Parameters(args): Parameters<DirectoryArgs>) -> Result<String, ErrorData> {
-        self.list_text(&args.cwd)
-            .map_err(|error| Self::error(&error))
+        let cwd = Self::directory(&args.cwd)?;
+        self.list_text(&cwd).map_err(|error| Self::error(&error))
     }
 
     #[tool(
@@ -120,9 +122,9 @@ impl Server {
         })
     }
 
-    fn recall_text(&self, prompt: &str, cwd: &str, explain: bool) -> Result<String> {
+    fn recall_text(&self, prompt: &str, cwd: &Path, explain: bool) -> Result<String> {
         let store = self.home.open_store(Patience::Batch)?;
-        let workspace = Workspace::resolve(&PathBuf::from(cwd), &store)?;
+        let workspace = Workspace::resolve(cwd, &store)?;
         let mut recall = Recall::new(&store, self.home.semantic());
         let outcome = recall.recall(&Query {
             prompt,
@@ -156,9 +158,9 @@ impl Server {
         Ok(text)
     }
 
-    fn list_text(&self, cwd: &str) -> Result<String> {
+    fn list_text(&self, cwd: &Path) -> Result<String> {
         let store = self.home.open_store(Patience::Batch)?;
-        let workspace = Workspace::resolve(&PathBuf::from(cwd), &store)?;
+        let workspace = Workspace::resolve(cwd, &store)?;
         let rows = store.list(Some(workspace.repo.as_str()), false)?;
         Ok(rows
             .iter()
@@ -200,7 +202,38 @@ impl Server {
         ))
     }
 
+    fn directory(cwd: &str) -> Result<PathBuf, ErrorData> {
+        let path = PathBuf::from(cwd);
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(ErrorData::invalid_params(
+                format!("`cwd` must be an absolute path, got {cwd:?}"),
+                None,
+            ))
+        }
+    }
+
     fn error(error: &anyhow::Error) -> ErrorData {
         ErrorData::internal_error(format!("{error:#}"), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::ErrorCode;
+
+    use super::*;
+
+    #[test]
+    fn tools_reject_relative_working_directories() {
+        for cwd in [".", "", "src", "../shop"] {
+            let error = Server::directory(cwd).expect_err("relative paths are rejected");
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        }
+        assert_eq!(
+            Server::directory("/home/dev/shop").expect("absolute paths are accepted"),
+            PathBuf::from("/home/dev/shop")
+        );
     }
 }
