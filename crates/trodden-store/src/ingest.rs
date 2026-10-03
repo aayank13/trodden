@@ -62,6 +62,31 @@ impl Store {
         Ok(())
     }
 
+    pub fn open_sessions(&self, harness: &str) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT session, transcript FROM sessions
+                 WHERE harness = ?1 AND ended = 0 ORDER BY updated_at, session",
+            )
+            .context("prepare the open session listing")?;
+        statement
+            .query_map([harness], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("list open sessions")?
+            .collect::<Result<_, _>>()
+            .context("read open sessions")
+    }
+
+    pub fn end_session(&self, session: &str, at: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended = 1, updated_at = ?2 WHERE session = ?1",
+                params![session, at],
+            )
+            .context("end a session")?;
+        Ok(())
+    }
+
     pub fn record_extraction(&self, record: &ExtractionRecord) -> Result<()> {
         self.conn
             .execute(
