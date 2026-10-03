@@ -16,7 +16,7 @@ use trodden_core::{
     Procedure,
     procedure::{Condition, Lifecycle},
 };
-use trodden_embed::{Embedder, Embedding};
+use trodden_embed::Embedder;
 use trodden_learn::{Evidence, Holdout, Policy};
 use trodden_store::{ProcedureRow, Store, Terms};
 
@@ -154,12 +154,14 @@ pub enum Decision {
 pub struct Outcome {
     pub decision: Decision,
     pub candidates: Vec<Match>,
+    pub semantic_error: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Recall<'a> {
     store: &'a Store,
     semantic: Option<(Embedder, VectorIndex)>,
+    semantic_error: Option<String>,
     rng: SmallRng,
 }
 
@@ -168,8 +170,15 @@ impl<'a> Recall<'a> {
         Self {
             store,
             semantic,
+            semantic_error: None,
             rng: rand::make_rng(),
         }
+    }
+
+    pub fn semantic_unavailable(mut self, error: &anyhow::Error) -> Self {
+        self.semantic = None;
+        self.semantic_error = Some(format!("{error:#}"));
+        self
     }
 
     pub fn seeded(mut self, seed: u64) -> Self {
@@ -183,6 +192,7 @@ impl<'a> Recall<'a> {
         Ok(Outcome {
             decision,
             candidates,
+            semantic_error: self.semantic_error.clone(),
         })
     }
 
@@ -216,6 +226,7 @@ impl<'a> Recall<'a> {
         Ok(Outcome {
             decision,
             candidates,
+            semantic_error: None,
         })
     }
 
@@ -248,30 +259,29 @@ impl<'a> Recall<'a> {
         {
             signals.entry(hit.rowid).or_default().lexical = Some((rank, hit.score));
         }
-        if let Some((embedder, index)) = &mut self.semantic
-            && let Some(embedding) = embedder
-                .embed(Skeleton::of(prompt).as_str())
-                .context("embed the prompt")?
-        {
-            for (rank, neighbor) in
-                Self::recallable_neighbors(self.store, index, &embedding, query.repo)?
+        let known: Vec<i64> = signals.keys().copied().collect();
+        match self.semantic_neighbors(prompt, query.repo, &known) {
+            Ok(Some((nearest, looked_up))) => {
+                for neighbor in looked_up {
+                    signals
+                        .get_mut(&neighbor.rowid)
+                        .expect("looked up rows have signals")
+                        .cosine = Some(neighbor.cosine);
+                }
+                for (rank, neighbor) in self
+                    .recallable_neighbors(nearest, query.repo)?
                     .into_iter()
                     .enumerate()
-            {
-                let entry = signals.entry(neighbor.rowid).or_default();
-                entry.semantic = Some((rank, neighbor.cosine));
-                entry.cosine = Some(neighbor.cosine);
+                {
+                    let entry = signals.entry(neighbor.rowid).or_default();
+                    entry.semantic = Some((rank, neighbor.cosine));
+                    entry.cosine = Some(neighbor.cosine);
+                }
             }
-            let unranked: Vec<i64> = signals
-                .iter()
-                .filter(|(_, s)| s.semantic.is_none())
-                .map(|(rowid, _)| *rowid)
-                .collect();
-            for neighbor in index.cosines(&embedding, query.repo, &unranked)? {
-                signals
-                    .get_mut(&neighbor.rowid)
-                    .expect("looked up rows have signals")
-                    .cosine = Some(neighbor.cosine);
+            Ok(None) => {}
+            Err(error) => {
+                self.semantic = None;
+                self.semantic_error = Some(format!("{error:#}"));
             }
         }
 
@@ -319,15 +329,34 @@ impl<'a> Recall<'a> {
         Ok(candidates)
     }
 
-    fn recallable_neighbors(
-        store: &Store,
-        index: &mut VectorIndex,
-        embedding: &Embedding,
+    fn semantic_neighbors(
+        &mut self,
+        prompt: &str,
         repo: &str,
-    ) -> Result<Vec<Neighbor>> {
+        known: &[i64],
+    ) -> Result<Option<(Vec<Neighbor>, Vec<Neighbor>)>> {
+        let Some((embedder, index)) = &mut self.semantic else {
+            return Ok(None);
+        };
+        let Some(embedding) = embedder
+            .embed(Skeleton::of(prompt).as_str())
+            .context("embed the prompt")?
+        else {
+            return Ok(None);
+        };
+        let nearest = index
+            .search(&embedding, repo, STAGE_LIMIT * SEMANTIC_OVERFETCH)
+            .context("search the vector index")?;
+        let looked_up = index
+            .cosines(&embedding, repo, known)
+            .context("look up cosines in the vector index")?;
+        Ok(Some((nearest, looked_up)))
+    }
+
+    fn recallable_neighbors(&self, nearest: Vec<Neighbor>, repo: &str) -> Result<Vec<Neighbor>> {
         let mut neighbors = Vec::with_capacity(STAGE_LIMIT);
-        for neighbor in index.search(embedding, repo, STAGE_LIMIT * SEMANTIC_OVERFETCH)? {
-            if store.is_recallable(neighbor.rowid, repo)? {
+        for neighbor in nearest {
+            if self.store.is_recallable(neighbor.rowid, repo)? {
                 neighbors.push(neighbor);
                 if neighbors.len() == STAGE_LIMIT {
                     break;
@@ -667,6 +696,81 @@ mod tests {
                 })
                 .expect("recall succeeds")
         }
+    }
+
+    #[derive(Debug)]
+    struct Truncated;
+
+    impl Truncated {
+        fn recall(name: &str, file: &str) -> Outcome {
+            let stale = StaleIndex::indexed();
+            let vectors = [(stale.rowid, direction(&[(0, 1.0)]))];
+            let semantic = semantic(name, &vectors);
+            let path = std::env::temp_dir()
+                .join(format!("trodden-recall-{name}-{}", std::process::id()))
+                .join(file);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("scratch file opens")
+                .set_len(16)
+                .expect("scratch file truncates");
+            Recall::new(&stale.store, Some(semantic))
+                .seeded(7)
+                .recall(&Query {
+                    prompt: CRASH_PROMPT,
+                    repo: REPO,
+                    root: Path::new("."),
+                    session: None,
+                })
+                .expect("recall succeeds without the semantic stage")
+        }
+    }
+
+    #[test]
+    fn recalls_exact_and_lexical_matches_when_the_semantic_stage_fails() {
+        for (name, file, stage) in [
+            ("truncated-index", "recall.index", "search the vector index"),
+            ("truncated-pack", "embeddings.pack", "embed the prompt"),
+        ] {
+            let outcome = Truncated::recall(name, file);
+
+            let Decision::Inject(chosen) = &outcome.decision else {
+                panic!("{name}: expected an injection, got {:?}", outcome.decision);
+            };
+            assert_eq!(chosen.signals.semantic, None, "{name}");
+            assert_eq!(chosen.signals.cosine, None, "{name}");
+            assert!(!chosen.signals.exact.is_empty(), "{name}");
+            let error = outcome.semantic_error.expect("the failure is reported");
+            assert!(error.starts_with(stage), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn reports_no_semantic_error_when_the_semantic_stage_works() {
+        assert_eq!(StaleIndex::indexed().recall("healthy").semantic_error, None);
+    }
+
+    #[test]
+    fn carries_a_semantic_open_error_into_the_outcome() {
+        let stale = StaleIndex::indexed();
+
+        let outcome = Recall::new(&stale.store, None)
+            .semantic_unavailable(&anyhow::anyhow!("recall.index is truncated"))
+            .seeded(7)
+            .recall(&Query {
+                prompt: CRASH_PROMPT,
+                repo: REPO,
+                root: Path::new("."),
+                session: None,
+            })
+            .expect("recall succeeds");
+
+        assert!(matches!(outcome.decision, Decision::Inject(_)));
+        assert_eq!(
+            outcome.semantic_error.as_deref(),
+            Some("recall.index is truncated")
+        );
     }
 
     #[test]

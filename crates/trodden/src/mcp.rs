@@ -11,7 +11,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 use trodden::{Home, Workspace};
-use trodden_recall::{Decision, Envelope, Query, Recall};
+use trodden_recall::{Decision, Envelope, Query};
 use trodden_store::{Patience, Store};
 
 #[derive(Debug, Clone)]
@@ -125,8 +125,7 @@ impl Server {
     fn recall_text(&self, prompt: &str, cwd: &Path, explain: bool) -> Result<String> {
         let store = self.store()?;
         let workspace = Workspace::resolve_read_only(cwd, &store)?;
-        let mut recall = Recall::new(&store, self.home.semantic());
-        let outcome = recall.recall(&Query {
+        let outcome = self.home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
             root: &workspace.root,
@@ -134,6 +133,12 @@ impl Server {
         })?;
         let mut lines = Vec::new();
         if explain {
+            if let Some(error) = &outcome.semantic_error {
+                lines.push(
+                    serde_json::to_string(&serde_json::json!({ "semantic_error": error }))
+                        .context("describe the semantic error")?,
+                );
+            }
             for candidate in &outcome.candidates {
                 lines.push(
                     serde_json::to_string(&serde_json::json!({
@@ -191,10 +196,10 @@ impl Server {
         Ok(format!(
             "capture: {}; semantic matching: {}; procedures: {}; sessions: {}; injections: {}",
             if store.paused()? { "paused" } else { "on" },
-            if self.home.semantic().is_some() {
-                "on"
-            } else {
-                "off"
+            match self.home.open_semantic() {
+                Ok(Some(_)) => "on".to_owned(),
+                Ok(None) => "off".to_owned(),
+                Err(error) => format!("off ({error:#})"),
             },
             stats.procedures,
             stats.sessions,
@@ -233,6 +238,62 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    struct Scratch {
+        server: Server,
+    }
+
+    impl Scratch {
+        fn with_corrupt_pack(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("trodden-mcp-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let home = Home::at(dir);
+            home.initialize().expect("home initializes");
+            std::fs::write(home.embeddings(), b"TRDEMB\x01\0short").expect("pack is writable");
+            Self {
+                server: Server {
+                    home,
+                    tool_router: Server::tool_router(),
+                },
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.server.home.dir());
+        }
+    }
+
+    #[test]
+    fn reports_a_corrupt_embedding_pack_in_explain_and_status() {
+        let scratch = Scratch::with_corrupt_pack("corrupt-pack");
+        let cwd = scratch.server.home.dir();
+
+        let explained = scratch
+            .server
+            .recall_text("Fix the crash in src/paginate.js", cwd, true)
+            .expect("recall succeeds without semantics");
+        let plain = scratch
+            .server
+            .recall_text("Fix the crash in src/paginate.js", cwd, false)
+            .expect("recall succeeds without semantics");
+        let status = scratch.server.status_text().expect("status reads");
+
+        let note: serde_json::Value =
+            serde_json::from_str(explained.lines().next().expect("explain output has lines"))
+                .expect("the note is JSON");
+        let error = note["semantic_error"]
+            .as_str()
+            .expect("the note has the error");
+        assert!(error.starts_with("load the embedding model: "), "{error}");
+        assert!(!plain.contains("semantic_error"), "{plain}");
+        assert!(
+            status.contains("semantic matching: off (load the embedding model: "),
+            "{status}"
+        );
+    }
 
     #[test]
     fn tools_reject_relative_working_directories() {
