@@ -65,6 +65,8 @@ impl Transcript {
 
     const PASTED: &str = "<pasted_content";
 
+    const SEPARATORS: &[char] = &['/', '\\'];
+
     const BOOKKEEPING_TOOLS: &[&str] = &[
         "TodoWrite",
         "TodoRead",
@@ -350,7 +352,7 @@ impl<'a> TraceBuilder<'a> {
             self.session.clone_from(&line.session_id);
         }
         if let Some(cwd) = &line.cwd {
-            let cwd = cwd.trim_end_matches('/');
+            let cwd = cwd.trim_end_matches(Transcript::SEPARATORS);
             if self.cwd.is_empty() {
                 cwd.clone_into(&mut self.cwd);
             }
@@ -559,7 +561,13 @@ impl<'a> TraceBuilder<'a> {
                 ToolAction::Edit
             }
             "Glob" | "Grep" => {
-                args.pattern = field("pattern").map(|p| self.redactor.redact(p).into_owned());
+                args.pattern = field("pattern").map(|p| {
+                    if name == "Glob" && Self::is_absolute(p) {
+                        self.relative(p)
+                    } else {
+                        self.redactor.redact(p).into_owned()
+                    }
+                });
                 args.path = field("path").map(|p| self.relative(p));
                 ToolAction::Search
             }
@@ -714,51 +722,112 @@ impl<'a> TraceBuilder<'a> {
     }
 
     fn relative(&self, path: &str) -> String {
-        if !self.cwd.is_empty() {
-            if path.trim_end_matches('/') == self.cwd {
-                return ".".to_owned();
+        let (base, rest) = if Self::is_absolute(path) {
+            match self.below(path) {
+                Some(rest) => ("", rest),
+                None => return self.redactor.redact(path).into_owned(),
             }
-            if let Some(relative) = path
-                .strip_prefix(&self.cwd)
-                .and_then(|rest| rest.strip_prefix('/'))
-            {
-                return relative.to_owned();
+        } else {
+            (self.subdirectory().unwrap_or_default(), path)
+        };
+        let separators = self.separators();
+        let parts = Self::normalized(base.split(separators).chain(rest.split(separators)));
+        let text = if parts.first() == Some(&"..") && !self.cwd.is_empty() {
+            let outside = self.outside(&parts);
+            match self.below(&outside) {
+                Some(rest) => Self::joined(&Self::normalized(rest.split(separators))),
+                None => outside,
             }
-        }
-        match self.subdirectory() {
-            Some(dir) if !path.starts_with(['/', '~']) => {
-                self.redactor.redact(&Self::joined(dir, path)).into_owned()
-            }
-            _ => self.redactor.redact(path).into_owned(),
-        }
+        } else {
+            Self::joined(&parts)
+        };
+        self.redactor.redact(&text).into_owned()
     }
 
-    fn subdirectory(&self) -> Option<&str> {
-        if self.cwd.is_empty() {
-            return None;
-        }
-        self.here
-            .strip_prefix(&self.cwd)?
-            .strip_prefix('/')
-            .filter(|dir| !dir.is_empty())
-    }
-
-    fn joined(dir: &str, path: &str) -> String {
-        let mut parts: Vec<&str> = dir.split('/').collect();
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." if parts.last().is_some_and(|last| *last != "..") => {
-                    parts.pop();
-                }
-                _ => parts.push(part),
-            }
-        }
+    fn joined(parts: &[&str]) -> String {
         if parts.is_empty() {
             ".".to_owned()
         } else {
             parts.join("/")
         }
+    }
+
+    fn outside(&self, parts: &[&str]) -> String {
+        let root = Self::root(&self.cwd);
+        let separator = if self.cwd.contains('\\') { "\\" } else { "/" };
+        let resolved = Self::normalized(
+            self.cwd[root.len()..]
+                .split(self.separators())
+                .chain(parts.iter().copied()),
+        );
+        let below_root: Vec<&str> = resolved
+            .into_iter()
+            .skip_while(|part| *part == "..")
+            .collect();
+        format!("{root}{}", below_root.join(separator))
+    }
+
+    fn below<'p>(&self, path: &'p str) -> Option<&'p str> {
+        if self.cwd.is_empty() {
+            return None;
+        }
+        let head = path.get(..self.cwd.len())?;
+        let same = if self.is_windows() {
+            head.chars().zip(self.cwd.chars()).all(|(a, b)| {
+                a.eq_ignore_ascii_case(&b)
+                    || (Transcript::SEPARATORS.contains(&a) && Transcript::SEPARATORS.contains(&b))
+            })
+        } else {
+            head == self.cwd
+        };
+        let rest = &path[self.cwd.len()..];
+        (same && (rest.is_empty() || rest.starts_with(self.separators())))
+            .then(|| rest.trim_start_matches(self.separators()))
+    }
+
+    fn subdirectory(&self) -> Option<&str> {
+        self.below(&self.here).filter(|dir| !dir.is_empty())
+    }
+
+    fn is_windows(&self) -> bool {
+        Self::has_drive(&self.cwd) || self.cwd.starts_with(r"\\")
+    }
+
+    fn separators(&self) -> &'static [char] {
+        if self.is_windows() {
+            Transcript::SEPARATORS
+        } else {
+            &Transcript::SEPARATORS[..1]
+        }
+    }
+
+    fn is_absolute(path: &str) -> bool {
+        path.starts_with(['~', '/', '\\'])
+            || (Self::has_drive(path) && path[2..].starts_with(Transcript::SEPARATORS))
+    }
+
+    fn has_drive(path: &str) -> bool {
+        matches!(path.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
+    }
+
+    fn root(path: &str) -> &str {
+        let drive = if Self::has_drive(path) { 2 } else { 0 };
+        let rest = path[drive..].trim_start_matches(Transcript::SEPARATORS);
+        &path[..path.len() - rest.len()]
+    }
+
+    fn normalized<'p>(parts: impl IntoIterator<Item = &'p str>) -> Vec<&'p str> {
+        let mut normalized = Vec::new();
+        for part in parts {
+            match part {
+                "" | "." => {}
+                ".." if normalized.last().is_some_and(|last| *last != "..") => {
+                    normalized.pop();
+                }
+                _ => normalized.push(part),
+            }
+        }
+        normalized
     }
 
     fn quoted(dir: &str) -> String {
@@ -970,6 +1039,13 @@ mod tests {
 
     impl Session {
         fn calls(steps: &[(&str, &str, Value)]) -> (Trace, Vec<ToolCall>) {
+            Self::calls_with(&Redactor::with_home("/home/dev"), steps)
+        }
+
+        fn calls_with(
+            redactor: &Redactor,
+            steps: &[(&str, &str, Value)],
+        ) -> (Trace, Vec<ToolCall>) {
             let text: String = steps
                 .iter()
                 .enumerate()
@@ -981,8 +1057,7 @@ mod tests {
                     format!("{line}\n")
                 })
                 .collect();
-            let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
-                .expect("valid transcript");
+            let trace = Transcript::parse(&text, redactor).expect("valid transcript");
             let calls = trace
                 .events
                 .iter()
@@ -1266,9 +1341,217 @@ mod tests {
                 "web/src",
                 "docs",
                 "web",
-                "../shared",
+                "/work/shared",
                 "web/src/paginate.js",
                 "src",
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_looking_names_inside_the_project_are_redacted() {
+        let key = ["sk", "live", "Zq8Lm3KpQ7vX2nB9wR4tY6uI"].join("_");
+        let file = format!("/work/app/config/{key}.json");
+        let (_, calls) = Session::calls(&[
+            ("/work/app", "Read", json!({"file_path": file})),
+            (
+                "/work/app/web",
+                "Read",
+                json!({"file_path": format!("../config/{key}.json")}),
+            ),
+            ("/work/app", "Edit", json!({"file_path": file})),
+        ]);
+        let edit = Session::resolved(
+            "Edit",
+            json!({"file_path": file}),
+            &Session::result(
+                "The file has been updated.",
+                false,
+                json!({"filePath": file, "originalFile": "{}\n",
+                       "structuredPatch": [{"oldStart": 1, "lines": ["-{}", "+{\"currency\": \"eur\"}"]}]}),
+            )
+            .to_string(),
+        );
+
+        for call in &calls {
+            assert_eq!(
+                call.args.path.as_deref(),
+                Some("config/[REDACTED:stripe-key].json")
+            );
+        }
+        assert_eq!(edit.changes[0].path, "config/[REDACTED:stripe-key].json");
+    }
+
+    #[test]
+    fn paths_leaving_the_project_are_resolved_redacted_and_home_folded() {
+        let key = ["sk", "live", "Zq8Lm3KpQ7vX2nB9wR4tY6uI"].join("_");
+        let (trace, calls) = Session::calls(&[
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": "../other-client/secret.txt"}),
+            ),
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": format!("../billing/{key}.json")}),
+            ),
+            (
+                "/home/dev/work/app/web",
+                "Grep",
+                json!({"pattern": "invoice", "path": "../../shared"}),
+            ),
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": "/home/dev/work/app/../other-client/notes.md"}),
+            ),
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": "../../../../../../etc/hosts"}),
+            ),
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": "/home/dev/work/application/README.md"}),
+            ),
+            (
+                "/home/dev/work/app",
+                "Read",
+                json!({"file_path": "src/../../app/src/invoice.rs"}),
+            ),
+        ]);
+        let paths: Vec<&str> = calls
+            .iter()
+            .map(|call| call.args.path.as_deref().expect("path argument"))
+            .collect();
+
+        assert_eq!(trace.cwd, "~/work/app");
+        assert_eq!(
+            paths,
+            [
+                "~/work/other-client/secret.txt",
+                "~/work/billing/[REDACTED:stripe-key].json",
+                "~/work/shared",
+                "~/work/other-client/notes.md",
+                "/etc/hosts",
+                "~/work/application/README.md",
+                "src/invoice.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn absolute_glob_patterns_are_relative_to_the_trace_root() {
+        let (_, calls) = Session::calls(&[
+            (
+                "/work/app",
+                "Glob",
+                json!({"pattern": "/work/app/src/**/*.rs"}),
+            ),
+            (
+                "/work/app/web",
+                "Glob",
+                json!({"pattern": "/work/app/web/src/**/*.ts", "path": "/work/app/web"}),
+            ),
+            ("/work/app", "Glob", json!({"pattern": "**/*.md"})),
+            (
+                "/work/app",
+                "Glob",
+                json!({"pattern": "/home/dev/notes/*.md"}),
+            ),
+            ("/work/app", "Grep", json!({"pattern": "/work/app/src"})),
+        ]);
+        let patterns: Vec<&str> = calls
+            .iter()
+            .map(|call| call.args.pattern.as_deref().expect("pattern argument"))
+            .collect();
+
+        assert_eq!(
+            patterns,
+            [
+                "src/**/*.rs",
+                "web/src/**/*.ts",
+                "**/*.md",
+                "~/notes/*.md",
+                "/work/app/src",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_paths_are_relative_and_home_folded() {
+        let redactor = Redactor::with_home(r"C:\Users\ada");
+        let (trace, calls) = Session::calls_with(
+            &redactor,
+            &[
+                (
+                    r"C:\Users\ada\shop\",
+                    "Read",
+                    json!({"file_path": r"C:\Users\ada\shop\src\cart.rs"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Read",
+                    json!({"file_path": r"c:\users\ada\shop\src\cart.rs"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Read",
+                    json!({"file_path": "C:/Users/ada/shop/src/cart.rs"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Read",
+                    json!({"file_path": r"C:\Users\ada\shop"}),
+                ),
+                (
+                    r"C:\Users\ada\shop\web",
+                    "Grep",
+                    json!({"pattern": "total", "path": r"src\lib"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Read",
+                    json!({"file_path": r"..\billing\notes.md"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Read",
+                    json!({"file_path": r"C:\Users\ada\shopping\list.md"}),
+                ),
+                (
+                    r"C:\Users\ada\shop",
+                    "Glob",
+                    json!({"pattern": r"C:\Users\ada\shop\src\**\*.rs"}),
+                ),
+            ],
+        );
+        let arguments: Vec<&str> = calls
+            .iter()
+            .map(|call| {
+                call.args
+                    .pattern
+                    .as_deref()
+                    .filter(|_| call.tool == "Glob")
+                    .or(call.args.path.as_deref())
+                    .expect("path or pattern argument")
+            })
+            .collect();
+
+        assert_eq!(trace.cwd, r"~\shop");
+        assert_eq!(
+            arguments,
+            [
+                "src/cart.rs",
+                "src/cart.rs",
+                "src/cart.rs",
+                ".",
+                "web/src/lib",
+                r"~\billing\notes.md",
+                r"~\shopping\list.md",
+                "src/**/*.rs",
             ]
         );
     }

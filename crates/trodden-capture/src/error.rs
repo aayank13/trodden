@@ -7,7 +7,7 @@ const MAX_CHARS: usize = 120;
 
 static PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^(?:Exception in thread "[^"]*"|Uncaught|(?P<path>(?:[^\s:()'"`]*/)?[^\s:()'"`/]+\.[A-Za-z0-9]+)(?:(?P<column>:\d+:\d+(?::| -)|\(\d+,\d+\):)|:\d+:))\s+"#,
+        r#"^(?:Exception in thread "[^"]*"|Uncaught|(?P<path>(?:[A-Za-z]:[/\\])?(?:[^\s:()'"`]*[/\\])?[^\s:()'"`/\\]+\.[A-Za-z0-9]+)(?:(?P<column>:\d+:\d+(?::| -)|\(\d+,\d+\):)|:\d+:))\s+"#,
     )
     .expect("location prefix pattern is valid")
 });
@@ -46,7 +46,10 @@ pub(crate) static ANSI: LazyLock<Regex> =
 
 static VOLATILE: LazyLock<[(Regex, &str); 4]> = LazyLock::new(|| {
     [
-        (r"(?:~|\.{0,2})/[^\s:'\x22`,)]+", "<path>"),
+        (
+            r"(?:\b[a-z]:[/\\]|\\\\|~[/\\]|\.{1,2}\\|\.{0,2}/)[^\s:'\x22`,)]+",
+            "<path>",
+        ),
         (r"\b0x[0-9a-fA-F]+\b", "<hex>"),
         (r"\b\d+\b", "N"),
         (r"\s+", " "),
@@ -298,6 +301,71 @@ mod tests {
             ),
             ErrorSignature::of(
                 "/home/ada/shop/src/lib/total.ts(88,13): error TS2322: Type 'string' is not assignable to type 'number'.",
+                &redactor()
+            ),
+        );
+    }
+
+    #[test]
+    fn windows_paths_leave_no_username_in_a_signature() {
+        let cases = [
+            (
+                r"Error: Cannot find module 'C:\Users\grace\shop\scripts\build.js'",
+                "error: cannot find module '<path>'",
+            ),
+            (
+                r"FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\grace\\shop\\cart.toml'",
+                "filenotfounderror: [errno N] no such file or directory: '<path>'",
+            ),
+            (
+                r"Error: ENOENT: no such file or directory, open 'd:/clients/grace/cart.json'",
+                "error: enoent: no such file or directory, open '<path>'",
+            ),
+            (
+                r"Error: Cannot find module '..\grace\build.js'",
+                "error: cannot find module '<path>'",
+            ),
+            (
+                r"Error: Cannot find module '\\fileserver\grace\build.js'",
+                "error: cannot find module '<path>'",
+            ),
+            (
+                r"SyntaxError: invalid escape sequence '\d'",
+                r"syntaxerror: invalid escape sequence '\d'",
+            ),
+            (
+                "Error: Cannot find module 'https://cdn.example.com/cart.js'",
+                "error: cannot find module 'https:<path>'",
+            ),
+        ];
+        for (output, signature) in cases {
+            assert_eq!(
+                ErrorSignature::of(output, &redactor()).as_deref(),
+                Some(signature),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_locations_give_the_same_signature() {
+        let at = |path: &str| {
+            ErrorSignature::of(
+                &format!("{path}:41:5: error: use of undeclared identifier 'totl'"),
+                &redactor(),
+            )
+        };
+
+        assert!(at("cart.c").is_some());
+        assert_eq!(at("cart.c"), at(r"C:\Users\grace\shop\src\cart.c"));
+        assert_eq!(at("cart.c"), at(r"src\cart.c"));
+        assert_eq!(
+            ErrorSignature::of(
+                "src/cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+                &redactor()
+            ),
+            ErrorSignature::of(
+                r"C:\Users\grace\shop\src\cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
                 &redactor()
             ),
         );
