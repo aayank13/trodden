@@ -14,7 +14,7 @@ use trodden_capture::{
     ErrorSignature,
     claude_code::{HookInput, Transcript},
 };
-use trodden_core::trace::{EventKind, ToolAction, ToolOutcome};
+use trodden_core::trace::{Event, EventKind, ToolAction, ToolOutcome};
 use trodden_extract::ProjectChecks;
 use trodden_recall::{Decision, Envelope, ErrorQuery, Match, Outcome, Query, Recall};
 use trodden_redact::Redactor;
@@ -147,6 +147,35 @@ impl Hook {
         })
     }
 
+    fn edited_since_check(events: &[Event], injected: Timestamp, check: &str) -> bool {
+        let turn = match events
+            .iter()
+            .rposition(|event| matches!(event.kind, EventKind::Prompt { .. }))
+        {
+            Some(start) if events[start].at > injected => return false,
+            Some(start) => &events[start..],
+            None => events,
+        };
+        let mut edited_since_check = false;
+        for event in turn.iter().filter(|event| event.at >= injected) {
+            let EventKind::ToolCall(call) = &event.kind else {
+                continue;
+            };
+            if call.action == ToolAction::Edit && call.outcome == ToolOutcome::Succeeded {
+                edited_since_check = true;
+            } else if call.action == ToolAction::Run
+                && call
+                    .args
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| ProjectChecks::same(command, check))
+            {
+                edited_since_check = false;
+            }
+        }
+        edited_since_check
+    }
+
     fn remind_to_verify(home: &Home, input: &HookInput) -> Result<()> {
         if input.stop_hook_active {
             return Ok(());
@@ -181,31 +210,8 @@ impl Hook {
         let text = std::fs::read_to_string(transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
         let trace = Transcript::parse(&text, &Redactor::new()).context("parse the transcript")?;
-        let turn = trace
-            .events
-            .iter()
-            .rposition(|event| matches!(event.kind, EventKind::Prompt { .. }))
-            .map_or(&trace.events[..], |start| &trace.events[start..]);
-        let mut edited_since_check = false;
-        for event in turn
-            .iter()
-            .filter(|event| event.at >= injected.injection.at)
-        {
-            let EventKind::ToolCall(call) = &event.kind else {
-                continue;
-            };
-            if call.action == ToolAction::Edit && call.outcome == ToolOutcome::Succeeded {
-                edited_since_check = true;
-            } else if call.action == ToolAction::Run
-                && call
-                    .args
-                    .command
-                    .as_deref()
-                    .is_some_and(|command| ProjectChecks::same(command, &check))
-            {
-                edited_since_check = false;
-            }
-        }
+        let edited_since_check =
+            Self::edited_since_check(&trace.events, injected.injection.at, &check);
         if edited_since_check {
             let reason = format!(
                 "Trodden: the procedure recalled for this task is checked with `{check}`, \
@@ -250,5 +256,140 @@ impl Hook {
         {
             let _ = writeln!(log, "{} {error:#}", Timestamp::now());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    const CWD: &str = "/home/dev/shop";
+
+    #[derive(Default)]
+    struct Session {
+        lines: Vec<Value>,
+    }
+
+    impl Session {
+        fn line(&mut self, at: &str, kind: &str, content: Value, result: Option<Value>) {
+            let mut line = json!({
+                "type": kind, "sessionId": "s", "cwd": CWD, "timestamp": at,
+                "message": {"role": kind, "content": content},
+            });
+            if let Some(result) = result {
+                line["toolUseResult"] = result;
+            }
+            self.lines.push(line);
+        }
+
+        fn prompt(mut self, at: &str, text: &str) -> Self {
+            self.line(at, "user", json!(text), None);
+            self
+        }
+
+        fn edit(mut self, at: &str, path: &str) -> Self {
+            let id = format!("call{}", self.lines.len());
+            let path = format!("{CWD}/{path}");
+            self.line(
+                at,
+                "assistant",
+                json!([{"type": "tool_use", "id": id, "name": "Edit", "input": {"file_path": path}}]),
+                None,
+            );
+            self.line(
+                at,
+                "user",
+                json!([{"type": "tool_result", "tool_use_id": id, "content": "updated"}]),
+                Some(json!({"filePath": path, "originalFile": "x\n",
+                            "structuredPatch": [{"oldStart": 1, "lines": ["-x", "+y"]}]})),
+            );
+            self
+        }
+
+        fn run(mut self, at: &str, command: &str) -> Self {
+            let id = format!("call{}", self.lines.len());
+            self.line(
+                at,
+                "assistant",
+                json!([{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]),
+                None,
+            );
+            self.line(
+                at,
+                "user",
+                json!([{"type": "tool_result", "tool_use_id": id, "content": "ok", "is_error": false}]),
+                None,
+            );
+            self
+        }
+
+        fn needs_check(&self, injected: &str) -> bool {
+            let text: String = self.lines.iter().map(|line| format!("{line}\n")).collect();
+            let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
+                .expect("valid transcript");
+            let injected = injected.parse().expect("valid timestamp");
+            Hook::edited_since_check(&trace.events, injected, "npm test")
+        }
+    }
+
+    #[test]
+    fn an_injection_from_an_earlier_turn_does_not_ask_for_its_check() {
+        let session = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/paginate.js")
+            .run("2026-09-21T14:00:09.000Z", "npm test")
+            .prompt("2026-09-21T14:05:00.000Z", "Reword the intro in README.md")
+            .edit("2026-09-21T14:05:04.000Z", "README.md");
+
+        assert!(!session.needs_check("2026-09-21T14:00:00.120Z"));
+    }
+
+    #[test]
+    fn an_injection_in_this_turn_asks_for_its_check_until_it_runs() {
+        let edited = Session::default()
+            .prompt("2026-09-21T14:00:00.000Z", "Reword the intro in README.md")
+            .edit("2026-09-21T14:00:04.000Z", "README.md")
+            .prompt(
+                "2026-09-21T14:05:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:05:05.000Z", "src/paginate.js");
+        let checked = Session::default()
+            .prompt(
+                "2026-09-21T14:05:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:05:05.000Z", "src/paginate.js")
+            .run("2026-09-21T14:05:09.000Z", "npm test");
+
+        assert!(edited.needs_check("2026-09-21T14:05:00.120Z"));
+        assert!(edited.needs_check("2026-09-21T14:05:00.000Z"));
+        assert!(!checked.needs_check("2026-09-21T14:05:00.120Z"));
+    }
+
+    #[test]
+    fn a_failure_injection_only_counts_edits_made_after_it() {
+        let failed = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/paginate.js")
+            .run("2026-09-21T14:00:09.000Z", "npm run build");
+        let fixed = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .run("2026-09-21T14:00:09.000Z", "npm run build")
+            .edit("2026-09-21T14:00:20.000Z", "src/paginate.js");
+
+        assert!(!failed.needs_check("2026-09-21T14:00:10.000Z"));
+        assert!(fixed.needs_check("2026-09-21T14:00:10.000Z"));
     }
 }
