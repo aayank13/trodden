@@ -42,6 +42,17 @@ impl Harness {
         }
     }
 
+    pub(crate) fn read(transcript: &Path) -> Result<String> {
+        let bytes =
+            fs::read(transcript).with_context(|| format!("read {}", transcript.display()))?;
+        Ok(Self::decode(bytes))
+    }
+
+    fn decode(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
+    }
+
     pub(crate) fn parse(self, text: &str, redactor: &Redactor) -> Result<(Trace, Option<PathBuf>)> {
         match self {
             Self::ClaudeCode => Ok((
@@ -114,5 +125,35 @@ mod tests {
         assert_eq!(Harness::ClaudeCode.as_str(), "claude-code");
         assert_eq!(Harness::from_name("future-agent"), None);
         assert_eq!(Harness::from_name("Claude-Code"), None);
+    }
+
+    #[test]
+    fn valid_transcripts_decode_unchanged() {
+        let text = "{\"cwd\":\"/home/dev/caf\u{e9}\"}\n";
+        assert_eq!(Harness::decode(text.as_bytes().to_vec()), text);
+    }
+
+    #[test]
+    fn invalid_bytes_only_spoil_their_own_line() {
+        let bytes = [
+            b"{\"type\":\"user\",\"note\":\"caf\xe9\"}\n".as_slice(),
+            b"{\"cwd\":\"/home/dev/shop\"}\n",
+            b"{\"cwd\":\"/home/dev/caf\xc3",
+        ]
+        .concat();
+        let text = Harness::decode(bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "{\"type\":\"user\",\"note\":\"caf\u{fffd}\"}",
+                "{\"cwd\":\"/home/dev/shop\"}",
+                "{\"cwd\":\"/home/dev/caf\u{fffd}",
+            ]
+        );
+        assert_eq!(
+            ClaudeCode::working_directory(&text),
+            Some(PathBuf::from("/home/dev/shop"))
+        );
     }
 }

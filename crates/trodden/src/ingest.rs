@@ -319,8 +319,7 @@ impl Ingest {
         transcript: &Path,
         ended: bool,
     ) -> Result<IngestReport> {
-        let text = fs::read_to_string(transcript)
-            .with_context(|| format!("read {}", transcript.display()))?;
+        let text = Harness::read(transcript)?;
         let (mut trace, cwd) = harness
             .parse(&text, &self.redactor)
             .with_context(|| format!("parse {}", transcript.display()))?;
@@ -568,6 +567,35 @@ mod tests {
             for line in lines {
                 writeln!(file, "{line}").expect("transcript line is written");
             }
+        }
+
+        fn append_damaged(&self, lines: &[Value]) {
+            let mut file = File::options()
+                .create(true)
+                .append(true)
+                .open(&self.transcript)
+                .expect("transcript is writable");
+            for line in lines {
+                let latin1 = line
+                    .to_string()
+                    .split('\u{e9}')
+                    .map(str::as_bytes)
+                    .collect::<Vec<_>>()
+                    .join(&0xe9);
+                file.write_all(&latin1)
+                    .and_then(|()| file.write_all(b"\n"))
+                    .expect("transcript line is written");
+            }
+        }
+
+        fn tear(&self) {
+            File::options()
+                .append(true)
+                .open(&self.transcript)
+                .and_then(|mut file| {
+                    file.write_all(b"{\"type\":\"assistant\",\"message\":{\"content\":\"caf\xc3")
+                })
+                .expect("torn line is written");
         }
 
         fn append_in(&self, cwd: &str, lines: &[Value]) {
@@ -911,6 +939,86 @@ mod tests {
                 .ends_with("has no usable working directory"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn transcripts_with_invalid_utf8_are_still_learned() {
+        let scratch = Scratch::new("invalid-utf8");
+        let mut ingest = scratch.ingest();
+        scratch.append_damaged(&task(
+            0,
+            "The cart total in src/caf\u{e9}.js ignores the discount code",
+            "src/cart.js",
+        ));
+        scratch.tear();
+        let report = ingest
+            .transcript(Harness::ClaudeCode, &scratch.transcript, true)
+            .expect("ingest a damaged transcript");
+        assert_eq!((report.sessions, report.tasks, report.created), (1, 1, 1));
+        let titles: Vec<_> = ingest
+            .store
+            .list(None, true)
+            .expect("procedures list")
+            .into_iter()
+            .map(|row| row.procedure.title)
+            .collect();
+        assert_eq!(
+            titles,
+            ["The cart total in src/caf\u{fffd}.js ignores the discount code"]
+        );
+    }
+
+    #[test]
+    fn idle_sessions_with_invalid_utf8_are_learned_before_ending() {
+        let scratch = Scratch::new("idle-invalid-utf8");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        ingest
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
+            .expect("ingest before the transcript is damaged");
+        scratch.tear();
+        scratch.go_idle();
+
+        let other = scratch.other_session(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        let swept = ingest
+            .transcript(Harness::ClaudeCode, &other, false)
+            .expect("ingest after the damaged session went idle");
+        assert_eq!((swept.sessions, swept.tasks, swept.created), (2, 1, 1));
+        assert!(Scratch::ended(&ingest));
+    }
+
+    #[test]
+    fn backfill_learns_transcripts_with_invalid_utf8() {
+        let scratch = Scratch::new("backfill-invalid-utf8");
+        let mut ingest = scratch.ingest();
+        scratch.append_damaged(&task(
+            0,
+            "The cart total in src/caf\u{e9}.js ignores the discount code",
+            "src/cart.js",
+        ));
+        scratch.append(&task(
+            5,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        scratch.tear();
+        let projects = scratch.dir.join("projects");
+        fs::create_dir_all(projects.join("shop")).expect("projects directory is writable");
+        fs::copy(&scratch.transcript, projects.join("shop/session.jsonl"))
+            .expect("transcript is copied");
+        let (report, failures) = ingest
+            .backfill(Harness::ClaudeCode, &projects)
+            .expect("backfill damaged history");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!((report.sessions, report.created), (1, 1));
     }
 
     #[test]
