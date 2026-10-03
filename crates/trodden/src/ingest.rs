@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -92,6 +92,7 @@ pub struct Ingest {
 
 impl Ingest {
     const IDLE_SECONDS: u64 = 30 * 60;
+    const IDLE_SESSIONS_PER_RUN: usize = 4;
 
     pub fn start(home: &Home) -> Result<Self> {
         let lock = File::create(home.ingest_lock()).context("create the ingest lock")?;
@@ -114,6 +115,36 @@ impl Ingest {
     const EMBEDDING_SCHEME: &str = "prompt-skeletons";
 
     pub fn claude_code(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
+        let mut report = self.session(transcript, ended)?;
+        report.absorb(self.finish_idle_sessions()?);
+        Ok(report)
+    }
+
+    fn finish_idle_sessions(&mut self) -> Result<IngestReport> {
+        let mut report = IngestReport::default();
+        if self.store.paused()? {
+            return Ok(report);
+        }
+        let idle: Vec<_> = self
+            .store
+            .open_sessions(HARNESS)?
+            .into_iter()
+            .map(|(session, transcript)| (session, PathBuf::from(transcript)))
+            .filter(|(_, transcript)| Self::is_idle(transcript) || !transcript.exists())
+            .take(Self::IDLE_SESSIONS_PER_RUN)
+            .collect();
+        for (session, transcript) in idle {
+            match self.session(&transcript, true) {
+                Ok(finished) => report.absorb(finished),
+                Err(_) => self
+                    .store
+                    .end_session(&session, &Timestamp::now().to_string())?,
+            }
+        }
+        Ok(report)
+    }
+
+    fn session(&mut self, transcript: &Path, ended: bool) -> Result<IngestReport> {
         let text = fs::read_to_string(transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
         let mut trace = Transcript::parse(&text, &self.redactor)
@@ -131,13 +162,16 @@ impl Ingest {
             .filter(|cwd| cwd.is_absolute())
             .with_context(|| format!("{} has no usable working directory", transcript.display()))?;
         let workspace = Workspace::resolve(&cwd, &self.store)?;
+        let recorded = path::absolute(transcript)
+            .with_context(|| format!("resolve {}", transcript.display()))?;
+        let recorded = recorded.to_string_lossy();
         let now = Timestamp::now();
         let stamp = now.to_string();
         if self.store.paused()? {
             self.store.set_progress(
                 &session,
                 HARNESS,
-                &transcript.to_string_lossy(),
+                &recorded,
                 Some(workspace.repo.as_str()),
                 Progress {
                     extracted_through: last_seq.max(already),
@@ -214,7 +248,7 @@ impl Ingest {
         self.store.set_progress(
             &session,
             HARNESS,
-            &transcript.to_string_lossy(),
+            &recorded,
             Some(workspace.repo.as_str()),
             Progress {
                 extracted_through: if ended {
@@ -262,7 +296,7 @@ impl Ingest {
         let mut report = IngestReport::default();
         let mut failures = Vec::new();
         for transcript in transcripts {
-            match self.claude_code(&transcript, false) {
+            match self.session(&transcript, false) {
                 Ok(one) => report.absorb(one),
                 Err(error) => failures.push((transcript, format!("{error:#}"))),
             }
@@ -329,6 +363,7 @@ mod tests {
     use super::*;
 
     const SESSION: &str = "0f6c1c4e-2f3a-4b8e-9d1a-5b2c3d4e5f60";
+    const OTHER_SESSION: &str = "1a7d2d5f-3a4b-4c9f-8e2b-6c3d4e5f6a71";
     const CWD: &str = "/home/dev/shop";
 
     struct Scratch {
@@ -371,6 +406,35 @@ mod tests {
                 })
                 .collect();
             self.append(&moved);
+        }
+
+        fn other_session(&self, lines: &[Value]) -> PathBuf {
+            let transcript = self.dir.join("other.jsonl");
+            let text: String = lines
+                .iter()
+                .map(|line| format!("{}\n", line.to_string().replace(SESSION, OTHER_SESSION)))
+                .collect();
+            fs::write(&transcript, text).expect("transcript is writable");
+            transcript
+        }
+
+        fn go_idle(&self) {
+            let long_ago = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(Ingest::IDLE_SECONDS + 60);
+            File::options()
+                .write(true)
+                .open(&self.transcript)
+                .and_then(|file| file.set_modified(long_ago))
+                .expect("transcript mtime is set");
+        }
+
+        fn ended(ingest: &Ingest) -> bool {
+            ingest
+                .store
+                .progress(SESSION)
+                .expect("progress reads")
+                .expect("session is recorded")
+                .ended
         }
 
         fn stored(&self) -> String {
@@ -711,5 +775,216 @@ mod tests {
             .expect("backfill after resuming capture");
         assert!(failures.is_empty());
         assert_eq!((resumed.sessions, resumed.created), (1, 1));
+    }
+
+    #[test]
+    fn idle_sessions_that_never_ended_are_finished_by_later_ingests() {
+        let scratch = Scratch::new("never-ended");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let crashed = ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest before the crash");
+        assert_eq!((crashed.sessions, crashed.tasks), (1, 0));
+
+        let other = scratch.other_session(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        let active = ingest
+            .claude_code(&other, false)
+            .expect("ingest while the crashed session is recent");
+        assert_eq!((active.sessions, active.tasks), (1, 0));
+        assert!(!Scratch::ended(&ingest));
+
+        scratch.go_idle();
+        let swept = ingest
+            .claude_code(&other, false)
+            .expect("ingest after the crashed session went idle");
+        assert_eq!((swept.sessions, swept.tasks, swept.created), (2, 1, 1));
+        assert!(Scratch::ended(&ingest));
+        let titles: Vec<_> = ingest
+            .store
+            .list(None, true)
+            .expect("procedures list")
+            .into_iter()
+            .map(|row| row.procedure.title)
+            .collect();
+        assert_eq!(
+            titles,
+            ["Page 2 in src/paginate.js repeats the last product from page 1"]
+        );
+
+        let again = ingest
+            .claude_code(&other, false)
+            .expect("ingest with nothing idle");
+        assert_eq!((again.sessions, again.tasks), (1, 0));
+    }
+
+    #[test]
+    fn idle_sessions_are_left_alone_while_paused() {
+        let scratch = Scratch::new("never-ended-paused");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest before the crash");
+        scratch.go_idle();
+        let other = scratch.other_session(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+
+        ingest.store.set_paused(true).expect("capture pauses");
+        let paused = ingest
+            .claude_code(&other, false)
+            .expect("ingest while paused");
+        assert_eq!(paused, IngestReport::default());
+        assert!(!Scratch::ended(&ingest));
+
+        ingest.store.set_paused(false).expect("capture resumes");
+        let resumed = ingest
+            .claude_code(&other, false)
+            .expect("ingest after resuming capture");
+        assert_eq!((resumed.tasks, resumed.created), (1, 1));
+        assert!(Scratch::ended(&ingest));
+    }
+
+    #[test]
+    fn sessions_whose_transcript_is_gone_are_ended() {
+        let scratch = Scratch::new("never-ended-gone");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        ingest
+            .claude_code(&scratch.transcript, false)
+            .expect("ingest before the crash");
+        fs::remove_file(&scratch.transcript).expect("transcript is removed");
+
+        let other = scratch.other_session(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+        let report = ingest
+            .claude_code(&other, false)
+            .expect("ingest after the transcript is gone");
+        assert_eq!((report.sessions, report.tasks), (1, 0));
+        assert!(Scratch::ended(&ingest));
+        assert_eq!(
+            ingest
+                .store
+                .open_sessions(HARNESS)
+                .expect("open sessions list"),
+            [(
+                OTHER_SESSION.to_owned(),
+                other.to_string_lossy().into_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn each_ingest_finishes_a_bounded_number_of_idle_sessions() {
+        let scratch = Scratch::new("never-ended-bounded");
+        let mut ingest = scratch.ingest();
+        let stamp = Timestamp::now().to_string();
+        for index in 0..=Ingest::IDLE_SESSIONS_PER_RUN {
+            ingest
+                .store
+                .set_progress(
+                    &format!("gone-{index}"),
+                    HARNESS,
+                    &scratch
+                        .dir
+                        .join(format!("gone-{index}.jsonl"))
+                        .to_string_lossy(),
+                    None,
+                    Progress {
+                        extracted_through: None,
+                        ended: false,
+                    },
+                    &stamp,
+                )
+                .expect("progress saves");
+        }
+        let other = scratch.other_session(&task(
+            5,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+
+        ingest.claude_code(&other, false).expect("first ingest");
+        assert_eq!(
+            ingest
+                .store
+                .open_sessions(HARNESS)
+                .expect("open sessions list")
+                .len(),
+            2
+        );
+        ingest.claude_code(&other, false).expect("second ingest");
+        assert_eq!(
+            ingest
+                .store
+                .open_sessions(HARNESS)
+                .expect("open sessions list")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn relative_transcripts_are_recorded_by_absolute_path() {
+        let scratch = Scratch::new("relative-transcript");
+        let mut ingest = scratch.ingest();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let relative: PathBuf = std::env::current_dir()
+            .expect("current directory is known")
+            .components()
+            .skip(1)
+            .map(|_| Path::new(".."))
+            .chain(
+                scratch
+                    .transcript
+                    .components()
+                    .skip(1)
+                    .map(|part| Path::new(part.as_os_str())),
+            )
+            .collect();
+        assert!(relative.is_relative());
+        ingest
+            .claude_code(&relative, false)
+            .expect("ingest by relative path");
+
+        let open = ingest
+            .store
+            .open_sessions(HARNESS)
+            .expect("open sessions list");
+        let [(session, recorded)] = open.as_slice() else {
+            panic!("one open session: {open:?}");
+        };
+        assert_eq!(session, SESSION);
+        assert!(Path::new(recorded).is_absolute(), "{recorded}");
+        assert_eq!(
+            fs::canonicalize(recorded).expect("recorded transcript exists"),
+            fs::canonicalize(&scratch.transcript).expect("transcript exists")
+        );
     }
 }
