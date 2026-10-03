@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use trodden_core::{Procedure, procedure::Lifecycle};
 use trodden_learn::Evidence;
 
@@ -162,34 +162,74 @@ impl Store {
         task: u32,
         outcome: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE injections SET task = ?1, outcome = ?2 WHERE rowid = ?3",
-                params![task, outcome, record.rowid],
-            )
-            .context("settle an injection")?;
-        self.mark_used(
+        Self::write_settlement(&self.conn, record, Some(task), Some(outcome))
+    }
+
+    pub fn mark_used(&self, procedure: &str, revision: u32, at: Timestamp) -> Result<()> {
+        Self::write_used(&self.conn, procedure, revision, at)
+    }
+
+    pub fn settle_procedure(
+        &mut self,
+        procedure: &str,
+        settled: &[InjectionRecord],
+        states: &[(u32, Lifecycle)],
+        decide: impl FnOnce(&FamilyEvidence) -> Vec<(u32, Lifecycle)>,
+    ) -> Result<Vec<(u32, Lifecycle)>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start settling a procedure")?;
+        for record in settled {
+            Self::write_settlement(&tx, record, record.task, record.outcome.as_deref())?;
+        }
+        Self::write_outcomes(&tx, procedure)?;
+        Self::write_states(&tx, procedure, states)?;
+        let decided = decide(&Self::read_evidence(&tx, procedure)?);
+        Self::write_states(&tx, procedure, &decided)?;
+        if !states.is_empty() || !decided.is_empty() {
+            Self::reindex(&tx, procedure)?;
+        }
+        tx.commit().context("commit a procedure's settlement")?;
+        Ok(decided)
+    }
+
+    fn write_settlement(
+        conn: &Connection,
+        record: &InjectionRecord,
+        task: Option<u32>,
+        outcome: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE injections SET task = ?1, outcome = ?2 WHERE rowid = ?3",
+            params![task, outcome, record.rowid],
+        )
+        .context("settle an injection")?;
+        Self::write_used(
+            conn,
             &record.injection.procedure,
             record.injection.revision,
             record.injection.at,
         )
     }
 
-    pub fn mark_used(&self, procedure: &str, revision: u32, at: Timestamp) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE procedures SET used_at = max(coalesce(used_at, ''), ?1)
-                 WHERE id = ?2 AND revision = ?3",
-                params![at.to_string(), procedure, revision],
-            )
-            .context("mark a revision as used")?;
+    fn write_used(conn: &Connection, procedure: &str, revision: u32, at: Timestamp) -> Result<()> {
+        conn.execute(
+            "UPDATE procedures SET used_at = max(coalesce(used_at, ''), ?1)
+             WHERE id = ?2 AND revision = ?3",
+            params![at.to_string(), procedure, revision],
+        )
+        .context("mark a revision as used")?;
         Ok(())
     }
 
     pub fn family_evidence(&self, procedure: &str) -> Result<FamilyEvidence> {
+        Self::read_evidence(&self.conn, procedure)
+    }
+
+    fn read_evidence(conn: &Connection, procedure: &str) -> Result<FamilyEvidence> {
         let mut evidence = FamilyEvidence::default();
-        let mut revisions = self
-            .conn
+        let mut revisions = conn
             .prepare_cached(
                 "SELECT revision, state FROM procedures WHERE id = ?1 ORDER BY revision",
             )
@@ -206,8 +246,7 @@ impl Store {
                 .push((revision, Self::parse_state(&state), Evidence::default()));
         }
 
-        let mut counts = self
-            .conn
+        let mut counts = conn
             .prepare_cached(
                 "SELECT revision, holdout, outcome = 'succeeded', COUNT(*) FROM injections
                  WHERE procedure = ?1 AND outcome IN ('succeeded', 'failed')
@@ -251,6 +290,11 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start refreshing outcomes")?;
+        Self::write_outcomes(&tx, procedure)?;
+        tx.commit().context("commit outcomes")
+    }
+
+    fn write_outcomes(tx: &Transaction<'_>, procedure: &str) -> Result<()> {
         let rows: Vec<(i64, u32, String)> = {
             let mut statement = tx
                 .prepare("SELECT rowid, revision, document FROM procedures WHERE id = ?1")
@@ -308,8 +352,7 @@ impl Store {
             )
             .context("store a revision's outcomes")?;
         }
-        drop(counts);
-        tx.commit().context("commit outcomes")
+        Ok(())
     }
 
     pub fn outcome_summaries(&self) -> Result<Vec<OutcomeSummary>> {
@@ -375,6 +418,16 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start changing states")?;
+        Self::write_states(&tx, procedure, changes)?;
+        Self::reindex(&tx, procedure)?;
+        tx.commit().context("commit state changes")
+    }
+
+    fn write_states(
+        tx: &Transaction<'_>,
+        procedure: &str,
+        changes: &[(u32, Lifecycle)],
+    ) -> Result<()> {
         for (revision, state) in changes {
             let document: Option<(i64, String)> = tx
                 .query_row(
@@ -396,8 +449,7 @@ impl Store {
             )
             .context("change a revision's state")?;
         }
-        Self::reindex(&tx, procedure)?;
-        tx.commit().context("commit state changes")
+        Ok(())
     }
 
     pub fn retire(&mut self, procedure: &str) -> Result<usize> {
@@ -442,5 +494,64 @@ impl Store {
             })
         })
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_settlement_leaves_the_injection_for_the_next_run() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        store.upsert(&Procedure::example()).expect("stored");
+        store
+            .record_injection(&Injection {
+                session: "0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90".to_owned(),
+                procedure: "p_7f3a91c2".to_owned(),
+                revision: 1,
+                holdout: false,
+                cue: Cue::Prompt,
+                at: Timestamp::UNIX_EPOCH,
+            })
+            .expect("recorded");
+        let settled = [InjectionRecord {
+            task: Some(0),
+            outcome: Some("failed".to_owned()),
+            ..store.injections(None).expect("injections read").remove(0)
+        }];
+        let quarantine = |_: &FamilyEvidence| vec![(1, Lifecycle::Quarantined)];
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER disk_full BEFORE UPDATE OF document ON procedures
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )
+            .expect("trigger created");
+
+        let failed = store.settle_procedure("p_7f3a91c2", &settled, &[], quarantine);
+        assert!(failed.is_err());
+        let outcome = |store: &Store| store.injections(None).expect("read")[0].outcome.clone();
+        assert_eq!(outcome(&store), None);
+
+        store
+            .conn
+            .execute_batch("DROP TRIGGER disk_full")
+            .expect("trigger dropped");
+        let mut seen = Evidence::default();
+        store
+            .settle_procedure("p_7f3a91c2", &settled, &[], |family| {
+                seen = family.injected();
+                quarantine(family)
+            })
+            .expect("settles");
+
+        assert_eq!(seen, Evidence::new(0, 1));
+        assert_eq!(outcome(&store).as_deref(), Some("failed"));
+        let stored = &store.revisions("p_7f3a91c2").expect("revisions read")[0].procedure;
+        assert_eq!(
+            (stored.state, stored.outcomes.failures),
+            (Lifecycle::Quarantined, 1)
+        );
     }
 }

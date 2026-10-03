@@ -9,7 +9,7 @@ use trodden_core::{
 };
 use trodden_extract::TaskOutcome;
 use trodden_learn::{Aging, Policy, RevisionEvidence};
-use trodden_store::{Cue, InjectionRecord, Store};
+use trodden_store::{Cue, FamilyEvidence, InjectionRecord, Store};
 
 const PROMPT_WINDOW: SignedDuration = SignedDuration::from_mins(2);
 
@@ -33,25 +33,37 @@ impl Changes {
     pub(crate) fn any(&self) -> bool {
         *self != Self::default()
     }
+
+    fn count(&mut self, decided: &[(u32, Lifecycle)]) {
+        for (_, state) in decided {
+            match state {
+                Lifecycle::Quarantined => self.quarantined += 1,
+                Lifecycle::Active => self.promoted += 1,
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Learning<'a> {
     store: &'a mut Store,
+    settled: BTreeMap<String, Vec<InjectionRecord>>,
 }
 
 impl<'a> Learning<'a> {
     pub(crate) fn new(store: &'a mut Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            settled: BTreeMap::new(),
+        }
     }
 
     pub(crate) fn settle_injections(
-        &self,
+        &mut self,
         trace: &Trace,
         tasks: &[TaskSpan],
     ) -> Result<(usize, BTreeSet<String>)> {
-        let mut settled = 0;
-        let mut touched = BTreeSet::new();
         for record in self.store.injections(Some(trace.session.as_str()))? {
             if record.outcome.is_some() {
                 continue;
@@ -63,13 +75,18 @@ impl<'a> Learning<'a> {
                 .iter()
                 .find(|task| (task.first_seq..=task.last_seq).contains(&seq))
             {
-                self.store
-                    .settle_injection(&record, task.first_seq, task.outcome.as_str())?;
-                settled += 1;
-                touched.insert(record.injection.procedure.clone());
+                self.settled
+                    .entry(record.injection.procedure.clone())
+                    .or_default()
+                    .push(InjectionRecord {
+                        task: Some(task.first_seq),
+                        outcome: Some(task.outcome.as_str().to_owned()),
+                        ..record
+                    });
             }
         }
-        Ok((settled, touched))
+        let settled = self.settled.values().map(Vec::len).sum();
+        Ok((settled, self.settled.keys().cloned().collect()))
     }
 
     fn landing(events: &[Event], record: &InjectionRecord) -> Option<u32> {
@@ -93,28 +110,26 @@ impl<'a> Learning<'a> {
     pub(crate) fn settle(&mut self, procedures: &BTreeSet<String>) -> Result<Changes> {
         let mut changes = Changes::default();
         for procedure in procedures {
-            self.store.refresh_outcomes(procedure)?;
-            let family = self.store.family_evidence(procedure)?;
-            let revisions: Vec<RevisionEvidence> = family
-                .revisions
-                .iter()
-                .map(|(revision, state, evidence)| RevisionEvidence {
-                    revision: *revision,
-                    state: *state,
-                    evidence: *evidence,
-                })
-                .collect();
-            let settled = Policy::settle(&revisions, family.holdout);
-            for (_, state) in &settled {
-                match state {
-                    Lifecycle::Quarantined => changes.quarantined += 1,
-                    Lifecycle::Active => changes.promoted += 1,
-                    _ => {}
-                }
-            }
-            self.store.set_states(procedure, &settled)?;
+            let settled = self.settled.remove(procedure).unwrap_or_default();
+            let decided = self
+                .store
+                .settle_procedure(procedure, &settled, &[], Self::decide)?;
+            changes.count(&decided);
         }
         Ok(changes)
+    }
+
+    fn decide(family: &FamilyEvidence) -> Vec<(u32, Lifecycle)> {
+        let revisions: Vec<RevisionEvidence> = family
+            .revisions
+            .iter()
+            .map(|(revision, state, evidence)| RevisionEvidence {
+                revision: *revision,
+                state: *state,
+                evidence: *evidence,
+            })
+            .collect();
+        Policy::settle(&revisions, family.holdout)
     }
 
     pub(crate) fn age(&mut self, now: Timestamp) -> Result<Changes> {
@@ -129,14 +144,13 @@ impl<'a> Learning<'a> {
             }
         }
         let mut changes = Changes::default();
-        for (procedure, states) in &by_procedure {
-            changes.aged += states.len();
-            self.store.set_states(procedure, states)?;
+        for (procedure, aged) in &by_procedure {
+            let decided = self
+                .store
+                .settle_procedure(procedure, &[], aged, Self::decide)?;
+            changes.aged += aged.len();
+            changes.count(&decided);
         }
-        let touched: BTreeSet<String> = by_procedure.into_keys().collect();
-        let handovers = self.settle(&touched)?;
-        changes.promoted += handovers.promoted;
-        changes.quarantined += handovers.quarantined;
         Ok(changes)
     }
 }
@@ -146,7 +160,7 @@ mod tests {
     use std::path::Path;
 
     use rand::{RngExt, SeedableRng, rngs::SmallRng};
-    use trodden_core::{Procedure, SessionId, procedure::Step};
+    use trodden_core::{HarnessId, Procedure, SessionId, procedure::Step};
     use trodden_recall::{Decision, Query, Recall};
     use trodden_store::Injection;
 
@@ -277,6 +291,69 @@ mod tests {
         assert!(
             served.ends_with(&[None]),
             "quarantined procedures are not served"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_ingest_still_settles_the_policy_on_the_next_run() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        store.upsert(&procedure("teacher-1")).expect("stored");
+        let at: Timestamp = "2026-10-01T10:00:00Z".parse().expect("timestamp is valid");
+        let session = |round: usize| format!("session-{round}");
+        for round in 0..5 {
+            store
+                .record_injection(&Injection {
+                    session: session(round),
+                    procedure: "p_7f3a91c2".to_owned(),
+                    revision: 1,
+                    holdout: false,
+                    cue: Cue::Prompt,
+                    at,
+                })
+                .expect("recorded");
+        }
+        let trace = |round: usize| Trace {
+            session: SessionId::new(session(round)),
+            harness: HarnessId::new("claude-code"),
+            model: None,
+            cwd: "/".to_owned(),
+            commit: None,
+            started_at: at,
+            events: vec![Event {
+                seq: 0,
+                at,
+                kind: EventKind::Prompt {
+                    summary: PROMPT.to_owned(),
+                },
+            }],
+        };
+        let tasks = [TaskSpan {
+            first_seq: 0,
+            last_seq: 0,
+            outcome: TaskOutcome::Failed,
+        }];
+        for round in 0..4 {
+            let mut learning = Learning::new(&mut store);
+            let (_, touched) = learning
+                .settle_injections(&trace(round), &tasks)
+                .expect("injections match");
+            learning.settle(&touched).expect("settles");
+        }
+
+        Learning::new(&mut store)
+            .settle_injections(&trace(4), &tasks)
+            .expect("injections match");
+        let mut learning = Learning::new(&mut store);
+        let (settled, touched) = learning
+            .settle_injections(&trace(4), &tasks)
+            .expect("injections match");
+        let changes = learning.settle(&touched).expect("settles");
+
+        assert_eq!((settled, changes.quarantined), (1, 1));
+        let stored = &store.revisions("p_7f3a91c2").expect("revisions read")[0].procedure;
+        assert_eq!(
+            (stored.state, stored.outcomes.failures),
+            (Lifecycle::Quarantined, 5)
         );
     }
 
