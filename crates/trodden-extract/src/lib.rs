@@ -440,20 +440,24 @@ impl<'a> Builder<'a> {
                     path: target.clone(),
                 });
             }
-            let texts = step.command.iter().chain(step.target.iter());
-            for text in texts {
-                if text.contains("[REDACTED:") {
-                    return Err(Rejection::ContainsSecret);
-                }
-                if let Some(rule) = DangerLint::check(text) {
-                    return Err(Rejection::Dangerous {
-                        rule,
-                        command: text.clone(),
-                    });
-                }
+            for text in step.command.iter().chain(step.target.iter()) {
+                Self::lint(text)?;
             }
         }
         Ok(())
+    }
+
+    fn lint(text: &str) -> Result<(), Rejection> {
+        if text.contains("[REDACTED:") {
+            return Err(Rejection::ContainsSecret);
+        }
+        match DangerLint::check(text) {
+            Some(rule) => Err(Rejection::Dangerous {
+                rule,
+                command: text.to_owned(),
+            }),
+            None => Ok(()),
+        }
     }
 
     fn is_outside_project(path: &str) -> bool {
@@ -468,6 +472,9 @@ impl<'a> Builder<'a> {
             let (Some(command), false) = (failed.command(), failed.succeeded()) else {
                 continue;
             };
+            if Self::lint(command).is_err() {
+                continue;
+            }
             let later = &self.calls[index + 1..];
             if later
                 .iter()
@@ -483,8 +490,10 @@ impl<'a> Builder<'a> {
                     call.succeeded()
                         && call.command().is_some_and(|other| {
                             other != command
+                                && Self::lint(other).is_ok()
                                 && if not_found {
-                                    Self::arguments(other) == Self::arguments(command)
+                                    Self::tool(other)
+                                        .is_some_and(|tool| Some(tool) == Self::tool(command))
                                 } else {
                                     Verification::is_verify(other)
                                         && Verification::is_verify(command)
@@ -505,8 +514,25 @@ impl<'a> Builder<'a> {
         lines
     }
 
-    fn arguments(command: &str) -> &str {
-        command.split_once(' ').map_or("", |(_, rest)| rest)
+    fn tool(command: &str) -> Option<(String, Vec<String>)> {
+        let argv = Command::normalize(command, "").argv();
+        let (program, arguments) = argv.split_first()?;
+        let (program, arguments) = match arguments {
+            [flag, module, rest @ ..] if flag == "-m" && Self::base(program) == "python" => {
+                (module, rest)
+            }
+            _ => (program, arguments),
+        };
+        let base = Self::base(program);
+        (!base.is_empty()).then(|| (base.to_owned(), arguments.to_vec()))
+    }
+
+    fn base(program: &str) -> &str {
+        program
+            .rsplit('/')
+            .next()
+            .unwrap_or(program)
+            .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
     }
 
     fn procedure(
@@ -992,6 +1018,29 @@ mod tests {
             results.remove(0)
         }
 
+        fn avoided(failed: &str, exit_code: i32, later: &[&str]) -> Vec<String> {
+            later
+                .iter()
+                .fold(
+                    Self::new()
+                        .prompt("Fix the pagination bug in the catalog")
+                        .run(failed, exit_code),
+                    |sketch, command| sketch.run(command, 0),
+                )
+                .edit("src/paginate.py", &["paginate"])
+                .run("make test", 0)
+                .extract_one()
+                .expect("avoid lines never reject a verified task")
+                .avoid
+        }
+
+        fn lesson(failed: &str, exit_code: i32, replacement: Option<&str>) -> Vec<String> {
+            replacement
+                .into_iter()
+                .map(|worked| format!("`{failed}` failed (exit {exit_code}); `{worked}` worked"))
+                .collect()
+        }
+
         fn check_requirements(self, check: &str) -> Vec<String> {
             self.prompt("Fix the off-by-one in src/paginate.js")
                 .edit("src/paginate.js", &[])
@@ -1056,6 +1105,82 @@ mod tests {
                 "`node --test test/` failed (exit 1); `npm test` worked",
             ]
         );
+    }
+
+    #[test]
+    fn a_missing_program_is_replaced_only_by_the_same_tool() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("pytest", &["pwd"], None),
+            (
+                "pytest",
+                &["pwd", "python3 -m pytest"],
+                Some("python3 -m pytest"),
+            ),
+            ("pytest", &["uv run pytest"], Some("uv run pytest")),
+            (
+                "pytest -x tests/",
+                &["python -m pytest -x tests/"],
+                Some("python -m pytest -x tests/"),
+            ),
+            ("pytest -x tests/", &["python -m pytest"], None),
+            ("python", &["python3"], Some("python3")),
+            (
+                "python tools/gen_models.py",
+                &["python3.12 tools/gen_models.py"],
+                Some("python3.12 tools/gen_models.py"),
+            ),
+            (
+                "python tools/gen_models.py",
+                &["node tools/gen_models.py"],
+                None,
+            ),
+            (
+                "pip install -e .",
+                &["pip3 install -e ."],
+                Some("pip3 install -e ."),
+            ),
+            ("jest", &["npx jest"], Some("npx jest")),
+            ("jest", &["ls"], None),
+            ("rg TODO", &["grep TODO"], None),
+        ];
+        for (failed, later, replacement) in cases {
+            assert_eq!(
+                Sketch::avoided(failed, COMMAND_NOT_FOUND, later),
+                Sketch::lesson(failed, COMMAND_NOT_FOUND, *replacement),
+                "{failed} then {later:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn avoid_lines_skip_dangerous_and_secret_commands() {
+        let secret = "API_TOKEN=[REDACTED:assignment] pytest";
+        let cases: &[(&str, i32, &[&str], Option<&str>)] = &[
+            ("pytest", 1, &["sudo pytest"], None),
+            (
+                "pytest",
+                1,
+                &["sudo pytest", "python3 -m pytest"],
+                Some("python3 -m pytest"),
+            ),
+            ("pytest", COMMAND_NOT_FOUND, &["sudo pytest"], None),
+            ("pytest", 1, &[secret], None),
+            (secret, 1, &["pytest"], None),
+            ("sudo pytest", 1, &["pytest"], None),
+            (
+                "pytest",
+                1,
+                &["python3 -m pytest"],
+                Some("python3 -m pytest"),
+            ),
+        ];
+        for (failed, exit_code, later, replacement) in cases {
+            assert_eq!(
+                Sketch::avoided(failed, *exit_code, later),
+                Sketch::lesson(failed, *exit_code, *replacement),
+                "{failed} then {later:?}"
+            );
+        }
     }
 
     #[test]
