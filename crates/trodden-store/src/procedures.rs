@@ -428,16 +428,9 @@ impl Store {
             .collect::<Result<_, _>>()
             .context("read lexical matches")?;
 
-        let mut in_scope = self
-            .conn
-            .prepare("SELECT 1 FROM procedures WHERE rowid = ?1 AND state IN ('active', 'stale') AND (repo = ?2 OR repo = '')")
-            .context("prepare the scope check")?;
         let mut hits = Vec::with_capacity(limit);
         for hit in ranked {
-            if in_scope
-                .exists(params![hit.rowid, repo])
-                .context("check a match's scope")?
-            {
+            if self.is_recallable(hit.rowid, repo)? {
                 hits.push(hit);
                 if hits.len() == limit {
                     break;
@@ -445,6 +438,21 @@ impl Store {
             }
         }
         Ok(hits)
+    }
+
+    pub fn is_recallable(&self, rowid: i64, repo: &str) -> Result<bool> {
+        self.conn
+            .prepare_cached("SELECT 1 FROM procedures WHERE rowid = ?1 AND state IN ('active', 'stale') AND (repo = ?2 OR repo = '')")
+            .context("prepare the scope check")?
+            .exists(params![rowid, repo])
+            .context("check a match's scope")
+    }
+
+    pub fn recallable_procedure(&self, rowid: i64, repo: &str) -> Result<Option<ProcedureRow>> {
+        if !self.is_recallable(rowid, repo)? {
+            return Ok(None);
+        }
+        self.procedure(rowid)
     }
 
     pub fn procedure(&self, rowid: i64) -> Result<Option<ProcedureRow>> {
