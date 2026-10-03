@@ -1,6 +1,7 @@
 mod cli;
 mod hook;
 mod mcp;
+mod output;
 
 use std::{env, process::ExitCode};
 
