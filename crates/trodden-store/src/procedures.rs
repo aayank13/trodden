@@ -439,11 +439,16 @@ impl Store {
             .join(" OR ");
         let mut statement = self
             .conn
-            .prepare("SELECT rowid, -rank FROM procedures_fts WHERE procedures_fts MATCH ?1 ORDER BY rank LIMIT ?2")
+            .prepare(
+                "SELECT procedures_fts.rowid, -procedures_fts.rank FROM procedures_fts
+                 CROSS JOIN procedures p ON p.rowid = procedures_fts.rowid
+                 WHERE procedures_fts MATCH ?1 AND p.state IN ('active', 'stale') AND (p.repo = ?2 OR p.repo = '')
+                 ORDER BY procedures_fts.rank LIMIT ?3",
+            )
             .context("prepare the lexical search")?;
-        let overfetch = i64::try_from(limit.saturating_mul(5)).unwrap_or(i64::MAX);
-        let ranked: Vec<LexicalHit> = statement
-            .query_map(params![query, overfetch], |row| {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        statement
+            .query_map(params![query, repo, limit], |row| {
                 Ok(LexicalHit {
                     rowid: row.get(0)?,
                     score: row.get(1)?,
@@ -451,18 +456,7 @@ impl Store {
             })
             .context("search procedure text")?
             .collect::<Result<_, _>>()
-            .context("read lexical matches")?;
-
-        let mut hits = Vec::with_capacity(limit);
-        for hit in ranked {
-            if self.is_recallable(hit.rowid, repo)? {
-                hits.push(hit);
-                if hits.len() == limit {
-                    break;
-                }
-            }
-        }
-        Ok(hits)
+            .context("read lexical matches")
     }
 
     pub fn is_recallable(&self, rowid: i64, repo: &str) -> Result<bool> {
@@ -664,7 +658,7 @@ pub enum Forget<'a> {
 
 #[cfg(test)]
 mod tests {
-    use trodden_core::{SessionId, procedure::StepKind};
+    use trodden_core::{FamilyId, ProcedureId, RepoId, SessionId, procedure::StepKind};
     use trodden_learn::Evidence;
 
     use super::*;
@@ -673,6 +667,62 @@ mod tests {
     const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
 
     const SESSION: &str = "0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90";
+
+    const ELSEWHERE: &str = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d";
+
+    #[derive(Debug)]
+    struct Zebras(Store);
+
+    impl Zebras {
+        fn new() -> Self {
+            Self(Store::open_in_memory().expect("store opens"))
+        }
+
+        fn add(&mut self, name: &str, scope: Scope, title: &str) -> &mut Self {
+            let mut procedure = Procedure::example();
+            procedure.id = ProcedureId::new(format!("p_{name}"));
+            procedure.family = FamilyId::new(format!("f_{name}"));
+            procedure.scope = scope;
+            procedure.title = title.to_owned();
+            self.0.upsert(&procedure).expect("stored");
+            self
+        }
+
+        fn in_repo(repo: &str) -> Scope {
+            Scope::Repo {
+                repo: RepoId::new(repo),
+            }
+        }
+
+        fn crowd(&mut self, count: usize) -> &mut Self {
+            for n in 0..count {
+                self.add(
+                    &format!("crowd{n}"),
+                    Self::in_repo(ELSEWHERE),
+                    "Zebra zebra",
+                );
+            }
+            self
+        }
+
+        fn found(&self, limit: usize) -> Vec<String> {
+            self.0
+                .lexical_hits(&["zebra".to_owned()], REPO, limit)
+                .expect("text searched")
+                .into_iter()
+                .map(|hit| {
+                    self.0
+                        .procedure(hit.rowid)
+                        .expect("procedure reads")
+                        .expect("hit exists")
+                        .procedure
+                        .id
+                        .as_str()
+                        .to_owned()
+                })
+                .collect()
+        }
+    }
 
     fn relearned(state: Lifecycle, check: &str) -> (Upsert, Store) {
         let mut store = Store::open_in_memory().expect("store opens");
@@ -921,5 +971,46 @@ mod tests {
             assert_eq!(states(&store), [(1, Lifecycle::Active)], "`{check}`");
             assert!(recallable(&store), "`{check}`");
         }
+    }
+
+    #[test]
+    fn lexical_search_is_not_crowded_out_by_other_repositories() {
+        let mut zebras = Zebras::new();
+        zebras.crowd(60).add(
+            "here",
+            Zebras::in_repo(REPO),
+            "Render the zebra striped table rows",
+        );
+
+        assert_eq!(zebras.found(10), ["p_here"]);
+    }
+
+    #[test]
+    fn lexical_search_ranks_only_recallable_procedures() {
+        let mut zebras = Zebras::new();
+        zebras
+            .crowd(3)
+            .add("global", Scope::Global, "Zebra stripes")
+            .add(
+                "here",
+                Zebras::in_repo(REPO),
+                "Render the zebra striped table rows",
+            )
+            .add("archived", Zebras::in_repo(REPO), "Zebra zebra zebra")
+            .add("stale", Zebras::in_repo(REPO), "Zebra crossing")
+            .add("candidate", Zebras::in_repo(REPO), "Zebra zebra");
+        for (id, state) in [
+            ("p_archived", Lifecycle::Archived),
+            ("p_stale", Lifecycle::Stale),
+            ("p_candidate", Lifecycle::Candidate),
+        ] {
+            zebras
+                .0
+                .set_states(id, &[(1, state)])
+                .expect("state changes");
+        }
+
+        assert_eq!(zebras.found(10), ["p_global", "p_stale", "p_here"]);
+        assert_eq!(zebras.found(2), ["p_global", "p_stale"]);
     }
 }
