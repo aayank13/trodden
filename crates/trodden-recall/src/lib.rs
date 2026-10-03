@@ -16,7 +16,7 @@ use trodden_core::{
     Procedure,
     procedure::{Condition, Lifecycle},
 };
-use trodden_embed::Embedder;
+use trodden_embed::{Embedder, Embedding};
 use trodden_learn::{Evidence, Holdout, Policy};
 use trodden_store::{ProcedureRow, Store, Terms};
 
@@ -27,6 +27,8 @@ pub use kind::TaskKind;
 pub use skeleton::Skeleton;
 
 const STAGE_LIMIT: usize = 10;
+
+const SEMANTIC_OVERFETCH: usize = 5;
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 
@@ -192,7 +194,7 @@ impl<'a> Recall<'a> {
             .into_iter()
             .filter(|hit| hit.kind == "error")
         {
-            if let Some(row) = self.store.procedure(hit.rowid)? {
+            if let Some(row) = self.store.recallable_procedure(hit.rowid, query.repo)? {
                 candidates.push(Match {
                     row,
                     signals: Signals {
@@ -251,10 +253,10 @@ impl<'a> Recall<'a> {
                 .embed(Skeleton::of(prompt).as_str())
                 .context("embed the prompt")?
         {
-            for (rank, neighbor) in index
-                .search(&embedding, query.repo, STAGE_LIMIT)?
-                .into_iter()
-                .enumerate()
+            for (rank, neighbor) in
+                Self::recallable_neighbors(self.store, index, &embedding, query.repo)?
+                    .into_iter()
+                    .enumerate()
             {
                 let entry = signals.entry(neighbor.rowid).or_default();
                 entry.semantic = Some((rank, neighbor.cosine));
@@ -294,7 +296,7 @@ impl<'a> Recall<'a> {
         let requested = Artifacts::requested(prompt);
         let mut candidates = Vec::with_capacity(signals.len());
         for (rowid, mut signals) in signals {
-            if let Some(row) = self.store.procedure(rowid)? {
+            if let Some(row) = self.store.recallable_procedure(rowid, query.repo)? {
                 let trigger = &row.procedure.trigger;
                 signals.same_kind = query_kind
                     .zip(TaskKind::of(&trigger.text))
@@ -315,6 +317,24 @@ impl<'a> Recall<'a> {
                 .then(a.row.rowid.cmp(&b.row.rowid))
         });
         Ok(candidates)
+    }
+
+    fn recallable_neighbors(
+        store: &Store,
+        index: &mut VectorIndex,
+        embedding: &Embedding,
+        repo: &str,
+    ) -> Result<Vec<Neighbor>> {
+        let mut neighbors = Vec::with_capacity(STAGE_LIMIT);
+        for neighbor in index.search(embedding, repo, STAGE_LIMIT * SEMANTIC_OVERFETCH)? {
+            if store.is_recallable(neighbor.rowid, repo)? {
+                neighbors.push(neighbor);
+                if neighbors.len() == STAGE_LIMIT {
+                    break;
+                }
+            }
+        }
+        Ok(neighbors)
     }
 
     fn bounded(prompt: &str) -> &str {
@@ -365,7 +385,7 @@ impl<'a> Recall<'a> {
 
         let mut revisions = self.store.servable_revisions(id)?;
         if revisions.is_empty() {
-            revisions.push(best.row.clone());
+            return Ok(Decision::Abstain(Abstention::NoCandidates));
         }
         let mut first_failure = None;
         revisions.retain(
@@ -447,7 +467,10 @@ impl Preconditions {
 
 #[cfg(test)]
 mod tests {
-    use trodden_core::{FamilyId, Procedure, ProcedureId, procedure::Trigger};
+    use trodden_core::{
+        FamilyId, Procedure, ProcedureId, RepoId,
+        procedure::{Scope, Trigger},
+    };
     use trodden_embed::{DIMS, Embedding, Quantized};
 
     use super::*;
@@ -617,6 +640,112 @@ mod tests {
         ));
     }
 
+    #[derive(Debug)]
+    struct StaleIndex {
+        store: Store,
+        rowid: i64,
+    }
+
+    impl StaleIndex {
+        fn indexed() -> Self {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let mut procedure = Procedure::example();
+            procedure.preconditions.clear();
+            let rowid = store.upsert(&procedure).expect("procedure stores").rowid();
+            Self { store, rowid }
+        }
+
+        fn recall(&self, name: &str) -> Outcome {
+            let vectors = [(self.rowid, direction(&[(0, 1.0)]))];
+            Recall::new(&self.store, Some(semantic(name, &vectors)))
+                .seeded(7)
+                .recall(&Query {
+                    prompt: CRASH_PROMPT,
+                    repo: REPO,
+                    root: Path::new("."),
+                    session: None,
+                })
+                .expect("recall succeeds")
+        }
+    }
+
+    #[test]
+    fn abstains_on_a_procedure_that_left_recall_after_the_index_was_built() {
+        assert!(matches!(
+            StaleIndex::indexed().recall("stale-active").decision,
+            Decision::Inject(_)
+        ));
+        for state in [Lifecycle::Retired, Lifecycle::Quarantined] {
+            let mut stale = StaleIndex::indexed();
+            stale
+                .store
+                .set_states("p_7f3a91c2", &[(1, state)])
+                .expect("state changes");
+
+            let outcome = stale.recall(&format!("stale-{state:?}"));
+
+            assert_eq!(
+                outcome.decision,
+                Decision::Abstain(Abstention::NoCandidates),
+                "{state:?}"
+            );
+            assert!(outcome.candidates.is_empty(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn ignores_a_reused_rowid_that_now_belongs_to_another_repository() {
+        let mut stale = StaleIndex::indexed();
+        stale
+            .store
+            .forget(trodden_store::Forget::Procedure("p_7f3a91c2"))
+            .expect("procedure is forgotten");
+        let mut elsewhere = unrelated(0);
+        elsewhere.scope = Scope::Repo {
+            repo: RepoId::new("9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d"),
+        };
+        let reused = stale.store.upsert(&elsewhere).expect("procedure stores");
+        assert_eq!(reused.rowid(), stale.rowid);
+
+        let outcome = stale.recall("stale-elsewhere");
+
+        assert_eq!(
+            outcome.decision,
+            Decision::Abstain(Abstention::NoCandidates)
+        );
+        assert!(outcome.candidates.is_empty());
+    }
+
+    #[test]
+    fn never_serves_a_match_without_a_servable_revision() {
+        let mut stale = StaleIndex::indexed();
+        let row = stale
+            .store
+            .procedure(stale.rowid)
+            .expect("procedure reads")
+            .expect("procedure exists");
+        stale.store.retire("p_7f3a91c2").expect("procedure retires");
+        let retired = Match {
+            row,
+            signals: Signals {
+                semantic: Some((0, 1.0)),
+                cosine: Some(1.0),
+                ..Signals::default()
+            },
+        };
+        let place = Place {
+            root: Path::new("."),
+            session: None,
+        };
+
+        let decision = Recall::new(&stale.store, None)
+            .seeded(7)
+            .decide(place, &[retired])
+            .expect("decision succeeds");
+
+        assert_eq!(decision, Decision::Abstain(Abstention::NoCandidates));
+    }
+
     fn scored(rowid: i64, family: &str, fused: f64, exact: &[&str]) -> Match {
         let mut procedure = Procedure::example();
         procedure.id = ProcedureId::new(format!("p_{family}"));
@@ -636,7 +765,12 @@ mod tests {
     }
 
     fn gate(candidates: &[Match]) -> Decision {
-        let store = Store::open_in_memory().expect("in-memory store opens");
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for candidate in candidates {
+            store
+                .upsert(&candidate.row.procedure)
+                .expect("procedure stores");
+        }
         let place = Place {
             root: Path::new("."),
             session: None,
