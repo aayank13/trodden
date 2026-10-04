@@ -880,49 +880,25 @@ mod tests {
         assert!(Transcript::parse("not a transcript\n", &redactor).is_err());
     }
 
-    fn outcome(command: &str, output: &str, is_error: bool) -> ToolOutcome {
-        let lines = [
-            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
-                   "message": {"role": "user", "content": "Fix the paging bug"}}),
-            json!({"type": "assistant", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:12Z",
-                   "message": {"role": "assistant", "content": [
-                       {"type": "tool_use", "id": "run", "name": "Bash", "input": {"command": command}}]}}),
-            json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:13Z",
-                   "message": {"role": "user", "content": [
-                       {"type": "tool_result", "tool_use_id": "run", "content": output, "is_error": is_error}]}}),
-        ];
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        let trace =
-            Transcript::parse(&text, &Redactor::with_home("/home/dev")).expect("valid transcript");
-        trace
-            .events
-            .into_iter()
-            .find_map(|event| match event.kind {
-                EventKind::ToolCall(call) => Some(call.outcome),
-                _ => None,
-            })
-            .expect("one tool call")
-    }
-
     #[test]
     fn piped_checks_are_judged_by_their_own_summary() {
         let failing = "running 3 tests\ntest paging ... FAILED\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored";
         let passing = "running 3 tests\n\ntest result: ok. 3 passed; 0 failed; 0 ignored";
 
         assert_eq!(
-            outcome("cargo test 2>&1 | tail -20", failing, false),
+            Session::outcome("cargo test 2>&1 | tail -20", failing, false),
             ToolOutcome::Failed { exit_code: None }
         );
         assert_eq!(
-            outcome("cargo test || true", failing, false),
+            Session::outcome("cargo test || true", failing, false),
             ToolOutcome::Failed { exit_code: None }
         );
         assert_eq!(
-            outcome("cargo test 2>&1 | grep -i failed", passing, true),
+            Session::outcome("cargo test 2>&1 | grep -i failed", passing, true),
             ToolOutcome::Succeeded
         );
         assert_eq!(
-            outcome("cargo test 2>&1 | tail -20", passing, false),
+            Session::outcome("cargo test 2>&1 | tail -20", passing, false),
             ToolOutcome::Succeeded
         );
     }
@@ -930,7 +906,7 @@ mod tests {
     #[test]
     fn plain_commands_keep_their_exit_code() {
         assert_eq!(
-            outcome(
+            Session::outcome(
                 "cargo test",
                 "test result: FAILED. 2 passed; 1 failed",
                 false
@@ -938,7 +914,7 @@ mod tests {
             ToolOutcome::Succeeded
         );
         assert_eq!(
-            outcome(
+            Session::outcome(
                 "cargo build && cargo test",
                 "Exit code 101\ntest result: ok. 3 passed",
                 true
@@ -948,28 +924,9 @@ mod tests {
             }
         );
         assert_eq!(
-            outcome("npm run build | tee build.log", "built in 2.1s", false),
+            Session::outcome("npm run build | tee build.log", "built in 2.1s", false),
             ToolOutcome::Succeeded
         );
-    }
-
-    fn summary(prompt: &str) -> String {
-        let line = json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
-                          "message": {"role": "user", "content": prompt}});
-        let trace = Transcript::parse(&format!("{line}\n"), &Redactor::with_home("/home/dev"))
-            .expect("valid transcript");
-        trace
-            .events
-            .into_iter()
-            .find_map(|event| match event.kind {
-                EventKind::Prompt { summary } => Some(summary),
-                _ => None,
-            })
-            .expect("one prompt")
-    }
-
-    fn anthropic_key() -> String {
-        ["sk", "ant", "api03", "Ab3Zq8Lm3KpQ7vX2nB9wR4tY6uI1oP5aS0dF"].join("-")
     }
 
     #[test]
@@ -977,16 +934,16 @@ mod tests {
         let lead = format!("Deploy the billing worker to staging {}", "x".repeat(148));
         let prompt = format!(
             "{lead} {} then report back\nand nothing else",
-            anthropic_key()
+            Secret::anthropic_key()
         );
 
-        assert_eq!(summary(&prompt), lead);
+        assert_eq!(Session::summary(&prompt), lead);
     }
 
     #[test]
     fn summaries_keep_whole_markers_or_none() {
         let secrets = [
-            anthropic_key(),
+            Secret::anthropic_key(),
             ["AKIA", "IOSFODNN7EXAMPLE"].concat(),
             ["ghp", "R4tY6uI1oP5aS0dFAb3Zq8Lm3KpQ7vX2nB9w"].join("_"),
             "API_KEY=4f9a1c2e8b7d6a5f3e2c1b0a9d8e7f6c".to_owned(),
@@ -997,7 +954,7 @@ mod tests {
             for lead in 150..=Transcript::SUMMARY_CHARS {
                 let prompt = format!("{} {secret} to deploy staging", "x".repeat(lead));
                 let redacted = redactor.redact(&prompt);
-                let summary = summary(&prompt);
+                let summary = Session::summary(&prompt);
                 let markers = summary.matches(Transcript::REDACTED).count();
 
                 assert!(redacted.contains(Transcript::REDACTED), "{secret}");
@@ -1014,11 +971,11 @@ mod tests {
         let value = "a".repeat(Transcript::SUMMARY_SOURCE_BYTES - 41);
         let prompt = format!(
             "Deploy with TOKEN={value} and use {} for the smoke test",
-            anthropic_key()
+            Secret::anthropic_key()
         );
 
         assert_eq!(
-            summary(&prompt),
+            Session::summary(&prompt),
             "Deploy with TOKEN=[REDACTED:assignment] and use"
         );
     }
@@ -1035,9 +992,57 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct Secret;
+
+    impl Secret {
+        fn anthropic_key() -> String {
+            ["sk", "ant", "api03", "Ab3Zq8Lm3KpQ7vX2nB9wR4tY6uI1oP5aS0dF"].join("-")
+        }
+    }
+
+    #[derive(Debug)]
     struct Session;
 
     impl Session {
+        fn outcome(command: &str, output: &str, is_error: bool) -> ToolOutcome {
+            let lines = [
+                json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                       "message": {"role": "user", "content": "Fix the paging bug"}}),
+                json!({"type": "assistant", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:12Z",
+                       "message": {"role": "assistant", "content": [
+                           {"type": "tool_use", "id": "run", "name": "Bash", "input": {"command": command}}]}}),
+                json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:13Z",
+                       "message": {"role": "user", "content": [
+                           {"type": "tool_result", "tool_use_id": "run", "content": output, "is_error": is_error}]}}),
+            ];
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            let trace = Transcript::parse(&text, &Redactor::with_home("/home/dev"))
+                .expect("valid transcript");
+            trace
+                .events
+                .into_iter()
+                .find_map(|event| match event.kind {
+                    EventKind::ToolCall(call) => Some(call.outcome),
+                    _ => None,
+                })
+                .expect("one tool call")
+        }
+
+        fn summary(prompt: &str) -> String {
+            let line = json!({"type": "user", "sessionId": "s", "cwd": "/work/app", "timestamp": "2026-09-21T14:02:11Z",
+                              "message": {"role": "user", "content": prompt}});
+            let trace = Transcript::parse(&format!("{line}\n"), &Redactor::with_home("/home/dev"))
+                .expect("valid transcript");
+            trace
+                .events
+                .into_iter()
+                .find_map(|event| match event.kind {
+                    EventKind::Prompt { summary } => Some(summary),
+                    _ => None,
+                })
+                .expect("one prompt")
+        }
+
         fn calls(steps: &[(&str, &str, Value)]) -> (Trace, Vec<ToolCall>) {
             Self::calls_with(&Redactor::with_home("/home/dev"), steps)
         }
@@ -1151,7 +1156,7 @@ mod tests {
         ];
         for prompt in cases {
             assert_eq!(
-                summary(prompt),
+                Session::summary(prompt),
                 "Fix this crash in the invoice total",
                 "{prompt}"
             );
@@ -1174,20 +1179,20 @@ mod tests {
             (
                 format!(
                     "<pasted_content id=\"a1\">\n{lead} {} then report back\n</pasted_content id=\"a1\">",
-                    anthropic_key()
+                    Secret::anthropic_key()
                 ),
                 lead,
             ),
             (
                 format!(
                     "<pasted_content id=\"a1\">\nexport KEY={}\n</pasted_content id=\"a1\">",
-                    anthropic_key()
+                    Secret::anthropic_key()
                 ),
                 "export KEY=[REDACTED:llm-api-key]".to_owned(),
             ),
         ];
         for (prompt, expected) in cases {
-            assert_eq!(summary(&prompt), expected, "{prompt}");
+            assert_eq!(Session::summary(&prompt), expected, "{prompt}");
         }
     }
 

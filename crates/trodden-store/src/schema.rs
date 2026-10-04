@@ -121,7 +121,7 @@ const MIGRATIONS: &[&str] = &[
 
 impl Store {
     pub(crate) fn is_current(&self) -> Result<bool> {
-        Ok(applied_migrations(&self.conn)? == MIGRATIONS.len())
+        Ok(Self::applied_migrations(&self.conn)? == MIGRATIONS.len())
     }
 
     pub(crate) fn migrate(&mut self) -> Result<()> {
@@ -132,7 +132,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("lock the database for migration")?;
-        let applied = applied_migrations(&tx)?;
+        let applied = Self::applied_migrations(&tx)?;
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(applied) {
             tx.execute_batch(migration)
                 .with_context(|| format!("migrate the schema to version {}", index + 1))?;
@@ -142,21 +142,21 @@ impl Store {
             .context("record the schema version")?;
         tx.commit().context("commit the migration")
     }
-}
 
-fn applied_migrations(conn: &Connection) -> Result<usize> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("read the schema version")?;
-    let applied = usize::try_from(version).context("read a valid schema version")?;
-    if applied > MIGRATIONS.len() {
-        bail!(
-            "this database was created by a newer version of trodden (schema version {applied}, \
-             this build knows up to {}); upgrade trodden to open it",
-            MIGRATIONS.len()
-        );
+    fn applied_migrations(conn: &Connection) -> Result<usize> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("read the schema version")?;
+        let applied = usize::try_from(version).context("read a valid schema version")?;
+        if applied > MIGRATIONS.len() {
+            bail!(
+                "this database was created by a newer version of trodden (schema version {applied}, \
+                 this build knows up to {}); upgrade trodden to open it",
+                MIGRATIONS.len()
+            );
+        }
+        Ok(applied)
     }
-    Ok(applied)
 }
 
 #[cfg(test)]
@@ -172,23 +172,28 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("trodden-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch directory is writable");
-        dir
-    }
+    #[derive(Debug)]
+    struct Databases;
 
-    fn version(store: &Store) -> i64 {
-        store
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("schema version reads")
+    impl Databases {
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("trodden-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch directory is writable");
+            dir
+        }
+
+        fn version(store: &Store) -> i64 {
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("schema version reads")
+        }
     }
 
     #[test]
     fn concurrent_opens_of_a_fresh_database_all_succeed() {
-        let dir = scratch("concurrent-opens");
+        let dir = Databases::scratch("concurrent-opens");
         for round in 0..40 {
             let path = dir.join(format!("{round}.db"));
             let barrier = Arc::new(Barrier::new(8));
@@ -198,7 +203,7 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     thread::spawn(move || {
                         barrier.wait();
-                        Store::open(&path, Patience::Batch).map(|store| version(&store))
+                        Store::open(&path, Patience::Batch).map(|store| Databases::version(&store))
                     })
                 })
                 .collect();
@@ -216,7 +221,7 @@ mod tests {
 
     #[test]
     fn a_database_from_a_newer_version_is_refused() {
-        let dir = scratch("newer-version");
+        let dir = Databases::scratch("newer-version");
         let path = dir.join("trodden.db");
         let store = Store::open(&path, Patience::Batch).expect("store opens");
         store

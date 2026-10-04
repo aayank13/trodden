@@ -310,42 +310,47 @@ mod tests {
         "no, I meant the staging config",
     ];
 
-    fn trace(prompts: &[&str]) -> Trace {
-        let events = prompts
-            .iter()
-            .enumerate()
-            .map(|(seq, prompt)| Event {
-                seq: u32::try_from(seq).expect("traces are small"),
-                at: Timestamp::UNIX_EPOCH,
-                kind: EventKind::Prompt {
-                    summary: (*prompt).to_owned(),
-                },
-            })
-            .collect();
-        Trace {
-            session: SessionId::new("0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90"),
-            harness: HarnessId::new("claude-code"),
-            model: None,
-            cwd: "/work/catalog".to_owned(),
-            commit: None,
-            started_at: Timestamp::UNIX_EPOCH,
-            events,
-        }
-    }
+    #[derive(Debug)]
+    struct Conversation;
 
-    fn split<'a>(prompts: &[&'a str]) -> Vec<(&'a str, u32, u32)> {
-        let trace = trace(prompts);
-        Task::split(&trace)
-            .iter()
-            .map(|task| {
-                let summary = prompts
-                    .iter()
-                    .copied()
-                    .find(|prompt| *prompt == task.summary)
-                    .expect("summaries come from prompts");
-                (summary, task.first_seq(), task.last_seq())
-            })
-            .collect()
+    impl Conversation {
+        fn trace(prompts: &[&str]) -> Trace {
+            let events = prompts
+                .iter()
+                .enumerate()
+                .map(|(seq, prompt)| Event {
+                    seq: u32::try_from(seq).expect("traces are small"),
+                    at: Timestamp::UNIX_EPOCH,
+                    kind: EventKind::Prompt {
+                        summary: (*prompt).to_owned(),
+                    },
+                })
+                .collect();
+            Trace {
+                session: SessionId::new("0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90"),
+                harness: HarnessId::new("claude-code"),
+                model: None,
+                cwd: "/work/catalog".to_owned(),
+                commit: None,
+                started_at: Timestamp::UNIX_EPOCH,
+                events,
+            }
+        }
+
+        fn split<'a>(prompts: &[&'a str]) -> Vec<(&'a str, u32, u32)> {
+            let trace = Self::trace(prompts);
+            Task::split(&trace)
+                .iter()
+                .map(|task| {
+                    let summary = prompts
+                        .iter()
+                        .copied()
+                        .find(|prompt| *prompt == task.summary)
+                        .expect("summaries come from prompts");
+                    (summary, task.first_seq(), task.last_seq())
+                })
+                .collect()
+        }
     }
 
     #[test]
@@ -375,7 +380,7 @@ mod tests {
     #[test]
     fn unrelated_short_and_acknowledged_prompts_start_their_own_tasks() {
         assert_eq!(
-            split(&[
+            Conversation::split(&[
                 "Page 2 in src/paginate.js repeats the last product from page 1",
                 "add dark mode",
                 "Okay, next: implement CSV export",
@@ -397,7 +402,7 @@ mod tests {
     #[test]
     fn follow_ups_join_the_current_task() {
         assert_eq!(
-            split(&[
+            Conversation::split(&[
                 "Page 2 in src/paginate.js repeats the last product from page 1",
                 "still failing",
                 "ok do it",
@@ -418,13 +423,16 @@ mod tests {
 
     #[test]
     fn bare_follow_ups_never_name_a_task() {
-        assert_eq!(split(&["continue", "yes", "still failing"]), []);
         assert_eq!(
-            split(&["continue", "same error", "add dark mode", "try again"]),
+            Conversation::split(&["continue", "yes", "still failing"]),
+            []
+        );
+        assert_eq!(
+            Conversation::split(&["continue", "same error", "add dark mode", "try again"]),
             [("add dark mode", 2, 3)]
         );
         assert_eq!(
-            split(&[
+            Conversation::split(&[
                 "it crashes when I upload a PNG larger than 5MB",
                 "still failing"
             ]),

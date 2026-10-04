@@ -48,7 +48,7 @@ impl Store {
         conn.busy_timeout(patience.timeout())
             .context("set the busy timeout")?;
         if patience == Patience::Batch {
-            enable_wal(&conn, patience.timeout())?;
+            Self::enable_wal(&conn, patience.timeout())?;
             conn.execute_batch("PRAGMA foreign_keys = ON;")
                 .context("configure the database")?;
         }
@@ -206,22 +206,22 @@ impl Store {
             )
             .context("count store contents")
     }
-}
 
-fn enable_wal(conn: &Connection, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match conn
-            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
-        {
-            Ok(_) => return Ok(()),
-            Err(error)
-                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
-                    && Instant::now() < deadline =>
+    fn enable_wal(conn: &Connection, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match conn
+                .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             {
-                thread::sleep(Duration::from_millis(5));
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error).context("switch the database to WAL mode"),
             }
-            Err(error) => return Err(error).context("switch the database to WAL mode"),
         }
     }
 }

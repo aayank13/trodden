@@ -316,22 +316,9 @@ mod tests {
 
         assert_eq!(checks.strongest(), None, "{checks:?}");
     }
-
-    fn project(name: &str, files: &[(&str, &str)]) -> ProjectChecks {
-        let root =
-            std::env::temp_dir().join(format!("trodden-checks-{name}-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("scratch directory is creatable");
-        for (path, contents) in files {
-            fs::write(root.join(path), contents).expect("scratch file is writable");
-        }
-        let checks = ProjectChecks::discover(&root);
-        fs::remove_dir_all(&root).expect("scratch directory is removable");
-        checks
-    }
-
     #[test]
     fn finds_the_documented_full_check() {
-        let checks = project(
+        let checks = Scratch::project(
             "documented",
             &[(
                 "README.md",
@@ -352,18 +339,18 @@ mod tests {
                 .strongest()
                 .map(|check| (check.command.clone(), check.source.clone()))
         };
-        let scripts = project(
+        let scripts = Scratch::project(
             "scripts",
             &[(
                 "package.json",
                 r#"{ "scripts": { "gen": "node scripts/gen-keys.js", "test": "node --test" } }"#,
             )],
         );
-        let cargo = project(
+        let cargo = Scratch::project(
             "cargo",
             &[("Cargo.toml", "[package]\nname = \"invoicer\"\n")],
         );
-        let inline = project(
+        let inline = Scratch::project(
             "inline",
             &[(
                 "CONTRIBUTING.md",
@@ -387,7 +374,7 @@ mod tests {
 
     #[test]
     fn reads_every_package_script_past_braces_inside_earlier_ones() {
-        let checks = project(
+        let checks = Scratch::project(
             "braces",
             &[(
                 "package.json",
@@ -409,7 +396,7 @@ mod tests {
 
     #[test]
     fn ignores_the_npm_placeholder_test_script() {
-        let checks = project(
+        let checks = Scratch::project(
             "placeholder",
             &[
                 (
@@ -428,7 +415,7 @@ mod tests {
 
     #[test]
     fn treats_malformed_package_json_as_having_no_scripts() {
-        let checks = project(
+        let checks = Scratch::project(
             "malformed",
             &[(
                 "package.json",
@@ -517,6 +504,18 @@ mod tests {
                 .into_iter()
                 .map(|check| (check.command, check.source))
                 .collect()
+        }
+
+        fn project(name: &str, files: &[(&str, &str)]) -> ProjectChecks {
+            let root =
+                std::env::temp_dir().join(format!("trodden-checks-{name}-{}", std::process::id()));
+            fs::create_dir_all(&root).expect("scratch directory is creatable");
+            for (path, contents) in files {
+                fs::write(root.join(path), contents).expect("scratch file is writable");
+            }
+            let checks = ProjectChecks::discover(&root);
+            fs::remove_dir_all(&root).expect("scratch directory is removable");
+            checks
         }
     }
 

@@ -388,9 +388,9 @@ mod tests {
         fn repo(&self, name: &str, commits: &[&str]) -> PathBuf {
             let repo = self.dir.join(name);
             fs::create_dir_all(&repo).expect("repository directory is writable");
-            git(&repo, &["init", "-q"]);
+            Self::git(&repo, &["init", "-q"]);
             for message in commits {
-                commit(&repo, message);
+                Self::commit(&repo, message);
             }
             repo
         }
@@ -417,12 +417,12 @@ mod tests {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            git(repo, &["rev-parse", "HEAD"])
+            Self::git(repo, &["rev-parse", "HEAD"])
         }
 
         fn commit_at(repo: &Path, second: i64) -> String {
             fs::write(repo.join("CHANGES"), second.to_string()).expect("file is writable");
-            git(repo, &["add", "-A"]);
+            Self::git(repo, &["add", "-A"]);
             Self::moved_at(repo, second, &["commit", "-q", "-m", &second.to_string()])
         }
 
@@ -462,7 +462,7 @@ mod tests {
 
         fn cache_key(repo: &Path) -> String {
             let stamp = Workspace::stamp(repo).expect("repository has a stamp");
-            format!("{}#{stamp}", text(repo))
+            format!("{}#{stamp}", Self::text(repo))
         }
 
         #[cfg(unix)]
@@ -510,8 +510,45 @@ mod tests {
             assert_eq!(workspace.repo.as_str(), Workspace::path_id(dir));
             assert_eq!(workspace.head_at(Timestamp::now()), None);
             let stamp = Workspace::stamp(dir).expect("git entry has a stamp");
-            let key = format!("{}#{stamp}", text(dir));
+            let key = format!("{}#{stamp}", Self::text(dir));
             assert_eq!(self.store.repo_for_root(&key).expect("cache reads"), None);
+        }
+
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=Dev",
+                    "-c",
+                    "user.email=dev@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn commit(repo: &Path, message: &str) {
+            fs::write(repo.join("CHANGES"), message).expect("file is writable");
+            Self::git(repo, &["add", "-A"]);
+            Self::git(repo, &["commit", "-q", "-m", message]);
+        }
+
+        fn root_commit(repo: &Path) -> String {
+            Self::git(repo, &["rev-list", "--max-parents=0", "HEAD"])
+        }
+
+        fn text(dir: &Path) -> String {
+            dir.to_string_lossy().into_owned()
         }
     }
 
@@ -519,43 +556,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
-    }
-
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args([
-                "-c",
-                "user.name=Dev",
-                "-c",
-                "user.email=dev@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    fn commit(repo: &Path, message: &str) {
-        fs::write(repo.join("CHANGES"), message).expect("file is writable");
-        git(repo, &["add", "-A"]);
-        git(repo, &["commit", "-q", "-m", message]);
-    }
-
-    fn root_commit(repo: &Path) -> String {
-        git(repo, &["rev-list", "--max-parents=0", "HEAD"])
-    }
-
-    fn text(dir: &Path) -> String {
-        dir.to_string_lossy().into_owned()
     }
 
     #[test]
@@ -574,8 +574,11 @@ mod tests {
         let scratch = Scratch::new("full");
         let repo = scratch.repo("shop", &["first", "second"]);
         fs::create_dir_all(repo.join("src")).expect("source directory is writable");
-        assert_eq!(scratch.resolve(&repo.join("src")), root_commit(&repo));
-        assert_eq!(scratch.resolve(&repo), root_commit(&repo));
+        assert_eq!(
+            scratch.resolve(&repo.join("src")),
+            Scratch::root_commit(&repo)
+        );
+        assert_eq!(scratch.resolve(&repo), Scratch::root_commit(&repo));
     }
 
     #[test]
@@ -587,7 +590,7 @@ mod tests {
         let second = scratch.repo("shop", &["blog"]);
         let new = scratch.resolve(&second);
         assert_ne!(old, new);
-        assert_eq!(new, root_commit(&second));
+        assert_eq!(new, Scratch::root_commit(&second));
     }
 
     #[test]
@@ -595,8 +598,8 @@ mod tests {
         let scratch = Scratch::new("unborn");
         let repo = scratch.repo("shop", &[]);
         assert!(scratch.resolve(&repo).starts_with("path-"));
-        commit(&repo, "first");
-        assert_eq!(scratch.resolve(&repo), root_commit(&repo));
+        Scratch::commit(&repo, "first");
+        assert_eq!(scratch.resolve(&repo), Scratch::root_commit(&repo));
     }
 
     #[test]
@@ -607,23 +610,33 @@ mod tests {
         let full = scratch.dir.join("full");
         let shallow = scratch.dir.join("shallow");
         let worktree = scratch.dir.join("worktree");
-        git(&scratch.dir, &["clone", "-q", &url, &text(&full)]);
-        git(
+        Scratch::git(&scratch.dir, &["clone", "-q", &url, &Scratch::text(&full)]);
+        Scratch::git(
             &scratch.dir,
-            &["clone", "-q", "--depth", "1", &url, &text(&shallow)],
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &url,
+                &Scratch::text(&shallow),
+            ],
         );
-        git(&shallow, &["worktree", "add", "-q", &text(&worktree)]);
+        Scratch::git(
+            &shallow,
+            &["worktree", "add", "-q", &Scratch::text(&worktree)],
+        );
 
         let shallow_id = scratch.resolve(&shallow);
         assert!(shallow_id.starts_with("remote-"));
         assert_eq!(scratch.resolve(&worktree), shallow_id);
-        git(&shallow, &["fetch", "-q", "--deepen", "1"]);
+        Scratch::git(&shallow, &["fetch", "-q", "--deepen", "1"]);
         assert_eq!(scratch.resolve(&shallow), shallow_id);
 
-        git(&shallow, &["fetch", "-q", "--unshallow"]);
-        assert_eq!(scratch.resolve(&shallow), root_commit(&origin));
-        assert_eq!(scratch.resolve(&worktree), root_commit(&origin));
-        assert_eq!(scratch.resolve(&full), root_commit(&origin));
+        Scratch::git(&shallow, &["fetch", "-q", "--unshallow"]);
+        assert_eq!(scratch.resolve(&shallow), Scratch::root_commit(&origin));
+        assert_eq!(scratch.resolve(&worktree), Scratch::root_commit(&origin));
+        assert_eq!(scratch.resolve(&full), Scratch::root_commit(&origin));
     }
 
     #[test]
@@ -637,7 +650,7 @@ mod tests {
 
         scratch.assert_path_identified(&empty);
         scratch.assert_path_identified(&broken);
-        assert_eq!(scratch.resolve(&shop), root_commit(&shop));
+        assert_eq!(scratch.resolve(&shop), Scratch::root_commit(&shop));
     }
 
     #[cfg(unix)]
@@ -659,15 +672,15 @@ mod tests {
         let blog = scratch.repo("blog", &["blog"]);
         let vendor = shop.join("vendor");
         fs::create_dir_all(&vendor).expect("vendor directory is writable");
-        git(&vendor, &["init", "-q"]);
-        commit(&vendor, "vendor");
+        Scratch::git(&vendor, &["init", "-q"]);
+        Scratch::commit(&vendor, "vendor");
         let tree = shop.join("blog-tree");
-        git(&blog, &["worktree", "add", "-q", &text(&tree)]);
+        Scratch::git(&blog, &["worktree", "add", "-q", &Scratch::text(&tree)]);
 
-        assert_eq!(scratch.resolve(&vendor), root_commit(&vendor));
-        assert_eq!(scratch.resolve(&tree), root_commit(&blog));
-        assert_ne!(root_commit(&blog), root_commit(&shop));
-        assert_ne!(root_commit(&vendor), root_commit(&shop));
+        assert_eq!(scratch.resolve(&vendor), Scratch::root_commit(&vendor));
+        assert_eq!(scratch.resolve(&tree), Scratch::root_commit(&blog));
+        assert_ne!(Scratch::root_commit(&blog), Scratch::root_commit(&shop));
+        assert_ne!(Scratch::root_commit(&vendor), Scratch::root_commit(&shop));
     }
 
     #[test]
@@ -675,12 +688,12 @@ mod tests {
         let scratch = Scratch::new("read-only");
         let repo = scratch.repo("shop", &["first"]);
         let stamp = Workspace::stamp(&repo).expect("repository has a stamp");
-        let key = format!("{}#{stamp}", text(&repo));
+        let key = format!("{}#{stamp}", Scratch::text(&repo));
 
         let read_only = Workspace::resolve_read_only(&repo, &scratch.store)
             .expect("read-only lookup runs")
             .expect("a small clone is walked within the budget");
-        assert_eq!(read_only.repo.as_str(), root_commit(&repo));
+        assert_eq!(read_only.repo.as_str(), Scratch::root_commit(&repo));
         assert_eq!(
             scratch.store.repo_for_root(&key).expect("cache reads"),
             None
@@ -760,7 +773,7 @@ mod tests {
         let notes = Scratch::directory(&scratch.dir, "notes", &["Cargo.toml"]);
         let unborn = scratch.repo("unborn", &[]);
         let unlogged = scratch.repo("unlogged", &[]);
-        git(&unlogged, &["config", "core.logAllRefUpdates", "false"]);
+        Scratch::git(&unlogged, &["config", "core.logAllRefUpdates", "false"]);
         Scratch::commit_at(&unlogged, 1_700_000_000);
 
         for dir in [&notes, &unborn, &unlogged] {
@@ -821,7 +834,7 @@ mod tests {
         fs::write(shop.join("web/package.json"), "").expect("manifest is writable");
         let workspace = scratch.under_home(&web, &scratch.dir);
         assert_eq!(workspace.root, shop);
-        assert_eq!(workspace.repo.as_str(), root_commit(&shop));
+        assert_eq!(workspace.repo.as_str(), Scratch::root_commit(&shop));
     }
 
     #[test]
@@ -847,11 +860,11 @@ mod tests {
         scratch.assert_root(&shop.join("src"), &home, &shop);
         assert_eq!(
             scratch.under_home(&blog.join("src"), &home).repo.as_str(),
-            root_commit(&blog)
+            Scratch::root_commit(&blog)
         );
         let at_home = scratch.under_home(&home, &home);
         assert_eq!(at_home.root, home);
-        assert_eq!(at_home.repo.as_str(), root_commit(&home));
+        assert_eq!(at_home.repo.as_str(), Scratch::root_commit(&home));
     }
 
     #[test]
@@ -862,7 +875,7 @@ mod tests {
         let src = Scratch::directory(&shop, "src", &[]);
         let workspace = scratch.under_home(&src, &home);
         assert_eq!(workspace.root, shop);
-        assert_eq!(workspace.repo.as_str(), root_commit(&shop));
+        assert_eq!(workspace.repo.as_str(), Scratch::root_commit(&shop));
     }
 
     #[test]
@@ -881,7 +894,7 @@ mod tests {
         );
 
         let walked = scratch.resolve(&repo);
-        assert_eq!(walked, root_commit(&repo));
+        assert_eq!(walked, Scratch::root_commit(&repo));
         assert_eq!(scratch.within(&repo, Duration::ZERO), Some(walked));
     }
 
@@ -890,13 +903,13 @@ mod tests {
         let scratch = Scratch::new("cached-in-time");
         let repo = scratch.repo("shop", &["first", "second"]);
 
-        assert_eq!(scratch.cached(&repo), Some(root_commit(&repo)));
+        assert_eq!(scratch.cached(&repo), Some(Scratch::root_commit(&repo)));
         assert_eq!(
             scratch
                 .store
                 .repo_for_root(&Scratch::cache_key(&repo))
                 .expect("cache reads"),
-            Some(root_commit(&repo))
+            Some(Scratch::root_commit(&repo))
         );
     }
 
@@ -941,9 +954,16 @@ mod tests {
         let origin = scratch.repo("origin", &["first", "second"]);
         let url = format!("file://{}", origin.display());
         let shallow = scratch.dir.join("shallow");
-        git(
+        Scratch::git(
             &scratch.dir,
-            &["clone", "-q", "--depth", "1", &url, &text(&shallow)],
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &url,
+                &Scratch::text(&shallow),
+            ],
         );
 
         let cached = scratch

@@ -649,273 +649,284 @@ mod tests {
         assert!(!redactor.contains_secret("cat /Users/ada/notes.md"));
     }
 
-    fn fake(parts: &[&str]) -> String {
-        parts.concat()
-    }
+    #[derive(Debug)]
+    struct Corpus;
 
-    fn hex() -> String {
-        fake(&["4b1e9c7d2a5f8e3b", "6c0d9a2f5e8b1c4d"])
-    }
+    impl Corpus {
+        fn fake(parts: &[&str]) -> String {
+            parts.concat()
+        }
 
-    fn must_redact() -> Vec<(String, Vec<String>)> {
-        let api_key = fake(&["q7Lm2Vx9", "Rt4Kp8Wz"]);
-        let session = fake(&["8f2kq0z7", "xw1m"]);
-        let curl_password = fake(&["Tr0ub", "4dor"]);
-        let mysql_password = fake(&["S3cret", "Pw"]);
-        let ssh_password = fake(&["Wint3r", "Pw"]);
-        let db_password = fake(&["Kq8v", "Rz2m"]);
-        let client_secret = fake(&["Zx81kQ", "p0vLm3"]);
-        let app_id = fake(&["9f3c1a7e5b2d4f6a", "8c0e1b3d5f7a9c2e"]);
-        let hex = hex();
-        let aws_id = fake(&["AK", "IA", "Q3EGRTYN4UJ7XKZP"]);
-        let aws_secret = fake(&["k3Jd9sX0pQ2mZ7vB4nR8", "tY1wE6uI5oP0aS3dF7g"]);
-        let base64 = [fake(&["9j4AAQ", "SkZJRg"]), fake(&["ABAQ2w", "BDAA"])];
-        let hex_path = fake(&["a1b2c3d4e5f6a7b8", "c9d0e1f2a3b4c5d6"]);
-        let slashed = [
-            fake(&["k3Jd9sX0pQ", "2mZ7vB4nR8"]),
-            fake(&["tY1wE6uI5o", "P0aS3dF7g"]),
-        ];
-        let prefix = [
-            fake(&["Q7vK2mXp", "9LzR4wT8"]),
-            fake(&["Nb3Hy6Jc1", "Fd5Gs0Wq"]),
-        ];
-        let nested = fake(&["Zx81kQp0vLm3Rt4K", "p8WzB2nY6cH9sD1fG5"]);
-        let pgp_body = [fake(&["lQOYBGXk", "2fIBCADq7d"]), fake(&["=pX", "3a"])];
-        let pgp = [
-            fake(&["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----\n"]),
-            pgp_body.join("\n"),
-            fake(&["-----END PGP ", "PRIVATE KEY BLOCK-----"]),
-        ]
-        .join("\n");
-        let case = |text: String, secrets: &[&str]| {
-            (
-                text,
-                secrets.iter().map(|&secret| secret.to_owned()).collect(),
-            )
-        };
-        vec![
-            case(
-                format!(r#"curl -H "X-Api-Key: {api_key}" https://api.example.com"#),
-                &[&api_key],
-            ),
-            case(
-                format!(r#"requests.get(url, headers={{"X-Api-Key": "{api_key}"}})"#),
-                &[&api_key],
-            ),
-            case(
-                format!(
-                    "curl -H 'Cookie: sessionid={session}; csrftoken=Zq81' https://shop.example.com"
+        fn hex() -> String {
+            Self::fake(&["4b1e9c7d2a5f8e3b", "6c0d9a2f5e8b1c4d"])
+        }
+
+        fn must_redact() -> Vec<(String, Vec<String>)> {
+            let api_key = Self::fake(&["q7Lm2Vx9", "Rt4Kp8Wz"]);
+            let session = Self::fake(&["8f2kq0z7", "xw1m"]);
+            let curl_password = Self::fake(&["Tr0ub", "4dor"]);
+            let mysql_password = Self::fake(&["S3cret", "Pw"]);
+            let ssh_password = Self::fake(&["Wint3r", "Pw"]);
+            let db_password = Self::fake(&["Kq8v", "Rz2m"]);
+            let client_secret = Self::fake(&["Zx81kQ", "p0vLm3"]);
+            let app_id = Self::fake(&["9f3c1a7e5b2d4f6a", "8c0e1b3d5f7a9c2e"]);
+            let hex = Self::hex();
+            let aws_id = Self::fake(&["AK", "IA", "Q3EGRTYN4UJ7XKZP"]);
+            let aws_secret = Self::fake(&["k3Jd9sX0pQ2mZ7vB4nR8", "tY1wE6uI5oP0aS3dF7g"]);
+            let base64 = [
+                Self::fake(&["9j4AAQ", "SkZJRg"]),
+                Self::fake(&["ABAQ2w", "BDAA"]),
+            ];
+            let hex_path = Self::fake(&["a1b2c3d4e5f6a7b8", "c9d0e1f2a3b4c5d6"]);
+            let slashed = [
+                Self::fake(&["k3Jd9sX0pQ", "2mZ7vB4nR8"]),
+                Self::fake(&["tY1wE6uI5o", "P0aS3dF7g"]),
+            ];
+            let prefix = [
+                Self::fake(&["Q7vK2mXp", "9LzR4wT8"]),
+                Self::fake(&["Nb3Hy6Jc1", "Fd5Gs0Wq"]),
+            ];
+            let nested = Self::fake(&["Zx81kQp0vLm3Rt4K", "p8WzB2nY6cH9sD1fG5"]);
+            let pgp_body = [
+                Self::fake(&["lQOYBGXk", "2fIBCADq7d"]),
+                Self::fake(&["=pX", "3a"]),
+            ];
+            let pgp = [
+                Self::fake(&["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----\n"]),
+                pgp_body.join("\n"),
+                Self::fake(&["-----END PGP ", "PRIVATE KEY BLOCK-----"]),
+            ]
+            .join("\n");
+            let case = |text: String, secrets: &[&str]| {
+                (
+                    text,
+                    secrets.iter().map(|&secret| secret.to_owned()).collect(),
+                )
+            };
+            vec![
+                case(
+                    format!(r#"curl -H "X-Api-Key: {api_key}" https://api.example.com"#),
+                    &[&api_key],
                 ),
-                &[&session, "Zq81"],
-            ),
-            case(
-                format!("Set-Cookie: session={session}; Path=/; HttpOnly"),
-                &[&session],
-            ),
-            case(
-                r#"./scripts/seed.sh '{"password":"hunter2"}'"#.to_owned(),
-                &["hunter2"],
-            ),
-            case(
-                "{'password': 'hunter2', 'user': 'ada'}".to_owned(),
-                &["hunter2"],
-            ),
-            case(
-                "spring.datasource.password=hunter2".to_owned(),
-                &["hunter2"],
-            ),
-            case(format!(r#"accessToken: "{api_key}.v2""#), &[&api_key]),
-            case(
-                format!("curl -u admin:{curl_password} https://ci.example.com/api/json"),
-                &[&curl_password],
-            ),
-            case(
-                format!("curl -sS -uadmin:{curl_password} https://ci.example.com"),
-                &[&curl_password],
-            ),
-            case(
-                format!("curl --user=admin:{curl_password} https://ci.example.com"),
-                &[&curl_password],
-            ),
-            case(
-                format!("curl -X POST --user 'admin:{curl_password}' https://ci.example.com"),
-                &[&curl_password],
-            ),
-            case(
-                format!("mysql -u root -p{mysql_password} shop"),
-                &[&mysql_password],
-            ),
-            case(
-                format!("mysqldump -h db -u root -p'{mysql_password}' shop > dump.sql"),
-                &[&mysql_password],
-            ),
-            case(
-                format!("sshpass -p {ssh_password} ssh deploy@staging"),
-                &[&ssh_password],
-            ),
-            case(
-                format!("sshpass -v -p '{ssh_password}' scp build.tar host:"),
-                &[&ssh_password],
-            ),
-            case(
-                format!("DB_PASS={db_password} ./scripts/migrate.sh"),
-                &[&db_password],
-            ),
-            case(
-                format!("PGPASS={db_password} psql -h db shop"),
-                &[&db_password],
-            ),
-            case(format!("dbPass: {db_password}"), &[&db_password]),
-            case(
-                format!("./bin/oauth --client-secret {client_secret}"),
-                &[&client_secret],
-            ),
-            case(
-                format!("./bin/oauth --auth-token {client_secret} --verbose"),
-                &[&client_secret],
-            ),
-            case(
-                format!("python summarize.py --openai-api-key {client_secret}"),
-                &[&client_secret],
-            ),
-            case("./bin/cli --password hunter2".to_owned(), &["hunter2"]),
-            case("./bin/cli --token=abc123".to_owned(), &["abc123"]),
-            case(
-                "http --auth admin:hunter2 :8080/admin".to_owned(),
-                &["admin:hunter2"],
-            ),
-            case(
-                r#"subprocess.run(["http", "--auth=admin:hunter2", url])"#.to_owned(),
-                &["hunter2"],
-            ),
-            case(
-                "./bin/cli --verbose --token abc123 --password-stdin".to_owned(),
-                &["abc123"],
-            ),
-            case(
-                "./bin/cli --token-type bearer --token abc123".to_owned(),
-                &["abc123"],
-            ),
-            case(
-                format!(
-                    r#"curl "https://api.openweathermap.org/data/2.5/weather?q=Berlin&appid={app_id}""#
+                case(
+                    format!(r#"requests.get(url, headers={{"X-Api-Key": "{api_key}"}})"#),
+                    &[&api_key],
                 ),
-                &[&app_id],
-            ),
-            case(
-                format!(r#"curl -H "DD-API-KEY: {hex}" https://api.datadoghq.com"#),
-                &[&hex],
-            ),
-            case(format!("export MAILGUN_KEY={hex}"), &[&hex]),
-            case(format!(r#"{{"app_key": "{hex}"}}"#), &[&hex]),
-            case(format!("TOKEN_TYPE={hex}"), &[&hex]),
-            case(pgp, &[&pgp_body[0], &pgp_body[1]]),
-            case(format!("aws s3 ls --profile é{aws_id}"), &[&aws_id]),
-            case(format!("{aws_id}é"), &[&aws_id]),
-            case(
-                "DB_PASSWORD=123456 ./scripts/seed.sh".to_owned(),
-                &["123456"],
-            ),
-            case("SECRET_KEY=98765".to_owned(), &["98765"]),
-            case("GITHUB_TOKEN_READONLY=abc123def".to_owned(), &["abc123def"]),
-            case(
-                format!("AWS_SECRET_ACCESS_KEY=/{aws_secret}"),
-                &[&aws_secret],
-            ),
-            case(
-                format!("SESSION_SECRET=/{}/{}", base64[0], base64[1]),
-                &[&base64[0], &base64[1]],
-            ),
-            case(format!("API_TOKEN=/{hex_path}"), &[&hex_path]),
-            case(
-                format!("sign uploads with {}/{}", slashed[0], slashed[1]),
-                &[&slashed[0], &slashed[1]],
-            ),
-            case(
-                format!("tar xf {}/{}/{nested}/src.tar", prefix[0], prefix[1]),
-                &[&prefix[0], &prefix[1], &nested],
-            ),
-            case(
-                "TOKEN_TYPE=bearer,password=hunter2".to_owned(),
-                &["hunter2"],
-            ),
-            case("MAX_TOKENS=100,TOKEN=abc123".to_owned(), &["abc123"]),
-            case("SECRET_TOKEN=abc123".to_owned(), &["abc123"]),
-            case(
-                "Authorization: Bearer abcdefgh123".to_owned(),
-                &["abcdefgh123"],
-            ),
-            case(
-                "psql postgres://app:hunter2@db/shop".to_owned(),
-                &["hunter2"],
-            ),
-            case(
-                "mail ada@example.com < report.txt".to_owned(),
-                &["ada@example.com"],
-            ),
-            case(
-                "ls ~/Library/CloudStorage/GoogleDrive-ada@example.com/shop".to_owned(),
-                &["ada@example.com"],
-            ),
-        ]
-    }
+                case(
+                    format!(
+                        "curl -H 'Cookie: sessionid={session}; csrftoken=Zq81' https://shop.example.com"
+                    ),
+                    &[&session, "Zq81"],
+                ),
+                case(
+                    format!("Set-Cookie: session={session}; Path=/; HttpOnly"),
+                    &[&session],
+                ),
+                case(
+                    r#"./scripts/seed.sh '{"password":"hunter2"}'"#.to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "{'password': 'hunter2', 'user': 'ada'}".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "spring.datasource.password=hunter2".to_owned(),
+                    &["hunter2"],
+                ),
+                case(format!(r#"accessToken: "{api_key}.v2""#), &[&api_key]),
+                case(
+                    format!("curl -u admin:{curl_password} https://ci.example.com/api/json"),
+                    &[&curl_password],
+                ),
+                case(
+                    format!("curl -sS -uadmin:{curl_password} https://ci.example.com"),
+                    &[&curl_password],
+                ),
+                case(
+                    format!("curl --user=admin:{curl_password} https://ci.example.com"),
+                    &[&curl_password],
+                ),
+                case(
+                    format!("curl -X POST --user 'admin:{curl_password}' https://ci.example.com"),
+                    &[&curl_password],
+                ),
+                case(
+                    format!("mysql -u root -p{mysql_password} shop"),
+                    &[&mysql_password],
+                ),
+                case(
+                    format!("mysqldump -h db -u root -p'{mysql_password}' shop > dump.sql"),
+                    &[&mysql_password],
+                ),
+                case(
+                    format!("sshpass -p {ssh_password} ssh deploy@staging"),
+                    &[&ssh_password],
+                ),
+                case(
+                    format!("sshpass -v -p '{ssh_password}' scp build.tar host:"),
+                    &[&ssh_password],
+                ),
+                case(
+                    format!("DB_PASS={db_password} ./scripts/migrate.sh"),
+                    &[&db_password],
+                ),
+                case(
+                    format!("PGPASS={db_password} psql -h db shop"),
+                    &[&db_password],
+                ),
+                case(format!("dbPass: {db_password}"), &[&db_password]),
+                case(
+                    format!("./bin/oauth --client-secret {client_secret}"),
+                    &[&client_secret],
+                ),
+                case(
+                    format!("./bin/oauth --auth-token {client_secret} --verbose"),
+                    &[&client_secret],
+                ),
+                case(
+                    format!("python summarize.py --openai-api-key {client_secret}"),
+                    &[&client_secret],
+                ),
+                case("./bin/cli --password hunter2".to_owned(), &["hunter2"]),
+                case("./bin/cli --token=abc123".to_owned(), &["abc123"]),
+                case(
+                    "http --auth admin:hunter2 :8080/admin".to_owned(),
+                    &["admin:hunter2"],
+                ),
+                case(
+                    r#"subprocess.run(["http", "--auth=admin:hunter2", url])"#.to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "./bin/cli --verbose --token abc123 --password-stdin".to_owned(),
+                    &["abc123"],
+                ),
+                case(
+                    "./bin/cli --token-type bearer --token abc123".to_owned(),
+                    &["abc123"],
+                ),
+                case(
+                    format!(
+                        r#"curl "https://api.openweathermap.org/data/2.5/weather?q=Berlin&appid={app_id}""#
+                    ),
+                    &[&app_id],
+                ),
+                case(
+                    format!(r#"curl -H "DD-API-KEY: {hex}" https://api.datadoghq.com"#),
+                    &[&hex],
+                ),
+                case(format!("export MAILGUN_KEY={hex}"), &[&hex]),
+                case(format!(r#"{{"app_key": "{hex}"}}"#), &[&hex]),
+                case(format!("TOKEN_TYPE={hex}"), &[&hex]),
+                case(pgp, &[&pgp_body[0], &pgp_body[1]]),
+                case(format!("aws s3 ls --profile é{aws_id}"), &[&aws_id]),
+                case(format!("{aws_id}é"), &[&aws_id]),
+                case(
+                    "DB_PASSWORD=123456 ./scripts/seed.sh".to_owned(),
+                    &["123456"],
+                ),
+                case("SECRET_KEY=98765".to_owned(), &["98765"]),
+                case("GITHUB_TOKEN_READONLY=abc123def".to_owned(), &["abc123def"]),
+                case(
+                    format!("AWS_SECRET_ACCESS_KEY=/{aws_secret}"),
+                    &[&aws_secret],
+                ),
+                case(
+                    format!("SESSION_SECRET=/{}/{}", base64[0], base64[1]),
+                    &[&base64[0], &base64[1]],
+                ),
+                case(format!("API_TOKEN=/{hex_path}"), &[&hex_path]),
+                case(
+                    format!("sign uploads with {}/{}", slashed[0], slashed[1]),
+                    &[&slashed[0], &slashed[1]],
+                ),
+                case(
+                    format!("tar xf {}/{}/{nested}/src.tar", prefix[0], prefix[1]),
+                    &[&prefix[0], &prefix[1], &nested],
+                ),
+                case(
+                    "TOKEN_TYPE=bearer,password=hunter2".to_owned(),
+                    &["hunter2"],
+                ),
+                case("MAX_TOKENS=100,TOKEN=abc123".to_owned(), &["abc123"]),
+                case("SECRET_TOKEN=abc123".to_owned(), &["abc123"]),
+                case(
+                    "Authorization: Bearer abcdefgh123".to_owned(),
+                    &["abcdefgh123"],
+                ),
+                case(
+                    "psql postgres://app:hunter2@db/shop".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "mail ada@example.com < report.txt".to_owned(),
+                    &["ada@example.com"],
+                ),
+                case(
+                    "ls ~/Library/CloudStorage/GoogleDrive-ada@example.com/shop".to_owned(),
+                    &["ada@example.com"],
+                ),
+            ]
+        }
 
-    fn must_keep() -> Vec<String> {
-        let sha256 = hex().repeat(2);
-        let sha1 = &sha256[..40];
-        [
-            "git clone git@github.com:org/repo.git",
-            "git remote add origin git@gitlab.example.com:group/project.git",
-            "git clone ssh://git@github.com/org/repo.git vendor/repo",
-            "TOKENIZERS_PARALLELISM=false python scripts/embed.py",
-            "python summarize.py --max-tokens=100",
-            "python summarize.py --max-tokens 100",
-            "MAX_TOKENS=4096 ./scripts/run.sh",
-            "max_new_tokens: 512",
-            "PASSWORD_FILE=/run/secrets/db ./scripts/migrate.sh",
-            "./bin/cli --password-file /run/secrets/db",
-            "GOOGLE_APPLICATION_CREDENTIALS=~/keys/service-account.json npm test",
-            "SSL_PRIVATE_KEY=/etc/ssl/private/server.key ./bin/serve",
-            "export TOKEN_PATH=./config/token.json",
-            "TOKEN_TYPE=bearer",
-            "TOKEN_TTL=3600 PASSWORD_MIN_LENGTH=12 ./bin/serve",
-            "DEBUG_SECRETS=0 npm start",
-            "USE_CREDENTIALS=true ./bin/sync",
-            r#"DB_PASSWORD="" ./scripts/seed.sh"#,
-            "GITHUB_TOKEN=$GITHUB_TOKEN ./scripts/release.sh",
-            "npm publish --token ${NPM_TOKEN}",
-            "npm config set //registry.npmjs.org/:_authToken=${NPM_TOKEN}",
-            r#"curl -u "$CI_USER:$CI_PASSWORD" https://ci.example.com"#,
-            r#"curl -H "Cookie: $COOKIE" https://shop.example.com"#,
-            "echo $PASSWORD | docker login --username ada --password-stdin ghcr.io",
-            "./bin/cli --no-password migrate",
-            "assert token == expected",
-            "Token::new(source).unwrap_or_default()",
-            "docker run -u 1000:1000 node",
-            "mysql -u root -p shop",
-            "mysql -P 3306 -h db shop",
-            "sshpass -f ~/.pw ssh -p 2222 deploy@staging",
-            "ssh -p 2222 deploy@staging",
-            "cargo test -p invoicer",
-            "npm test",
-            "cd .claude/worktrees/agent-a3f9c2d17e5b4c08 && cargo test",
-            "diff -r worktrees/agent-a3f9c2d17e5b4c08/src src",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .chain([
-            format!("docker pull node@sha256:{sha256}"),
-            format!("pip install requests --hash=sha256:{sha256}"),
-            format!(r#"checksum = "{sha256}""#),
-            format!(r#"{{"head_sha": "{sha1}"}}"#),
-        ])
-        .collect()
+        fn must_keep() -> Vec<String> {
+            let sha256 = Self::hex().repeat(2);
+            let sha1 = &sha256[..40];
+            [
+                "git clone git@github.com:org/repo.git",
+                "git remote add origin git@gitlab.example.com:group/project.git",
+                "git clone ssh://git@github.com/org/repo.git vendor/repo",
+                "TOKENIZERS_PARALLELISM=false python scripts/embed.py",
+                "python summarize.py --max-tokens=100",
+                "python summarize.py --max-tokens 100",
+                "MAX_TOKENS=4096 ./scripts/run.sh",
+                "max_new_tokens: 512",
+                "PASSWORD_FILE=/run/secrets/db ./scripts/migrate.sh",
+                "./bin/cli --password-file /run/secrets/db",
+                "GOOGLE_APPLICATION_CREDENTIALS=~/keys/service-account.json npm test",
+                "SSL_PRIVATE_KEY=/etc/ssl/private/server.key ./bin/serve",
+                "export TOKEN_PATH=./config/token.json",
+                "TOKEN_TYPE=bearer",
+                "TOKEN_TTL=3600 PASSWORD_MIN_LENGTH=12 ./bin/serve",
+                "DEBUG_SECRETS=0 npm start",
+                "USE_CREDENTIALS=true ./bin/sync",
+                r#"DB_PASSWORD="" ./scripts/seed.sh"#,
+                "GITHUB_TOKEN=$GITHUB_TOKEN ./scripts/release.sh",
+                "npm publish --token ${NPM_TOKEN}",
+                "npm config set //registry.npmjs.org/:_authToken=${NPM_TOKEN}",
+                r#"curl -u "$CI_USER:$CI_PASSWORD" https://ci.example.com"#,
+                r#"curl -H "Cookie: $COOKIE" https://shop.example.com"#,
+                "echo $PASSWORD | docker login --username ada --password-stdin ghcr.io",
+                "./bin/cli --no-password migrate",
+                "assert token == expected",
+                "Token::new(source).unwrap_or_default()",
+                "docker run -u 1000:1000 node",
+                "mysql -u root -p shop",
+                "mysql -P 3306 -h db shop",
+                "sshpass -f ~/.pw ssh -p 2222 deploy@staging",
+                "ssh -p 2222 deploy@staging",
+                "cargo test -p invoicer",
+                "npm test",
+                "cd .claude/worktrees/agent-a3f9c2d17e5b4c08 && cargo test",
+                "diff -r worktrees/agent-a3f9c2d17e5b4c08/src src",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .chain([
+                format!("docker pull node@sha256:{sha256}"),
+                format!("pip install requests --hash=sha256:{sha256}"),
+                format!(r#"checksum = "{sha256}""#),
+                format!(r#"{{"head_sha": "{sha1}"}}"#),
+            ])
+            .collect()
+        }
     }
 
     #[test]
     fn redacts_every_known_secret_shape() {
         let redactor = Redactor::with_home("/Users/ada");
-        for (text, secrets) in must_redact() {
+        for (text, secrets) in Corpus::must_redact() {
             let redacted = redactor.redact(&text);
             assert!(redacted.contains(MARKER_PREFIX), "{text} -> {redacted}");
             for secret in secrets {
@@ -928,7 +939,7 @@ mod tests {
     #[test]
     fn keeps_values_that_are_not_secrets() {
         let redactor = Redactor::with_home("/Users/ada");
-        for text in must_keep() {
+        for text in Corpus::must_keep() {
             assert_eq!(redactor.redact(&text), text);
             assert!(!redactor.contains_secret(&text), "{text}");
         }
@@ -937,8 +948,8 @@ mod tests {
     #[test]
     fn redacts_only_the_secret_part() {
         let redactor = Redactor::with_home("/Users/ada");
-        let password = fake(&["Tr0ub", "4dor"]);
-        let secret = fake(&["Zx81kQ", "p0vLm3"]);
+        let password = Corpus::fake(&["Tr0ub", "4dor"]);
+        let secret = Corpus::fake(&["Zx81kQ", "p0vLm3"]);
         let cases = [
             (
                 r#"{"password":"hunter2","user":"ada"}"#.to_owned(),
@@ -965,10 +976,10 @@ mod tests {
     #[test]
     fn redacting_twice_changes_nothing() {
         let redactor = Redactor::with_home("/Users/ada");
-        let texts = must_redact()
+        let texts = Corpus::must_redact()
             .into_iter()
             .map(|(text, _)| text)
-            .chain(must_keep());
+            .chain(Corpus::must_keep());
         for text in texts {
             let once = redactor.redact(&text).into_owned();
             assert_eq!(redactor.redact(&once), once);

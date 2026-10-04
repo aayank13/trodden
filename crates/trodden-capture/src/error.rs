@@ -131,6 +131,15 @@ impl ErrorSignature {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct Fixture;
+
+    impl Fixture {
+        fn redactor() -> Redactor {
+            Redactor::with_home("/Users/ada")
+        }
+    }
+
     #[test]
     fn keeps_the_kind_and_names_and_drops_what_varies() {
         let cases = [
@@ -157,7 +166,7 @@ mod tests {
         ];
         for (output, signature) in cases {
             assert_eq!(
-                ErrorSignature::of(output, &redactor()).as_deref(),
+                ErrorSignature::of(output, &Fixture::redactor()).as_deref(),
                 Some(signature),
                 "{output}"
             );
@@ -278,7 +287,7 @@ mod tests {
         ];
         for (output, signature) in cases {
             assert_eq!(
-                ErrorSignature::of(output, &redactor()).as_deref(),
+                ErrorSignature::of(output, &Fixture::redactor()).as_deref(),
                 Some(signature),
                 "{output}"
             );
@@ -290,18 +299,18 @@ mod tests {
         let at = |path: &str, line: u32| {
             ErrorSignature::of(
                 &format!("{path}:{line}:5: error: use of undeclared identifier 'totl'"),
-                &redactor(),
+                &Fixture::redactor(),
             )
         };
         assert_eq!(at("cart.c", 3), at("/home/ada/shop/src/cart.c", 41));
         assert_eq!(
             ErrorSignature::of(
                 "src/cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
-                &redactor()
+                &Fixture::redactor()
             ),
             ErrorSignature::of(
                 "/home/ada/shop/src/lib/total.ts(88,13): error TS2322: Type 'string' is not assignable to type 'number'.",
-                &redactor()
+                &Fixture::redactor()
             ),
         );
     }
@@ -340,7 +349,7 @@ mod tests {
         ];
         for (output, signature) in cases {
             assert_eq!(
-                ErrorSignature::of(output, &redactor()).as_deref(),
+                ErrorSignature::of(output, &Fixture::redactor()).as_deref(),
                 Some(signature),
                 "{output}"
             );
@@ -352,7 +361,7 @@ mod tests {
         let at = |path: &str| {
             ErrorSignature::of(
                 &format!("{path}:41:5: error: use of undeclared identifier 'totl'"),
-                &redactor(),
+                &Fixture::redactor(),
             )
         };
 
@@ -362,11 +371,11 @@ mod tests {
         assert_eq!(
             ErrorSignature::of(
                 "src/cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
-                &redactor()
+                &Fixture::redactor()
             ),
             ErrorSignature::of(
                 r"C:\Users\grace\shop\src\cart.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
-                &redactor()
+                &Fixture::redactor()
             ),
         );
     }
@@ -391,12 +400,12 @@ mod tests {
             "src/lib.rs:10:5",
             "Error",
         ] {
-            assert_eq!(ErrorSignature::of(output, &redactor()), None, "{output}");
+            assert_eq!(
+                ErrorSignature::of(output, &Fixture::redactor()),
+                None,
+                "{output}"
+            );
         }
-    }
-
-    fn redactor() -> Redactor {
-        Redactor::with_home("/Users/ada")
     }
 
     #[test]
@@ -414,7 +423,7 @@ mod tests {
             long_key.as_str(),
         ] {
             assert!(ErrorSignature::select(output).is_some(), "{output}");
-            let signature = ErrorSignature::of(output, &redactor());
+            let signature = ErrorSignature::of(output, &Fixture::redactor());
             assert_eq!(signature, None, "{output} gave {signature:?}");
         }
     }
@@ -424,7 +433,7 @@ mod tests {
         assert_eq!(
             ErrorSignature::of(
                 "Error: password authentication failed for user \"app\"",
-                &redactor()
+                &Fixture::redactor()
             )
             .as_deref(),
             Some("error: password authentication failed for user \"app\"")

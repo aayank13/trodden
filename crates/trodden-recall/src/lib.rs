@@ -665,140 +665,180 @@ mod tests {
 
     const CRASH_PROMPT: &str = "Fix the crash in src/paginate.js when the user logs out.";
 
-    fn outcome(store: &Store, prompt: &str) -> Outcome {
-        Recall::new(store, None)
-            .seeded(7)
-            .recall(&Query {
-                prompt,
-                repo: REPO,
+    #[derive(Debug)]
+    struct Fixture;
+
+    impl Fixture {
+        fn outcome(store: &Store, prompt: &str) -> Outcome {
+            Recall::new(store, None)
+                .seeded(7)
+                .recall(&Query {
+                    prompt,
+                    repo: REPO,
+                    root: Path::new("."),
+                    session: None,
+                })
+                .expect("recall succeeds")
+        }
+
+        fn direction(weights: &[(usize, f32)]) -> Embedding {
+            let mut embedding = [0.0; DIMS];
+            for (axis, weight) in weights {
+                embedding[*axis] = *weight;
+            }
+            embedding
+        }
+
+        fn semantic(name: &str, vectors: &[(i64, Embedding)]) -> (Embedder, VectorIndex) {
+            let dir =
+                std::env::temp_dir().join(format!("trodden-recall-{name}-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("scratch directory is writable");
+            let token = b"crash";
+            let mut pack = b"TRDEMB\x01\0".to_vec();
+            for field in [DIMS, 1, token.len(), 0, 0, token.len(), 0] {
+                pack.extend(
+                    u32::try_from(field)
+                        .expect("pack field is small")
+                        .to_le_bytes(),
+                );
+            }
+            pack.extend(token);
+            pack.extend(Quantized::new(&Self::direction(&[(0, 1.0)])).to_bytes());
+            let pack_path = dir.join("embeddings.pack");
+            fs::write(&pack_path, pack).expect("pack is writable");
+            let rows: Vec<(i64, String, Vec<u8>)> = vectors
+                .iter()
+                .map(|(rowid, vector)| (*rowid, REPO.to_owned(), Quantized::new(vector).to_bytes()))
+                .collect();
+            let index_path = dir.join("recall.index");
+            VectorIndex::build(&rows, &index_path).expect("index builds");
+            (
+                Embedder::open(&pack_path).expect("pack opens"),
+                VectorIndex::open(&index_path).expect("index opens"),
+            )
+        }
+
+        fn unrelated(n: usize) -> Procedure {
+            let mut procedure = Procedure::example();
+            procedure.id = ProcedureId::new(format!("p_rotate{n}"));
+            procedure.family = FamilyId::new(format!("f_rotate{n}"));
+            procedure.title = format!("Rotate the staging credentials of service {n}");
+            procedure.trigger = Trigger {
+                entities: Vec::new(),
+                text: "rotate staging credentials".to_owned(),
+                examples: Vec::new(),
+            };
+            procedure.preconditions.clear();
+            procedure.steps.clear();
+            procedure.verify = None;
+            procedure.avoid.clear();
+            procedure
+        }
+
+        fn semantic_outcome(
+            name: &str,
+            prompt: &str,
+            target: Option<Embedding>,
+            closer: usize,
+        ) -> Outcome {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let mut procedure = Procedure::example();
+            procedure.preconditions.clear();
+            let rowid = store.upsert(&procedure).expect("procedure stores").rowid();
+            let mut vectors: Vec<(i64, Embedding)> =
+                target.map(|target| (rowid, target)).into_iter().collect();
+            for n in 0..closer {
+                let rowid = store
+                    .upsert(&Self::unrelated(n))
+                    .expect("procedure stores")
+                    .rowid();
+                vectors.push((rowid, Self::direction(&[(0, 0.5), (n + 2, 0.866)])));
+            }
+            Recall::new(&store, Some(Self::semantic(name, &vectors)))
+                .seeded(7)
+                .recall(&Query {
+                    prompt,
+                    repo: REPO,
+                    root: Path::new("."),
+                    session: None,
+                })
+                .expect("recall succeeds")
+        }
+
+        fn semantic_decision(
+            name: &str,
+            prompt: &str,
+            target: Option<Embedding>,
+            closer: usize,
+        ) -> Decision {
+            Self::semantic_outcome(name, prompt, target, closer).decision
+        }
+
+        fn scored(rowid: i64, family: &str, fused: f64, exact: &[&str]) -> Match {
+            let mut procedure = Procedure::example();
+            procedure.id = ProcedureId::new(format!("p_{family}"));
+            procedure.family = FamilyId::new(family);
+            procedure.preconditions.clear();
+            Match {
+                row: ProcedureRow { rowid, procedure },
+                signals: Signals {
+                    exact: exact
+                        .iter()
+                        .map(|key| ((*key).to_owned(), "path".to_owned()))
+                        .collect(),
+                    fused,
+                    ..Signals::default()
+                },
+            }
+        }
+
+        fn gate(candidates: &[Match]) -> Decision {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            for candidate in candidates {
+                store
+                    .upsert(&candidate.row.procedure)
+                    .expect("procedure stores");
+            }
+            let place = Place {
                 root: Path::new("."),
                 session: None,
-            })
-            .expect("recall succeeds")
-    }
-
-    fn direction(weights: &[(usize, f32)]) -> Embedding {
-        let mut embedding = [0.0; DIMS];
-        for (axis, weight) in weights {
-            embedding[*axis] = *weight;
+            };
+            Recall::new(&store, None)
+                .seeded(7)
+                .decide(place, candidates)
+                .expect("decision succeeds")
         }
-        embedding
-    }
-
-    fn semantic(name: &str, vectors: &[(i64, Embedding)]) -> (Embedder, VectorIndex) {
-        let dir =
-            std::env::temp_dir().join(format!("trodden-recall-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("scratch directory is writable");
-        let token = b"crash";
-        let mut pack = b"TRDEMB\x01\0".to_vec();
-        for field in [DIMS, 1, token.len(), 0, 0, token.len(), 0] {
-            pack.extend(
-                u32::try_from(field)
-                    .expect("pack field is small")
-                    .to_le_bytes(),
-            );
-        }
-        pack.extend(token);
-        pack.extend(Quantized::new(&direction(&[(0, 1.0)])).to_bytes());
-        let pack_path = dir.join("embeddings.pack");
-        fs::write(&pack_path, pack).expect("pack is writable");
-        let rows: Vec<(i64, String, Vec<u8>)> = vectors
-            .iter()
-            .map(|(rowid, vector)| (*rowid, REPO.to_owned(), Quantized::new(vector).to_bytes()))
-            .collect();
-        let index_path = dir.join("recall.index");
-        VectorIndex::build(&rows, &index_path).expect("index builds");
-        (
-            Embedder::open(&pack_path).expect("pack opens"),
-            VectorIndex::open(&index_path).expect("index opens"),
-        )
-    }
-
-    fn unrelated(n: usize) -> Procedure {
-        let mut procedure = Procedure::example();
-        procedure.id = ProcedureId::new(format!("p_rotate{n}"));
-        procedure.family = FamilyId::new(format!("f_rotate{n}"));
-        procedure.title = format!("Rotate the staging credentials of service {n}");
-        procedure.trigger = Trigger {
-            entities: Vec::new(),
-            text: "rotate staging credentials".to_owned(),
-            examples: Vec::new(),
-        };
-        procedure.preconditions.clear();
-        procedure.steps.clear();
-        procedure.verify = None;
-        procedure.avoid.clear();
-        procedure
-    }
-
-    fn semantic_outcome(
-        name: &str,
-        prompt: &str,
-        target: Option<Embedding>,
-        closer: usize,
-    ) -> Outcome {
-        let mut store = Store::open_in_memory().expect("in-memory store opens");
-        let mut procedure = Procedure::example();
-        procedure.preconditions.clear();
-        let rowid = store.upsert(&procedure).expect("procedure stores").rowid();
-        let mut vectors: Vec<(i64, Embedding)> =
-            target.map(|target| (rowid, target)).into_iter().collect();
-        for n in 0..closer {
-            let rowid = store
-                .upsert(&unrelated(n))
-                .expect("procedure stores")
-                .rowid();
-            vectors.push((rowid, direction(&[(0, 0.5), (n + 2, 0.866)])));
-        }
-        Recall::new(&store, Some(semantic(name, &vectors)))
-            .seeded(7)
-            .recall(&Query {
-                prompt,
-                repo: REPO,
-                root: Path::new("."),
-                session: None,
-            })
-            .expect("recall succeeds")
-    }
-
-    fn semantic_decision(
-        name: &str,
-        prompt: &str,
-        target: Option<Embedding>,
-        closer: usize,
-    ) -> Decision {
-        semantic_outcome(name, prompt, target, closer).decision
     }
 
     #[test]
     fn abstains_on_a_far_exact_match_however_many_procedures_are_closer() {
-        let far = Some(direction(&[(1, 1.0)]));
+        let far = Some(Fixture::direction(&[(1, 1.0)]));
 
         assert_eq!(
-            semantic_decision("far-alone", CRASH_PROMPT, far, 0),
+            Fixture::semantic_decision("far-alone", CRASH_PROMPT, far, 0),
             Decision::Abstain(Abstention::NotConfident)
         );
         assert_eq!(
-            semantic_decision("far-crowded", CRASH_PROMPT, far, 12),
+            Fixture::semantic_decision("far-crowded", CRASH_PROMPT, far, 12),
             Decision::Abstain(Abstention::NotConfident)
         );
     }
 
     #[test]
     fn injects_a_near_exact_match_among_other_procedures() {
-        let near = Some(direction(&[(0, 0.6), (1, 0.8)]));
+        let near = Some(Fixture::direction(&[(0, 0.6), (1, 0.8)]));
 
         assert!(matches!(
-            semantic_decision("near-crowded", CRASH_PROMPT, near, 12),
+            Fixture::semantic_decision("near-crowded", CRASH_PROMPT, near, 12),
             Decision::Inject(_)
         ));
     }
 
     #[test]
     fn injects_a_moderately_close_exact_match_outside_the_semantic_top_ten() {
-        let moderate = Some(direction(&[(0, 0.35), (1, 0.937)]));
+        let moderate = Some(Fixture::direction(&[(0, 0.35), (1, 0.937)]));
 
-        let outcome = semantic_outcome("moderate-crowded", CRASH_PROMPT, moderate, 12);
+        let outcome = Fixture::semantic_outcome("moderate-crowded", CRASH_PROMPT, moderate, 12);
 
         let Decision::Inject(chosen) = outcome.decision else {
             panic!("expected an injection, got {:?}", outcome.decision);
@@ -810,15 +850,15 @@ mod tests {
 
     #[test]
     fn falls_back_to_exact_matches_without_a_semantic_score() {
-        let far = Some(direction(&[(1, 1.0)]));
+        let far = Some(Fixture::direction(&[(1, 1.0)]));
         let unembeddable = "Fix the hang in src/paginate.js when the user logs out.";
 
         assert!(matches!(
-            semantic_decision("unembedded", unembeddable, far, 12),
+            Fixture::semantic_decision("unembedded", unembeddable, far, 12),
             Decision::Inject(_)
         ));
         assert!(matches!(
-            semantic_decision("unindexed", CRASH_PROMPT, None, 12),
+            Fixture::semantic_decision("unindexed", CRASH_PROMPT, None, 12),
             Decision::Inject(_)
         ));
     }
@@ -839,8 +879,8 @@ mod tests {
         }
 
         fn recall(&self, name: &str) -> Outcome {
-            let vectors = [(self.rowid, direction(&[(0, 1.0)]))];
-            Recall::new(&self.store, Some(semantic(name, &vectors)))
+            let vectors = [(self.rowid, Fixture::direction(&[(0, 1.0)]))];
+            Recall::new(&self.store, Some(Fixture::semantic(name, &vectors)))
                 .seeded(7)
                 .recall(&Query {
                     prompt: CRASH_PROMPT,
@@ -858,8 +898,8 @@ mod tests {
     impl Truncated {
         fn recall(name: &str, file: &str) -> Outcome {
             let stale = StaleIndex::indexed();
-            let vectors = [(stale.rowid, direction(&[(0, 1.0)]))];
-            let semantic = semantic(name, &vectors);
+            let vectors = [(stale.rowid, Fixture::direction(&[(0, 1.0)]))];
+            let semantic = Fixture::semantic(name, &vectors);
             let path = std::env::temp_dir()
                 .join(format!("trodden-recall-{name}-{}", std::process::id()))
                 .join(file);
@@ -958,7 +998,7 @@ mod tests {
             .store
             .forget(trodden_store::Forget::Procedure("p_7f3a91c2"))
             .expect("procedure is forgotten");
-        let mut elsewhere = unrelated(0);
+        let mut elsewhere = Fixture::unrelated(0);
         elsewhere.scope = Scope::Repo {
             repo: RepoId::new("9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d"),
         };
@@ -1004,68 +1044,36 @@ mod tests {
         assert_eq!(decision, Decision::Abstain(Abstention::NoCandidates));
     }
 
-    fn scored(rowid: i64, family: &str, fused: f64, exact: &[&str]) -> Match {
-        let mut procedure = Procedure::example();
-        procedure.id = ProcedureId::new(format!("p_{family}"));
-        procedure.family = FamilyId::new(family);
-        procedure.preconditions.clear();
-        Match {
-            row: ProcedureRow { rowid, procedure },
-            signals: Signals {
-                exact: exact
-                    .iter()
-                    .map(|key| ((*key).to_owned(), "path".to_owned()))
-                    .collect(),
-                fused,
-                ..Signals::default()
-            },
-        }
-    }
-
-    fn gate(candidates: &[Match]) -> Decision {
-        let mut store = Store::open_in_memory().expect("in-memory store opens");
-        for candidate in candidates {
-            store
-                .upsert(&candidate.row.procedure)
-                .expect("procedure stores");
-        }
-        let place = Place {
-            root: Path::new("."),
-            session: None,
-        };
-        Recall::new(&store, None)
-            .seeded(7)
-            .decide(place, candidates)
-            .expect("decision succeeds")
-    }
-
     #[test]
     fn abstains_when_any_other_family_is_as_strong() {
-        let mut best = scored(1, "f_best", 1.0, &["src/paginate.js"]);
+        let mut best = Fixture::scored(1, "f_best", 1.0, &["src/paginate.js"]);
         best.signals.lexical = Some((0, 1.0));
-        let weak = scored(2, "f_weak", 0.99, &[]);
-        let strong = scored(3, "f_strong", 0.97, &["src/paginate.js"]);
-        let distant = scored(4, "f_distant", 0.9, &["src/paginate.js"]);
+        let weak = Fixture::scored(2, "f_weak", 0.99, &[]);
+        let strong = Fixture::scored(3, "f_strong", 0.97, &["src/paginate.js"]);
+        let distant = Fixture::scored(4, "f_distant", 0.9, &["src/paginate.js"]);
 
         let ambiguous = Decision::Abstain(Abstention::Ambiguous);
         assert_eq!(
-            gate(&[best.clone(), weak.clone(), strong.clone()]),
+            Fixture::gate(&[best.clone(), weak.clone(), strong.clone()]),
             ambiguous
         );
-        assert_eq!(gate(&[best.clone(), strong]), ambiguous);
+        assert_eq!(Fixture::gate(&[best.clone(), strong]), ambiguous);
         assert!(matches!(
-            gate(&[best.clone(), weak.clone()]),
+            Fixture::gate(&[best.clone(), weak.clone()]),
             Decision::Inject(_)
         ));
-        assert!(matches!(gate(&[best, weak, distant]), Decision::Inject(_)));
+        assert!(matches!(
+            Fixture::gate(&[best, weak, distant]),
+            Decision::Inject(_)
+        ));
     }
 
     #[test]
     fn the_prompts_task_kind_settles_a_tie() {
-        let mut other_kind = scored(1, "f_add", 1.0, &["src/paginate.js"]);
+        let mut other_kind = Fixture::scored(1, "f_add", 1.0, &["src/paginate.js"]);
         other_kind.signals.lexical = Some((1, 1.0));
         other_kind.signals.same_kind = Some(false);
-        let mut same_kind = scored(2, "f_fix", 0.98, &["src/paginate.js"]);
+        let mut same_kind = Fixture::scored(2, "f_fix", 0.98, &["src/paginate.js"]);
         same_kind.signals.lexical = Some((0, 1.0));
         same_kind.signals.same_kind = Some(true);
         let mut unclear = same_kind.clone();
@@ -1074,16 +1082,17 @@ mod tests {
         rival.signals.fused = 0.97;
         rival.signals.same_kind = Some(true);
 
-        let Decision::Inject(served) = gate(&[other_kind.clone(), same_kind.clone()]) else {
+        let Decision::Inject(served) = Fixture::gate(&[other_kind.clone(), same_kind.clone()])
+        else {
             panic!("the task of the prompt's kind is served");
         };
         assert_eq!(served.row.procedure.family.as_str(), "f_fix");
         assert_eq!(
-            gate(&[other_kind, unclear]),
+            Fixture::gate(&[other_kind, unclear]),
             Decision::Abstain(Abstention::NotConfident)
         );
         assert_eq!(
-            gate(&[same_kind, rival]),
+            Fixture::gate(&[same_kind, rival]),
             Decision::Abstain(Abstention::Ambiguous)
         );
     }
@@ -1096,10 +1105,13 @@ mod tests {
         store.upsert(&procedure).expect("procedure stores");
         let paste: String = (0..200_000).map(|n| format!("w{n:x} ")).collect();
 
-        let expected = outcome(&store, PROMPT);
+        let expected = Fixture::outcome(&store, PROMPT);
 
         assert!(matches!(expected.decision, Decision::Inject(_)));
-        assert_eq!(outcome(&store, &format!("{PROMPT}\n{paste}")), expected);
+        assert_eq!(
+            Fixture::outcome(&store, &format!("{PROMPT}\n{paste}")),
+            expected
+        );
     }
 
     #[test]
@@ -1137,7 +1149,7 @@ mod tests {
         }
 
         fn exact(&self, prompt: &str) -> Vec<(String, String)> {
-            let mut exact = outcome(&self.0, prompt)
+            let mut exact = Fixture::outcome(&self.0, prompt)
                 .candidates
                 .into_iter()
                 .next()
@@ -1165,7 +1177,7 @@ mod tests {
         let bare = "Fix the crash in index when the user logs out.";
 
         assert_eq!(
-            outcome(&learned.0, bare).decision,
+            Fixture::outcome(&learned.0, bare).decision,
             Decision::Abstain(Abstention::NotConfident)
         );
         assert_eq!(learned.exact(bare), Learned::pairs(&[("index", "stem")]));
@@ -1174,7 +1186,10 @@ mod tests {
             "Fix the crash in index.js when the user logs out.",
         ] {
             assert!(
-                matches!(outcome(&learned.0, prompt).decision, Decision::Inject(_)),
+                matches!(
+                    Fixture::outcome(&learned.0, prompt).decision,
+                    Decision::Inject(_)
+                ),
                 "{prompt}"
             );
         }
@@ -1206,7 +1221,7 @@ mod tests {
             Learned::pairs(&[("makefile", "path")])
         );
         assert!(matches!(
-            outcome(&learned.0, prompt).decision,
+            Fixture::outcome(&learned.0, prompt).decision,
             Decision::Inject(_)
         ));
     }
@@ -1285,12 +1300,12 @@ mod tests {
             )])
         );
         assert!(matches!(
-            outcome(&learned.0, pasted).decision,
+            Fixture::outcome(&learned.0, pasted).decision,
             Decision::Inject(_)
         ));
         assert_eq!(learned.exact(described), Learned::pairs(&[]));
         assert_eq!(
-            outcome(&learned.0, described).decision,
+            Fixture::outcome(&learned.0, described).decision,
             Decision::Abstain(Abstention::NotConfident)
         );
     }

@@ -1058,23 +1058,34 @@ mod tests {
                 })
                 .collect()
         }
-    }
 
-    fn step_summary(procedure: &Procedure) -> Vec<String> {
-        procedure
-            .steps
-            .iter()
-            .map(|step| {
-                format!(
-                    "{:?} {}",
-                    step.kind,
-                    step.target
-                        .as_deref()
-                        .or(step.command.as_deref())
-                        .unwrap_or("")
-                )
-            })
-            .collect()
+        fn step_summary(procedure: &Procedure) -> Vec<String> {
+            procedure
+                .steps
+                .iter()
+                .map(|step| {
+                    format!(
+                        "{:?} {}",
+                        step.kind,
+                        step.target
+                            .as_deref()
+                            .or(step.command.as_deref())
+                            .unwrap_or("")
+                    )
+                })
+                .collect()
+        }
+
+        fn file_preconditions(procedure: &Procedure) -> Vec<&str> {
+            procedure
+                .preconditions
+                .iter()
+                .filter_map(|condition| match condition {
+                    Condition::FileExists { path } => Some(path.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     #[test]
@@ -1091,7 +1102,7 @@ mod tests {
             .expect("verified task is admitted");
 
         assert_eq!(
-            step_summary(&procedure),
+            Sketch::step_summary(&procedure),
             [
                 "Edit schema/models.json",
                 "Run python3 tools/gen_models.py",
@@ -1423,7 +1434,7 @@ mod tests {
 
         assert_eq!(closed.len(), 1, "the last task is still open");
         assert_eq!(
-            step_summary(&procedure),
+            Sketch::step_summary(&procedure),
             [
                 "Edit src/cli.rs",
                 "Edit docs/COMMANDS.md",
@@ -1480,7 +1491,7 @@ mod tests {
         assert_eq!(verify.command, "python3 tools/check.py");
         assert_eq!(verify.declared_by.as_deref(), Some("README.md"));
         assert_eq!(
-            step_summary(&procedure).last().map(String::as_str),
+            Sketch::step_summary(&procedure).last().map(String::as_str),
             Some("Verify python3 -m unittest -v"),
             "the session's own check stays a step"
         );
@@ -1522,18 +1533,6 @@ mod tests {
             path: "migrations".to_owned()
         }));
     }
-
-    fn file_preconditions(procedure: &Procedure) -> Vec<&str> {
-        procedure
-            .preconditions
-            .iter()
-            .filter_map(|condition| match condition {
-                Condition::FileExists { path } => Some(path.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn generated_files_become_slots_instead_of_preconditions() {
         let generated = |migration: &str| {
@@ -1561,7 +1560,7 @@ mod tests {
             .expect("admitted");
 
         assert_eq!(
-            step_summary(&first),
+            Sketch::step_summary(&first),
             [
                 "Edit app/models.py",
                 "Run python3 manage.py makemigrations",
@@ -1571,13 +1570,13 @@ mod tests {
         );
         assert_eq!(first.slots[0].examples, ["0005_priority"]);
         assert_eq!(
-            file_preconditions(&first),
+            Sketch::file_preconditions(&first),
             ["app/models.py", "app/migrations"]
         );
         assert_eq!(first.family, second.family);
         assert_eq!(first.steps, second.steps);
         assert_eq!(
-            file_preconditions(&existing),
+            Sketch::file_preconditions(&existing),
             ["app/models.py", "app/admin.py"]
         );
         assert!(existing.slots.is_empty());
@@ -1602,7 +1601,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            step_summary(&procedures[0]),
+            Sketch::step_summary(&procedures[0]),
             [
                 "Create migrations/{migration}.sql",
                 "Run python3 tools/apply.py migrations/{migration}.sql",
@@ -1612,14 +1611,14 @@ mod tests {
         );
         assert_eq!(procedures[0].slots.len(), 1);
         assert_eq!(
-            step_summary(&procedures[1]),
+            Sketch::step_summary(&procedures[1]),
             [
                 "Edit migrations/{migration}.sql",
                 "Verify python3 -m unittest"
             ]
         );
         for procedure in &procedures {
-            assert_eq!(file_preconditions(procedure), ["migrations"]);
+            assert_eq!(Sketch::file_preconditions(procedure), ["migrations"]);
         }
     }
 
@@ -1641,7 +1640,7 @@ mod tests {
                 "{repro}"
             );
             assert_eq!(
-                file_preconditions(&procedure),
+                Sketch::file_preconditions(&procedure),
                 ["src/paginate.py"],
                 "{repro}"
             );
@@ -1669,7 +1668,7 @@ mod tests {
 
             assert_eq!(procedure.slots.len(), 1, "{path}");
             assert!(
-                !file_preconditions(&procedure).contains(&path),
+                !Sketch::file_preconditions(&procedure).contains(&path),
                 "{path}: {:?}",
                 procedure.preconditions
             );
@@ -1704,7 +1703,10 @@ mod tests {
             Some("prisma/migrations/{migration}/migration.sql")
         );
         assert_eq!(procedure.slots[0].examples, ["20240101120000_add_priority"]);
-        assert_eq!(file_preconditions(&procedure), ["prisma/migrations"]);
+        assert_eq!(
+            Sketch::file_preconditions(&procedure),
+            ["prisma/migrations"]
+        );
     }
 
     #[test]
@@ -1722,7 +1724,7 @@ mod tests {
             .expect("admitted");
 
         assert_eq!(
-            step_summary(&procedure),
+            Sketch::step_summary(&procedure),
             [
                 "Create migrations/{migration}.sql",
                 "Edit app/models.py",

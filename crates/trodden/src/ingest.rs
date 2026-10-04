@@ -567,7 +567,7 @@ mod tests {
         fn numbered_session(&self, index: usize) -> (String, PathBuf) {
             let session = format!("0f6c1c4e-2f3a-4b8e-9d1a-{index:012}");
             let transcript = self.dir.join(format!("{session}.jsonl"));
-            let text: String = task(
+            let text: String = Self::task(
                 0,
                 &format!("The total in src/order{index}.js ignores the discount code"),
                 &format!("src/order{index}.js"),
@@ -729,6 +729,81 @@ mod tests {
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .collect()
         }
+
+        fn at(minute: u32, second: u32) -> String {
+            format!("2026-10-01T10:{minute:02}:{second:02}Z")
+        }
+
+        fn line(minute: u32, second: u32, kind: &str, message: Value) -> Value {
+            json!({
+                "type": kind,
+                "sessionId": SESSION,
+                "cwd": CWD,
+                "timestamp": Self::at(minute, second),
+                "message": message,
+            })
+        }
+
+        fn task(minute: u32, prompt: &str, file: &str) -> Vec<Value> {
+            let path = format!("{CWD}/{file}");
+            let edit = format!("edit-{minute}");
+            let test = format!("test-{minute}");
+            let mut edited = Self::line(
+                minute,
+                20,
+                "user",
+                json!({"content": [{"type": "tool_result", "tool_use_id": edit, "content": "ok"}]}),
+            );
+            edited["toolUseResult"] = json!({
+                "filePath": path,
+                "originalFile": "module.exports = 1;\n",
+                "structuredPatch": [{
+                    "oldStart": 1,
+                    "lines": ["-module.exports = 1;", "+module.exports = 2;"],
+                }],
+            });
+            vec![
+                Self::line(minute, 0, "user", json!({"content": prompt})),
+                Self::line(
+                    minute,
+                    10,
+                    "assistant",
+                    json!({"content": [{"type": "tool_use", "id": edit, "name": "Edit", "input": {"file_path": path}}]}),
+                ),
+                edited,
+                Self::line(
+                    minute,
+                    30,
+                    "assistant",
+                    json!({"content": [{"type": "tool_use", "id": test, "name": "Bash", "input": {"command": "npm test"}}]}),
+                ),
+                Self::line(
+                    minute,
+                    40,
+                    "user",
+                    json!({"content": [{"type": "tool_result", "tool_use_id": test, "content": "pass 3"}]}),
+                ),
+            ]
+        }
+
+        fn inject(ingest: &Ingest, minute: u32) {
+            let row = ingest
+                .store
+                .list(None, true)
+                .expect("procedures list")
+                .remove(0);
+            ingest
+                .store
+                .record_injection(&Injection {
+                    session: SESSION.to_owned(),
+                    procedure: row.procedure.id.to_string(),
+                    revision: row.procedure.revision,
+                    holdout: false,
+                    cue: Cue::Prompt,
+                    at: Self::at(minute, 0).parse().expect("timestamp is valid"),
+                })
+                .expect("injection is recorded");
+        }
     }
 
     impl Drop for Scratch {
@@ -737,86 +812,11 @@ mod tests {
         }
     }
 
-    fn at(minute: u32, second: u32) -> String {
-        format!("2026-10-01T10:{minute:02}:{second:02}Z")
-    }
-
-    fn line(minute: u32, second: u32, kind: &str, message: Value) -> Value {
-        json!({
-            "type": kind,
-            "sessionId": SESSION,
-            "cwd": CWD,
-            "timestamp": at(minute, second),
-            "message": message,
-        })
-    }
-
-    fn task(minute: u32, prompt: &str, file: &str) -> Vec<Value> {
-        let path = format!("{CWD}/{file}");
-        let edit = format!("edit-{minute}");
-        let test = format!("test-{minute}");
-        let mut edited = line(
-            minute,
-            20,
-            "user",
-            json!({"content": [{"type": "tool_result", "tool_use_id": edit, "content": "ok"}]}),
-        );
-        edited["toolUseResult"] = json!({
-            "filePath": path,
-            "originalFile": "module.exports = 1;\n",
-            "structuredPatch": [{
-                "oldStart": 1,
-                "lines": ["-module.exports = 1;", "+module.exports = 2;"],
-            }],
-        });
-        vec![
-            line(minute, 0, "user", json!({"content": prompt})),
-            line(
-                minute,
-                10,
-                "assistant",
-                json!({"content": [{"type": "tool_use", "id": edit, "name": "Edit", "input": {"file_path": path}}]}),
-            ),
-            edited,
-            line(
-                minute,
-                30,
-                "assistant",
-                json!({"content": [{"type": "tool_use", "id": test, "name": "Bash", "input": {"command": "npm test"}}]}),
-            ),
-            line(
-                minute,
-                40,
-                "user",
-                json!({"content": [{"type": "tool_result", "tool_use_id": test, "content": "pass 3"}]}),
-            ),
-        ]
-    }
-
-    fn inject(ingest: &Ingest, minute: u32) {
-        let row = ingest
-            .store
-            .list(None, true)
-            .expect("procedures list")
-            .remove(0);
-        ingest
-            .store
-            .record_injection(&Injection {
-                session: SESSION.to_owned(),
-                procedure: row.procedure.id.to_string(),
-                revision: row.procedure.revision,
-                holdout: false,
-                cue: Cue::Prompt,
-                at: at(minute, 0).parse().expect("timestamp is valid"),
-            })
-            .expect("injection is recorded");
-    }
-
     #[test]
     fn resumed_sessions_are_learned_from_after_ending() {
         let scratch = Scratch::new("resumed");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -826,12 +826,12 @@ mod tests {
             .expect("first ingest");
         assert_eq!((first.sessions, first.tasks, first.created), (1, 1, 1));
 
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
         ));
-        inject(&ingest, 5);
+        Scratch::inject(&ingest, 5);
         let running = ingest
             .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest while resumed");
@@ -858,7 +858,7 @@ mod tests {
     fn follow_ups_after_resuming_join_the_extracted_task() {
         let scratch = Scratch::new("follow-up");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -867,8 +867,8 @@ mod tests {
             .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("first ingest");
 
-        scratch.append(&task(5, "still failing", "src/paginate.js"));
-        inject(&ingest, 5);
+        scratch.append(&Scratch::task(5, "still failing", "src/paginate.js"));
+        Scratch::inject(&ingest, 5);
         let resumed = ingest
             .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("ingest after resuming");
@@ -888,7 +888,7 @@ mod tests {
         let scratch = Scratch::new("paused");
         let mut ingest = scratch.ingest();
         ingest.store.set_paused(true).expect("capture pauses");
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -904,7 +904,7 @@ mod tests {
             .expect("ingest after resuming capture");
         assert_eq!((ended.sessions, ended.tasks, ended.created), (1, 0, 0));
 
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -933,7 +933,7 @@ mod tests {
     fn sessions_spanning_a_pause_learn_only_what_followed_it() {
         let scratch = Scratch::new("spanning-pause");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -942,18 +942,18 @@ mod tests {
             .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect("first ingest");
 
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
         ));
-        inject(&ingest, 5);
+        Scratch::inject(&ingest, 5);
         ingest
             .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before pausing");
 
         ingest.store.set_paused(true).expect("capture pauses");
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             10,
             "Search in src/search.js returns archived products to shoppers",
             "src/search.js",
@@ -963,9 +963,9 @@ mod tests {
             .expect("ingest while paused");
 
         ingest.store.set_paused(false).expect("capture resumes");
-        scratch.append(&task(15, "still failing", "src/search.js"));
-        inject(&ingest, 15);
-        scratch.append(&task(
+        scratch.append(&Scratch::task(15, "still failing", "src/search.js"));
+        Scratch::inject(&ingest, 15);
+        scratch.append(&Scratch::task(
             20,
             "Checkout in src/checkout.js charges shipping twice",
             "src/checkout.js",
@@ -995,7 +995,7 @@ mod tests {
             let mut ingest = scratch.ingest();
             scratch.append_in(
                 cwd,
-                &task(
+                &Scratch::task(
                     0,
                     &format!("The cart total in {cwd}/src/cart.js ignores the discount code"),
                     "src/cart.js",
@@ -1013,7 +1013,10 @@ mod tests {
     fn sessions_without_an_absolute_directory_are_refused() {
         let scratch = Scratch::new("relative-cwd");
         let mut ingest = scratch.ingest();
-        scratch.append_in("shop", &task(0, "Fix the cart total", "src/cart.js"));
+        scratch.append_in(
+            "shop",
+            &Scratch::task(0, "Fix the cart total", "src/cart.js"),
+        );
         let error = ingest
             .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect_err("a relative directory is refused");
@@ -1030,7 +1033,7 @@ mod tests {
     fn transcripts_with_invalid_utf8_are_still_learned() {
         let scratch = Scratch::new("invalid-utf8");
         let mut ingest = scratch.ingest();
-        scratch.append_damaged(&task(
+        scratch.append_damaged(&Scratch::task(
             0,
             "The cart total in src/caf\u{e9}.js ignores the discount code",
             "src/cart.js",
@@ -1057,7 +1060,7 @@ mod tests {
     fn idle_sessions_with_invalid_utf8_are_learned_before_ending() {
         let scratch = Scratch::new("idle-invalid-utf8");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1068,7 +1071,7 @@ mod tests {
         scratch.tear();
         scratch.go_idle();
 
-        let other = scratch.other_session(&task(
+        let other = scratch.other_session(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1084,12 +1087,12 @@ mod tests {
     fn backfill_learns_transcripts_with_invalid_utf8() {
         let scratch = Scratch::new("backfill-invalid-utf8");
         let mut ingest = scratch.ingest();
-        scratch.append_damaged(&task(
+        scratch.append_damaged(&Scratch::task(
             0,
             "The cart total in src/caf\u{e9}.js ignores the discount code",
             "src/cart.js",
         ));
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             5,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1110,12 +1113,12 @@ mod tests {
     fn backfill_while_paused_leaves_history_for_later() {
         let scratch = Scratch::new("paused-backfill");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
         ));
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1147,7 +1150,7 @@ mod tests {
     fn idle_sessions_that_never_ended_are_finished_by_later_ingests() {
         let scratch = Scratch::new("never-ended");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1157,7 +1160,7 @@ mod tests {
             .expect("ingest before the crash");
         assert_eq!((crashed.sessions, crashed.tasks), (1, 0));
 
-        let other = scratch.other_session(&task(
+        let other = scratch.other_session(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1196,7 +1199,7 @@ mod tests {
     fn idle_sessions_are_left_alone_while_paused() {
         let scratch = Scratch::new("never-ended-paused");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1205,7 +1208,7 @@ mod tests {
             .transcript(Harness::ClaudeCode, &scratch.transcript, false)
             .expect("ingest before the crash");
         scratch.go_idle();
-        let other = scratch.other_session(&task(
+        let other = scratch.other_session(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1230,7 +1233,7 @@ mod tests {
     fn sessions_whose_transcript_is_gone_are_ended() {
         let scratch = Scratch::new("never-ended-gone");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1240,7 +1243,7 @@ mod tests {
             .expect("ingest before the crash");
         fs::remove_file(&scratch.transcript).expect("transcript is removed");
 
-        let other = scratch.other_session(&task(
+        let other = scratch.other_session(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1286,7 +1289,7 @@ mod tests {
                 )
                 .expect("progress saves");
         }
-        let other = scratch.other_session(&task(
+        let other = scratch.other_session(&Scratch::task(
             5,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1333,7 +1336,7 @@ mod tests {
             let mut ingest = scratch.ingest();
             scratch.append_in(
                 &repo.to_string_lossy(),
-                &task(
+                &Scratch::task(
                     0,
                     "The cart total in src/cart.js ignores the discount code",
                     "src/cart.js",
@@ -1355,7 +1358,7 @@ mod tests {
     fn relative_transcripts_are_recorded_by_absolute_path() {
         let scratch = Scratch::new("relative-transcript");
         let mut ingest = scratch.ingest();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1397,7 +1400,7 @@ mod tests {
     fn background_ingests_leave_their_transcript_to_the_running_one() {
         let scratch = Scratch::new("deferred");
         let home = scratch.home();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1420,7 +1423,7 @@ mod tests {
     fn transcripts_queued_as_the_running_ingest_releases_are_picked_up() {
         let scratch = Scratch::new("deferred-race");
         let home = scratch.home();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1486,7 +1489,7 @@ mod tests {
     fn queued_transcripts_of_an_unknown_harness_are_skipped() {
         let scratch = Scratch::new("deferred-harness");
         let home = scratch.home();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1517,7 +1520,7 @@ mod tests {
     fn unreadable_queued_markers_are_logged_and_dropped() {
         let scratch = Scratch::new("deferred-corrupt");
         let home = scratch.home();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",
@@ -1551,14 +1554,14 @@ mod tests {
         let home = scratch.home();
         scratch.append_in(
             "shop",
-            &task(
+            &Scratch::task(
                 0,
                 "Page 2 in src/paginate.js repeats the last product from page 1",
                 "src/paginate.js",
             ),
         );
         let missing = scratch.dir.join("missing.jsonl");
-        let healthy = scratch.other_session(&task(
+        let healthy = scratch.other_session(&Scratch::task(
             0,
             "The cart total in src/cart.js ignores the discount code",
             "src/cart.js",
@@ -1604,7 +1607,7 @@ mod tests {
     fn queued_markers_name_their_harness_by_its_stored_id() {
         let scratch = Scratch::new("deferred-format");
         let home = scratch.home();
-        scratch.append(&task(
+        scratch.append(&Scratch::task(
             0,
             "Page 2 in src/paginate.js repeats the last product from page 1",
             "src/paginate.js",

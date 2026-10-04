@@ -115,18 +115,23 @@ mod tests {
 
     use super::*;
 
-    fn close(a: f64, b: f64, tolerance: f64) -> bool {
-        (a - b).abs() <= tolerance
+    #[derive(Debug)]
+    struct Tolerance;
+
+    impl Tolerance {
+        fn close(a: f64, b: f64, tolerance: f64) -> bool {
+            (a - b).abs() <= tolerance
+        }
     }
 
     #[test]
     fn known_comparisons() {
-        assert!(close(
+        assert!(Tolerance::close(
             Evidence::new(1, 0).prob_better_than(Evidence::default()),
             2.0 / 3.0,
             1e-12
         ));
-        assert!(close(
+        assert!(Tolerance::close(
             Evidence::new(4, 6).prob_better_than(Evidence::new(4, 6)),
             0.5,
             1e-9
@@ -145,7 +150,7 @@ mod tests {
         let sampled = wins as f64 / f64::from(draws);
 
         assert!(
-            close(x.prob_better_than(y), sampled, 0.005),
+            Tolerance::close(x.prob_better_than(y), sampled, 0.005),
             "{sampled} vs {}",
             x.prob_better_than(y)
         );
@@ -153,8 +158,16 @@ mod tests {
 
     #[test]
     fn tail_probabilities() {
-        assert!(close(Evidence::default().prob_below(0.3), 0.3, 1e-12));
-        assert!(close(Evidence::new(0, 1).prob_below(0.5), 0.75, 1e-12));
+        assert!(Tolerance::close(
+            Evidence::default().prob_below(0.3),
+            0.3,
+            1e-12
+        ));
+        assert!(Tolerance::close(
+            Evidence::new(0, 1).prob_below(0.5),
+            0.75,
+            1e-12
+        ));
         assert!(Evidence::new(0, 9).prob_below(0.5) > 0.99);
     }
 
@@ -162,7 +175,7 @@ mod tests {
         fn comparisons_are_complementary(a: u8, b: u8, c: u8, d: u8) -> bool {
             let x = Evidence::new(a.into(), b.into());
             let y = Evidence::new(c.into(), d.into());
-            close(x.prob_better_than(y) + y.prob_better_than(x), 1.0, 1e-6)
+            Tolerance::close(x.prob_better_than(y) + y.prob_better_than(x), 1.0, 1e-6)
         }
 
         fn more_successes_never_hurt(a: u8, b: u8, c: u8, d: u8) -> bool {

@@ -266,47 +266,68 @@ mod tests {
     use super::*;
     use crate::procedure::{Step, StepKind, Verification};
 
-    fn procedure(commands: &[&str]) -> Procedure {
-        let mut procedure: Procedure = Procedure::example();
-        procedure.steps = commands
-            .iter()
-            .map(|command| Step {
-                kind: StepKind::Run,
-                command: Some((*command).to_owned()),
-                target: None,
-                symbols: Vec::new(),
-                reads: Vec::new(),
-                writes: Vec::new(),
-            })
-            .collect();
-        procedure.slots = Vec::new();
-        procedure.verify = None;
-        procedure
-    }
+    #[derive(Debug)]
+    struct Fixture;
 
-    fn commands(procedure: &Procedure) -> Vec<&str> {
-        procedure
-            .steps
-            .iter()
-            .filter_map(|step| step.command.as_deref())
-            .collect()
-    }
+    impl Fixture {
+        fn procedure(commands: &[&str]) -> Procedure {
+            let mut procedure: Procedure = Procedure::example();
+            procedure.steps = commands
+                .iter()
+                .map(|command| Step {
+                    kind: StepKind::Run,
+                    command: Some((*command).to_owned()),
+                    target: None,
+                    symbols: Vec::new(),
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                })
+                .collect();
+            procedure.slots = Vec::new();
+            procedure.verify = None;
+            procedure
+        }
 
-    fn checked(commands: &[&str], check: &str) -> Procedure {
-        let mut procedure = procedure(commands);
-        procedure.verify = Some(Verification {
-            command: check.to_owned(),
-            expect_exit: 0,
-            declared_by: None,
-        });
-        procedure
-    }
+        fn commands(procedure: &Procedure) -> Vec<&str> {
+            procedure
+                .steps
+                .iter()
+                .filter_map(|step| step.command.as_deref())
+                .collect()
+        }
 
-    fn check(procedure: &Procedure) -> Option<&str> {
-        procedure
-            .verify
-            .as_ref()
-            .map(|verify| verify.command.as_str())
+        fn checked(commands: &[&str], check: &str) -> Procedure {
+            let mut procedure = Self::procedure(commands);
+            procedure.verify = Some(Verification {
+                command: check.to_owned(),
+                expect_exit: 0,
+                declared_by: None,
+            });
+            procedure
+        }
+
+        fn check(procedure: &Procedure) -> Option<&str> {
+            procedure
+                .verify
+                .as_ref()
+                .map(|verify| verify.command.as_str())
+        }
+
+        fn session(test: &str, dir: &str, release: bool) -> Procedure {
+            let check = if release {
+                format!("cargo test --release {test}")
+            } else {
+                format!("cargo test {test}")
+            };
+            Self::checked(
+                &[
+                    &format!("mkdir {dir}"),
+                    &format!("python3 tools/new.py --name={test} {dir}"),
+                    &check,
+                ],
+                &check,
+            )
+        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -317,9 +338,11 @@ mod tests {
 
     impl Shape {
         fn of(procedure: &Procedure) -> Self {
-            let mut lines: Vec<String> =
-                commands(procedure).into_iter().map(str::to_owned).collect();
-            lines.extend(check(procedure).map(str::to_owned));
+            let mut lines: Vec<String> = Fixture::commands(procedure)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            lines.extend(Fixture::check(procedure).map(str::to_owned));
             let mut slots: Vec<(String, SlotKind, Vec<String>)> = Vec::new();
             for line in &lines {
                 for piece in line.split('{').skip(1) {
@@ -351,34 +374,19 @@ mod tests {
         }
     }
 
-    fn session(test: &str, dir: &str, release: bool) -> Procedure {
-        let check = if release {
-            format!("cargo test --release {test}")
-        } else {
-            format!("cargo test {test}")
-        };
-        checked(
-            &[
-                &format!("mkdir {dir}"),
-                &format!("python3 tools/new.py --name={test} {dir}"),
-                &check,
-            ],
-            &check,
-        )
-    }
-
     #[test]
     fn differing_arguments_become_slots() {
-        let first = procedure(&[
+        let first = Fixture::procedure(&[
             "python3 tools/new.py --name add_priority",
             "pytest -k priority",
         ]);
-        let second = procedure(&["python3 tools/new.py --name add_due_date", "pytest -k due"]);
+        let second =
+            Fixture::procedure(&["python3 tools/new.py --name add_due_date", "pytest -k due"]);
 
         let merged = first.anti_unify(&second).expect("same path");
 
         assert_eq!(
-            commands(&merged),
+            Fixture::commands(&merged),
             ["python3 tools/new.py --name {name}", "pytest -k {k}"]
         );
         assert_eq!(merged.slots[0].examples, ["add_priority", "add_due_date"]);
@@ -386,16 +394,16 @@ mod tests {
 
     #[test]
     fn a_third_session_adds_a_value() {
-        let first = procedure(&["cargo test count_prints"]);
-        let second = procedure(&["cargo test total_prints"]);
-        let third = procedure(&["cargo test unpaid_prints"]);
+        let first = Fixture::procedure(&["cargo test count_prints"]);
+        let second = Fixture::procedure(&["cargo test total_prints"]);
+        let third = Fixture::procedure(&["cargo test unpaid_prints"]);
 
         let merged = first
             .anti_unify(&second)
             .and_then(|merged| merged.anti_unify(&third))
             .expect("same path");
 
-        assert_eq!(commands(&merged), ["cargo test {test}"]);
+        assert_eq!(Fixture::commands(&merged), ["cargo test {test}"]);
         assert_eq!(merged.slots.len(), 1);
         assert_eq!(
             merged.slots[0].examples,
@@ -405,13 +413,15 @@ mod tests {
 
     #[test]
     fn values_of_shared_slots_are_reused() {
-        let mut first = procedure(&["python3 tools/apply.py migrations/0005_add_priority.sql"]);
+        let mut first =
+            Fixture::procedure(&["python3 tools/apply.py migrations/0005_add_priority.sql"]);
         first.slots = vec![Slot {
             name: "migration".to_owned(),
             kind: SlotKind::Identifier,
             examples: vec!["0005_add_priority".to_owned()],
         }];
-        let mut second = procedure(&["python3 tools/apply.py migrations/0006_add_due.sql"]);
+        let mut second =
+            Fixture::procedure(&["python3 tools/apply.py migrations/0006_add_due.sql"]);
         second.slots = vec![Slot {
             name: "migration".to_owned(),
             kind: SlotKind::Identifier,
@@ -421,7 +431,7 @@ mod tests {
         let merged = first.anti_unify(&second).expect("same path");
 
         assert_eq!(
-            commands(&merged),
+            Fixture::commands(&merged),
             ["python3 tools/apply.py migrations/{migration}.sql"]
         );
         assert_eq!(merged.slots.len(), 1);
@@ -429,50 +439,57 @@ mod tests {
 
     #[test]
     fn different_paths_stay_apart() {
-        let base = procedure(&["cargo test count_prints"]);
+        let base = Fixture::procedure(&["cargo test count_prints"]);
         for other in [
-            procedure(&["cargo test --release count_prints"]),
-            procedure(&["cargo test --doc"]),
-            procedure(&["cargo nextest run count_prints"]),
-            procedure(&["cargo build", "cargo test count_prints"]),
-            procedure(&["cargo test count_prints extra args here"]),
+            Fixture::procedure(&["cargo test --release count_prints"]),
+            Fixture::procedure(&["cargo test --doc"]),
+            Fixture::procedure(&["cargo nextest run count_prints"]),
+            Fixture::procedure(&["cargo build", "cargo test count_prints"]),
+            Fixture::procedure(&["cargo test count_prints extra args here"]),
         ] {
-            assert!(base.anti_unify(&other).is_none(), "{:?}", commands(&other));
+            assert!(
+                base.anti_unify(&other).is_none(),
+                "{:?}",
+                Fixture::commands(&other)
+            );
         }
-        let wide = procedure(&["make a b c"]);
-        assert!(wide.anti_unify(&procedure(&["make x y z"])).is_none());
+        let wide = Fixture::procedure(&["make a b c"]);
+        assert!(
+            wide.anti_unify(&Fixture::procedure(&["make x y z"]))
+                .is_none()
+        );
     }
 
     #[test]
     fn the_check_shares_the_slot_of_its_step() {
-        let first = checked(&["cargo test count_prints"], "cargo test count_prints");
-        let second = checked(&["cargo test total_prints"], "cargo test total_prints");
+        let first = Fixture::checked(&["cargo test count_prints"], "cargo test count_prints");
+        let second = Fixture::checked(&["cargo test total_prints"], "cargo test total_prints");
 
         let merged = first.anti_unify(&second).expect("same path");
 
-        assert_eq!(commands(&merged), ["cargo test {test}"]);
-        assert_eq!(check(&merged), Some("cargo test {test}"));
+        assert_eq!(Fixture::commands(&merged), ["cargo test {test}"]);
+        assert_eq!(Fixture::check(&merged), Some("cargo test {test}"));
         assert_eq!(merged.slots.len(), 1);
         assert_eq!(merged.slots[0].examples, ["count_prints", "total_prints"]);
     }
 
     #[test]
     fn values_that_stop_agreeing_get_their_own_slot() {
-        let merged = checked(&["cargo test count_prints"], "cargo test count_prints")
-            .anti_unify(&checked(
+        let merged = Fixture::checked(&["cargo test count_prints"], "cargo test count_prints")
+            .anti_unify(&Fixture::checked(
                 &["cargo test total_prints"],
                 "cargo test total_prints",
             ))
             .and_then(|merged| {
-                merged.anti_unify(&checked(
+                merged.anti_unify(&Fixture::checked(
                     &["cargo test unpaid_prints"],
                     "cargo test paid_prints",
                 ))
             })
             .expect("same path");
 
-        assert_eq!(commands(&merged), ["cargo test {test}"]);
-        assert_eq!(check(&merged), Some("cargo test {test_2}"));
+        assert_eq!(Fixture::commands(&merged), ["cargo test {test}"]);
+        assert_eq!(Fixture::check(&merged), Some("cargo test {test_2}"));
         assert_eq!(
             merged.slots[0].examples,
             ["count_prints", "total_prints", "unpaid_prints"]
@@ -485,19 +502,19 @@ mod tests {
 
     #[test]
     fn placeholders_on_either_side_stay_placeholders() {
-        let merged = checked(&["cargo test count_prints"], "cargo test count_prints")
-            .anti_unify(&checked(
+        let merged = Fixture::checked(&["cargo test count_prints"], "cargo test count_prints")
+            .anti_unify(&Fixture::checked(
                 &["cargo test total_prints"],
                 "cargo test total_prints",
             ))
             .expect("same path");
-        let third = checked(&["cargo test unpaid_prints"], "cargo test unpaid_prints");
+        let third = Fixture::checked(&["cargo test unpaid_prints"], "cargo test unpaid_prints");
 
         let forward = merged.anti_unify(&third).expect("same path");
         let backward = third.anti_unify(&merged).expect("same path");
 
-        assert_eq!(commands(&backward), ["cargo test {test}"]);
-        assert_eq!(check(&backward), Some("cargo test {test}"));
+        assert_eq!(Fixture::commands(&backward), ["cargo test {test}"]);
+        assert_eq!(Fixture::check(&backward), Some("cargo test {test}"));
         assert_eq!(
             backward.slots[0].examples,
             ["count_prints", "total_prints", "unpaid_prints"]
@@ -507,8 +524,8 @@ mod tests {
 
     #[test]
     fn braces_that_are_not_placeholders_are_not_values() {
-        let named = procedure(&["find src -exec rustfmt main.rs +"]);
-        let braced = procedure(&["find src -exec rustfmt {} +"]);
+        let named = Fixture::procedure(&["find src -exec rustfmt main.rs +"]);
+        let braced = Fixture::procedure(&["find src -exec rustfmt {} +"]);
 
         assert!(named.anti_unify(&braced).is_none());
         assert!(braced.anti_unify(&named).is_none());
@@ -520,7 +537,7 @@ mod tests {
         for test in ["count_prints", "total_prints", "out"] {
             for dir in ["out", "build/out", "total_prints"] {
                 for release in [false, true] {
-                    sessions.push(session(test, dir, release));
+                    sessions.push(Fixture::session(test, dir, release));
                 }
             }
         }
@@ -529,7 +546,13 @@ mod tests {
             for b in &sessions {
                 let forward = a.anti_unify(b).as_ref().map(Shape::of);
                 let backward = b.anti_unify(a).as_ref().map(Shape::of);
-                assert_eq!(forward, backward, "{:?} and {:?}", commands(a), commands(b));
+                assert_eq!(
+                    forward,
+                    backward,
+                    "{:?} and {:?}",
+                    Fixture::commands(a),
+                    Fixture::commands(b)
+                );
                 for c in &sessions {
                     let merges: Vec<Option<Shape>> = [[a, b, c], [a, c, b], [b, c, a]]
                         .into_iter()
@@ -545,9 +568,9 @@ mod tests {
                     assert!(
                         merges.windows(2).all(|pair| pair[0] == pair[1]),
                         "{:?}, {:?} and {:?}: {merges:#?}",
-                        commands(a),
-                        commands(b),
-                        commands(c)
+                        Fixture::commands(a),
+                        Fixture::commands(b),
+                        Fixture::commands(c)
                     );
                 }
             }

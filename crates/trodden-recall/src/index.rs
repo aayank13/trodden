@@ -260,18 +260,18 @@ mod tests {
 
     use super::*;
 
-    fn direction(weights: &[(usize, f32)]) -> Embedding {
-        let mut embedding = [0.0; DIMS];
-        for (axis, weight) in weights {
-            embedding[*axis] = *weight;
-        }
-        embedding
-    }
-
     #[derive(Debug)]
     struct Fixture;
 
     impl Fixture {
+        fn direction(weights: &[(usize, f32)]) -> Embedding {
+            let mut embedding = [0.0; DIMS];
+            for (axis, weight) in weights {
+                embedding[*axis] = *weight;
+            }
+            embedding
+        }
+
         fn index(name: &str) -> Vec<u8> {
             let rows: Vec<(i64, String, Vec<u8>)> = [(1, "repo-a"), (2, "repo-b"), (3, "")]
                 .into_iter()
@@ -279,7 +279,7 @@ mod tests {
                     (
                         rowid,
                         repo.to_owned(),
-                        Quantized::new(&direction(&[(0, 1.0)])).to_bytes(),
+                        Quantized::new(&Fixture::direction(&[(0, 1.0)])).to_bytes(),
                     )
                 })
                 .collect();
@@ -318,7 +318,7 @@ mod tests {
         let mut index = Fixture::open("search", &Fixture::index("search")).expect("index opens");
 
         let neighbors = index
-            .search(&direction(&[(0, 1.0)]), "repo-a", 10)
+            .search(&Fixture::direction(&[(0, 1.0)]), "repo-a", 10)
             .expect("index searches");
 
         let mut rowids: Vec<i64> = neighbors.iter().map(|neighbor| neighbor.rowid).collect();
@@ -370,7 +370,7 @@ mod tests {
             (
                 rowid,
                 repo.to_owned(),
-                Quantized::new(&direction(weights)).to_bytes(),
+                Quantized::new(&Fixture::direction(weights)).to_bytes(),
             )
         };
         let rows = vec![
@@ -386,7 +386,7 @@ mod tests {
         let mut index = VectorIndex::open(&path).expect("index opens");
 
         let mut cosines = index
-            .cosines(&direction(&[(0, 1.0)]), "repo-a", &[1, 3, 4, 9])
+            .cosines(&Fixture::direction(&[(0, 1.0)]), "repo-a", &[1, 3, 4, 9])
             .expect("index looks up cosines");
         fs::remove_file(&path).expect("index is removable");
 

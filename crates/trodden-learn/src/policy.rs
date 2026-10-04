@@ -96,16 +96,16 @@ mod tests {
 
     use super::*;
 
-    fn revision(
-        revision: u32,
-        state: Lifecycle,
-        successes: u32,
-        failures: u32,
-    ) -> RevisionEvidence {
-        RevisionEvidence {
-            revision,
-            state,
-            evidence: Evidence::new(successes, failures),
+    #[derive(Debug)]
+    struct Revision;
+
+    impl Revision {
+        fn of(revision: u32, state: Lifecycle, successes: u32, failures: u32) -> RevisionEvidence {
+            RevisionEvidence {
+                revision,
+                state,
+                evidence: Evidence::new(successes, failures),
+            }
         }
     }
 
@@ -113,8 +113,8 @@ mod tests {
     fn promotes_a_clearly_better_candidate() {
         let changes = Policy::settle(
             &[
-                revision(1, Lifecycle::Active, 2, 6),
-                revision(2, Lifecycle::Candidate, 8, 0),
+                Revision::of(1, Lifecycle::Active, 2, 6),
+                Revision::of(2, Lifecycle::Candidate, 8, 0),
             ],
             Evidence::default(),
         );
@@ -126,8 +126,8 @@ mod tests {
     fn keeps_the_incumbent_on_thin_evidence() {
         let changes = Policy::settle(
             &[
-                revision(1, Lifecycle::Active, 3, 1),
-                revision(2, Lifecycle::Candidate, 2, 0),
+                Revision::of(1, Lifecycle::Active, 3, 1),
+                Revision::of(2, Lifecycle::Candidate, 2, 0),
             ],
             Evidence::default(),
         );
@@ -139,8 +139,8 @@ mod tests {
     fn quarantines_revisions_worse_than_the_holdout() {
         let changes = Policy::settle(
             &[
-                revision(1, Lifecycle::Active, 1, 7),
-                revision(2, Lifecycle::Candidate, 1, 0),
+                Revision::of(1, Lifecycle::Active, 1, 7),
+                Revision::of(2, Lifecycle::Candidate, 1, 0),
             ],
             Evidence::new(6, 1),
         );
@@ -153,8 +153,14 @@ mod tests {
 
     #[test]
     fn without_a_holdout_only_clear_failure_quarantines() {
-        let failing = Policy::settle(&[revision(1, Lifecycle::Active, 0, 6)], Evidence::default());
-        let mediocre = Policy::settle(&[revision(1, Lifecycle::Active, 3, 4)], Evidence::default());
+        let failing = Policy::settle(
+            &[Revision::of(1, Lifecycle::Active, 0, 6)],
+            Evidence::default(),
+        );
+        let mediocre = Policy::settle(
+            &[Revision::of(1, Lifecycle::Active, 3, 4)],
+            Evidence::default(),
+        );
 
         assert_eq!(failing, [(1, Lifecycle::Quarantined)]);
         assert!(mediocre.is_empty());

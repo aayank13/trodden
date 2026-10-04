@@ -886,100 +886,105 @@ mod tests {
         }
     }
 
-    fn relearned(state: Lifecycle, check: &str) -> (Upsert, Store) {
-        let mut store = Store::open_in_memory().expect("store opens");
-        store.upsert(&Procedure::example()).expect("stored");
-        store
-            .set_states("p_7f3a91c2", &[(1, state)])
-            .expect("state changes");
-        let mut later = Procedure::example();
-        later.provenance.sources[0].session =
-            SessionId::new("9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58");
-        later
-            .steps
-            .iter_mut()
-            .rfind(|step| step.kind == StepKind::Verify)
-            .expect("the example has a check")
-            .command = Some(check.to_owned());
-        let upsert = store.upsert(&later).expect("stored");
-        (upsert, store)
-    }
+    #[derive(Debug)]
+    struct Example;
 
-    fn states(store: &Store) -> Vec<(u32, Lifecycle)> {
-        store
-            .revisions("p_7f3a91c2")
-            .expect("revisions read")
-            .iter()
-            .map(|row| (row.procedure.revision, row.procedure.state))
-            .collect()
-    }
-
-    fn recallable(store: &Store) -> bool {
-        !store
-            .entity_hits(&["paginate".to_owned()], REPO)
-            .expect("entities read")
-            .is_empty()
-    }
-
-    fn learned_and_injected(store: &mut Store) {
-        let rowid = store.upsert(&Procedure::example()).expect("stored").rowid();
-        for (first_seq, procedure, rejection) in [
-            (0, Some(rowid), None),
-            (8, None, Some("no files were changed")),
-        ] {
+    impl Example {
+        fn relearned(state: Lifecycle, check: &str) -> (Upsert, Store) {
+            let mut store = Store::open_in_memory().expect("store opens");
+            store.upsert(&Procedure::example()).expect("stored");
             store
-                .record_extraction(&ExtractionRecord {
-                    session: SESSION.to_owned(),
-                    first_seq,
-                    summary: "Page 2 repeats the last product".to_owned(),
-                    procedure,
-                    rejection: rejection.map(str::to_owned),
-                    outcome: Some("succeeded".to_owned()),
-                    tool_calls: Some(6),
-                    span: None,
-                    at: "2026-09-21T14:02:44Z".to_owned(),
-                })
-                .expect("extraction recorded");
+                .set_states("p_7f3a91c2", &[(1, state)])
+                .expect("state changes");
+            let mut later = Procedure::example();
+            later.provenance.sources[0].session =
+                SessionId::new("9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58");
+            later
+                .steps
+                .iter_mut()
+                .rfind(|step| step.kind == StepKind::Verify)
+                .expect("the example has a check")
+                .command = Some(check.to_owned());
+            let upsert = store.upsert(&later).expect("stored");
+            (upsert, store)
         }
-        for procedure in ["p_7f3a91c2", "p_0c4e2a9b"] {
-            store
-                .record_injection(&Injection {
-                    session: SESSION.to_owned(),
-                    procedure: procedure.to_owned(),
-                    revision: 1,
-                    holdout: false,
-                    cue: Cue::Prompt,
-                    at: "2026-09-21T14:03:00Z".parse().expect("timestamp is valid"),
-                })
-                .expect("injection recorded");
-        }
-        let injections = store.injections(None).expect("injections read");
-        for record in &injections {
-            store
-                .settle_injection(record, 8, "failed")
-                .expect("injection settled");
-        }
-    }
 
-    fn injected(store: &Store) -> Vec<String> {
-        store
-            .injections(None)
-            .expect("injections read")
-            .into_iter()
-            .map(|record| record.injection.procedure)
-            .collect()
+        fn states(store: &Store) -> Vec<(u32, Lifecycle)> {
+            store
+                .revisions("p_7f3a91c2")
+                .expect("revisions read")
+                .iter()
+                .map(|row| (row.procedure.revision, row.procedure.state))
+                .collect()
+        }
+
+        fn recallable(store: &Store) -> bool {
+            !store
+                .entity_hits(&["paginate".to_owned()], REPO)
+                .expect("entities read")
+                .is_empty()
+        }
+
+        fn learned_and_injected(store: &mut Store) {
+            let rowid = store.upsert(&Procedure::example()).expect("stored").rowid();
+            for (first_seq, procedure, rejection) in [
+                (0, Some(rowid), None),
+                (8, None, Some("no files were changed")),
+            ] {
+                store
+                    .record_extraction(&ExtractionRecord {
+                        session: SESSION.to_owned(),
+                        first_seq,
+                        summary: "Page 2 repeats the last product".to_owned(),
+                        procedure,
+                        rejection: rejection.map(str::to_owned),
+                        outcome: Some("succeeded".to_owned()),
+                        tool_calls: Some(6),
+                        span: None,
+                        at: "2026-09-21T14:02:44Z".to_owned(),
+                    })
+                    .expect("extraction recorded");
+            }
+            for procedure in ["p_7f3a91c2", "p_0c4e2a9b"] {
+                store
+                    .record_injection(&Injection {
+                        session: SESSION.to_owned(),
+                        procedure: procedure.to_owned(),
+                        revision: 1,
+                        holdout: false,
+                        cue: Cue::Prompt,
+                        at: "2026-09-21T14:03:00Z".parse().expect("timestamp is valid"),
+                    })
+                    .expect("injection recorded");
+            }
+            let injections = store.injections(None).expect("injections read");
+            for record in &injections {
+                store
+                    .settle_injection(record, 8, "failed")
+                    .expect("injection settled");
+            }
+        }
+
+        fn injected(store: &Store) -> Vec<String> {
+            store
+                .injections(None)
+                .expect("injections read")
+                .into_iter()
+                .map(|record| record.injection.procedure)
+                .collect()
+        }
     }
 
     #[test]
     fn forgetting_a_procedure_deletes_its_injections_and_learned_tasks() {
         for target in [Forget::Procedure("p_7f3a91c2"), Forget::Repo(REPO)] {
             let mut store = Store::open_in_memory().expect("store opens");
-            learned_and_injected(&mut store);
+            Example::learned_and_injected(&mut store);
 
             let deleted = store.forget(target).expect("forgotten");
 
             assert_eq!(deleted, 1, "{target:?}");
-            assert_eq!(injected(&store), ["p_0c4e2a9b"], "{target:?}");
+            assert_eq!(Example::injected(&store), ["p_0c4e2a9b"], "{target:?}");
             let stats = store.stats().expect("stats read");
             assert_eq!((stats.rejections, stats.injections), (1, 1), "{target:?}");
             assert_eq!(
@@ -993,7 +998,7 @@ mod tests {
     #[test]
     fn a_relearned_procedure_starts_without_the_forgotten_evidence() {
         let mut store = Store::open_in_memory().expect("store opens");
-        learned_and_injected(&mut store);
+        Example::learned_and_injected(&mut store);
         assert_eq!(
             store
                 .family_evidence("p_7f3a91c2")
@@ -1007,7 +1012,7 @@ mod tests {
             .expect("forgotten");
         store.upsert(&Procedure::example()).expect("relearned");
 
-        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
+        assert_eq!(Example::states(&store), [(1, Lifecycle::Active)]);
         assert_eq!(
             store.family_evidence("p_7f3a91c2").expect("evidence read"),
             FamilyEvidence {
@@ -1027,21 +1032,21 @@ mod tests {
     #[test]
     fn forgetting_an_unknown_procedure_deletes_nothing_else() {
         let mut store = Store::open_in_memory().expect("store opens");
-        learned_and_injected(&mut store);
+        Example::learned_and_injected(&mut store);
 
         let deleted = store
             .forget(Forget::Procedure("p_doesnotexist"))
             .expect("forgetting is harmless");
 
         assert_eq!(deleted, 0);
-        assert_eq!(injected(&store), ["p_7f3a91c2", "p_0c4e2a9b"]);
-        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
+        assert_eq!(Example::injected(&store), ["p_7f3a91c2", "p_0c4e2a9b"]);
+        assert_eq!(Example::states(&store), [(1, Lifecycle::Active)]);
     }
 
     #[test]
     fn forgetting_everything_also_forgets_repositories() {
         let mut store = Store::open_in_memory().expect("store opens");
-        learned_and_injected(&mut store);
+        Example::learned_and_injected(&mut store);
         store
             .remember_repo("/home/dev/shop", REPO)
             .expect("repository remembered");
@@ -1049,7 +1054,7 @@ mod tests {
         let deleted = store.forget(Forget::All).expect("forgotten");
 
         assert_eq!(deleted, 1);
-        assert!(injected(&store).is_empty());
+        assert!(Example::injected(&store).is_empty());
         assert_eq!(
             store.repo_for_root("/home/dev/shop").expect("repos read"),
             None
@@ -1072,11 +1077,15 @@ mod tests {
             ("npm test", Upsert::Refreshed { rowid: 1 }),
             ("npm check", Upsert::Generalized { rowid: 1 }),
         ] {
-            let (upsert, store) = relearned(Lifecycle::Quarantined, check);
+            let (upsert, store) = Example::relearned(Lifecycle::Quarantined, check);
 
             assert_eq!(upsert, expected, "`{check}`");
-            assert_eq!(states(&store), [(1, Lifecycle::Quarantined)], "`{check}`");
-            assert!(!recallable(&store), "`{check}`");
+            assert_eq!(
+                Example::states(&store),
+                [(1, Lifecycle::Quarantined)],
+                "`{check}`"
+            );
+            assert!(!Example::recallable(&store), "`{check}`");
         }
     }
 
@@ -1086,28 +1095,32 @@ mod tests {
             ("npm test", Upsert::Refreshed { rowid: 1 }),
             ("npm check", Upsert::Generalized { rowid: 1 }),
         ] {
-            let (upsert, store) = relearned(Lifecycle::Retired, check);
+            let (upsert, store) = Example::relearned(Lifecycle::Retired, check);
 
             assert_eq!(upsert, expected, "`{check}`");
-            assert_eq!(states(&store), [(1, Lifecycle::Retired)], "`{check}`");
-            assert!(!recallable(&store), "`{check}`");
+            assert_eq!(
+                Example::states(&store),
+                [(1, Lifecycle::Retired)],
+                "`{check}`"
+            );
+            assert!(!Example::recallable(&store), "`{check}`");
         }
     }
 
     #[test]
     fn relearning_an_archived_procedure_brings_it_back_into_recall() {
-        let (upsert, store) = relearned(Lifecycle::Archived, "npm test");
+        let (upsert, store) = Example::relearned(Lifecycle::Archived, "npm test");
 
         assert_eq!(upsert, Upsert::Refreshed { rowid: 1 });
-        assert_eq!(states(&store), [(1, Lifecycle::Active)]);
-        assert!(recallable(&store));
+        assert_eq!(Example::states(&store), [(1, Lifecycle::Active)]);
+        assert!(Example::recallable(&store));
     }
 
     #[test]
     fn relearning_an_archived_procedure_beside_an_active_one_makes_it_a_candidate() {
-        let (_, mut store) = relearned(Lifecycle::Archived, "npm check");
+        let (_, mut store) = Example::relearned(Lifecycle::Archived, "npm check");
         assert_eq!(
-            states(&store),
+            Example::states(&store),
             [(1, Lifecycle::Archived), (2, Lifecycle::Active)]
         );
 
@@ -1115,10 +1128,10 @@ mod tests {
 
         assert_eq!(upsert, Upsert::Refreshed { rowid: 1 });
         assert_eq!(
-            states(&store),
+            Example::states(&store),
             [(1, Lifecycle::Candidate), (2, Lifecycle::Active)]
         );
-        assert!(recallable(&store));
+        assert!(Example::recallable(&store));
     }
 
     #[test]
@@ -1140,8 +1153,8 @@ mod tests {
         hook.record_injection(&Contention::injection())
             .expect("injection recorded once the procedure is stored");
         assert!(matches!(stored, Upsert::Created { .. }));
-        assert_eq!(injected(&ingest), ["p_0c4e2a9b"]);
-        assert!(recallable(&ingest));
+        assert_eq!(Example::injected(&ingest), ["p_0c4e2a9b"]);
+        assert!(Example::recallable(&ingest));
     }
 
     #[test]
@@ -1150,11 +1163,15 @@ mod tests {
             ("npm test", Upsert::Refreshed { rowid: 1 }),
             ("npm check", Upsert::Generalized { rowid: 1 }),
         ] {
-            let (upsert, store) = relearned(Lifecycle::Stale, check);
+            let (upsert, store) = Example::relearned(Lifecycle::Stale, check);
 
             assert_eq!(upsert, expected, "`{check}`");
-            assert_eq!(states(&store), [(1, Lifecycle::Active)], "`{check}`");
-            assert!(recallable(&store), "`{check}`");
+            assert_eq!(
+                Example::states(&store),
+                [(1, Lifecycle::Active)],
+                "`{check}`"
+            );
+            assert!(Example::recallable(&store), "`{check}`");
         }
     }
 

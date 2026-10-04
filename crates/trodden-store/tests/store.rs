@@ -7,29 +7,58 @@ use trodden_store::{Cue, ExtractionRecord, Forget, Injection, Progress, Store, U
 
 const REPO: &str = "4b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c";
 
-fn pagination() -> Procedure {
-    let mut procedure: Procedure = Procedure::example();
-    procedure.state = Lifecycle::Candidate;
-    procedure
-}
+#[derive(Debug)]
+struct Fixture;
 
-fn from_session(mut procedure: Procedure, session: &str) -> Procedure {
-    procedure.provenance.sources[0].session = SessionId::new(session);
-    procedure
+impl Fixture {
+    fn pagination() -> Procedure {
+        let mut procedure: Procedure = Procedure::example();
+        procedure.state = Lifecycle::Candidate;
+        procedure
+    }
+
+    fn from_session(mut procedure: Procedure, session: &str) -> Procedure {
+        procedure.provenance.sources[0].session = SessionId::new(session);
+        procedure
+    }
+
+    fn checked_with(mut procedure: Procedure, command: &str) -> Procedure {
+        let check = procedure
+            .steps
+            .iter_mut()
+            .rfind(|step| step.kind == StepKind::Verify)
+            .expect("the example has a check");
+        check.command = Some(command.to_owned());
+        procedure
+    }
+
+    fn injection(session: &str, revision: u32, holdout: bool) -> Injection {
+        Injection {
+            session: session.to_owned(),
+            procedure: "p_7f3a91c2".to_owned(),
+            revision,
+            holdout,
+            cue: Cue::Prompt,
+            at: "2026-09-22T09:00:00Z".parse().expect("valid timestamp"),
+        }
+    }
 }
 
 #[test]
 fn identical_steps_refresh_and_different_steps_revise() {
     let mut store = Store::open_in_memory().expect("store opens");
 
-    let first = store.upsert(&pagination()).expect("stored");
+    let first = store.upsert(&Fixture::pagination()).expect("stored");
     let again = store
-        .upsert(&from_session(
-            pagination(),
+        .upsert(&Fixture::from_session(
+            Fixture::pagination(),
             "9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58",
         ))
         .expect("stored");
-    let mut different = from_session(pagination(), "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24");
+    let mut different = Fixture::from_session(
+        Fixture::pagination(),
+        "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24",
+    );
     different.steps.insert(
         0,
         Step {
@@ -66,38 +95,40 @@ fn identical_steps_refresh_and_different_steps_revise() {
     );
 }
 
-fn checked_with(mut procedure: Procedure, command: &str) -> Procedure {
-    let check = procedure
-        .steps
-        .iter_mut()
-        .rfind(|step| step.kind == StepKind::Verify)
-        .expect("the example has a check");
-    check.command = Some(command.to_owned());
-    procedure
-}
-
 #[test]
 fn literals_that_differ_between_sessions_become_slots() {
     let mut store = Store::open_in_memory().expect("store opens");
 
     let first = store
-        .upsert(&checked_with(pagination(), "npm test -- page_overlap"))
+        .upsert(&Fixture::checked_with(
+            Fixture::pagination(),
+            "npm test -- page_overlap",
+        ))
         .expect("stored");
     let second = store
-        .upsert(&checked_with(
-            from_session(pagination(), "9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58"),
+        .upsert(&Fixture::checked_with(
+            Fixture::from_session(
+                Fixture::pagination(),
+                "9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58",
+            ),
             "npm test -- total_pages",
         ))
         .expect("stored");
     let third = store
-        .upsert(&checked_with(
-            from_session(pagination(), "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24"),
+        .upsert(&Fixture::checked_with(
+            Fixture::from_session(
+                Fixture::pagination(),
+                "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24",
+            ),
             "npm test -- cursor_repeat",
         ))
         .expect("stored");
     let flagged = store
-        .upsert(&checked_with(
-            from_session(pagination(), "6a0e4f2d-8c1b-4d7e-b3a9-1f5c7e9d2b40"),
+        .upsert(&Fixture::checked_with(
+            Fixture::from_session(
+                Fixture::pagination(),
+                "6a0e4f2d-8c1b-4d7e-b3a9-1f5c7e9d2b40",
+            ),
             "npm test -- --watch",
         ))
         .expect("stored");
@@ -141,7 +172,10 @@ fn literals_that_differ_between_sessions_become_slots() {
 #[test]
 fn finds_procedures_by_entity_and_text() {
     let mut store = Store::open_in_memory().expect("store opens");
-    let rowid = store.upsert(&pagination()).expect("stored").rowid();
+    let rowid = store
+        .upsert(&Fixture::pagination())
+        .expect("stored")
+        .rowid();
 
     let by_stem = store
         .entity_hits(&["paginate".to_owned()], REPO)
@@ -177,7 +211,7 @@ fn finds_procedures_by_entity_and_text() {
 #[test]
 fn lexical_search_treats_prompt_syntax_as_text() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
+    store.upsert(&Fixture::pagination()).expect("stored");
 
     let hits = store
         .lexical_hits(
@@ -198,7 +232,7 @@ fn lexical_search_treats_prompt_syntax_as_text() {
 #[test]
 fn forgetting_removes_procedures_and_their_index_entries() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
+    store.upsert(&Fixture::pagination()).expect("stored");
 
     let deleted = store
         .forget(Forget::Procedure("p_7f3a91c2"))
@@ -291,24 +325,13 @@ fn saves_progress_before_any_task_is_extracted() {
     );
 }
 
-fn injection(session: &str, revision: u32, holdout: bool) -> Injection {
-    Injection {
-        session: session.to_owned(),
-        procedure: "p_7f3a91c2".to_owned(),
-        revision,
-        holdout,
-        cue: Cue::Prompt,
-        at: "2026-09-22T09:00:00Z".parse().expect("valid timestamp"),
-    }
-}
-
 #[test]
 fn records_injections_per_session() {
     let store = Store::open_in_memory().expect("store opens");
     let session = "0b6f7c1e-2d4a-4f0e-9a51-3c8e2f1d7b90";
 
     store
-        .record_injection(&injection(session, 1, false))
+        .record_injection(&Fixture::injection(session, 1, false))
         .expect("recorded");
 
     assert!(store.was_injected(session, "p_7f3a91c2").expect("read"));
@@ -322,7 +345,7 @@ fn records_injections_per_session() {
 #[test]
 fn settled_outcomes_count_per_revision_and_holdout() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
+    store.upsert(&Fixture::pagination()).expect("stored");
     let outcomes = [
         ("s1", false, "succeeded"),
         ("s2", false, "succeeded"),
@@ -332,7 +355,7 @@ fn settled_outcomes_count_per_revision_and_holdout() {
     ];
     for (session, holdout, _) in outcomes {
         store
-            .record_injection(&injection(session, 1, holdout))
+            .record_injection(&Fixture::injection(session, 1, holdout))
             .expect("recorded");
     }
     for (record, (_, _, outcome)) in store
@@ -366,8 +389,11 @@ fn settled_outcomes_count_per_revision_and_holdout() {
 #[test]
 fn promotion_moves_the_index_to_the_new_incumbent() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
-    let mut different = from_session(pagination(), "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24");
+    store.upsert(&Fixture::pagination()).expect("stored");
+    let mut different = Fixture::from_session(
+        Fixture::pagination(),
+        "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24",
+    );
     different.steps.remove(0);
     let revised = store.upsert(&different).expect("stored").rowid();
 
@@ -394,8 +420,11 @@ fn promotion_moves_the_index_to_the_new_incumbent() {
 #[test]
 fn refreshing_learns_prompts_slot_values_and_lessons() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
-    let mut again = from_session(pagination(), "9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58");
+    store.upsert(&Fixture::pagination()).expect("stored");
+    let mut again = Fixture::from_session(
+        Fixture::pagination(),
+        "9d3e7a10-5b2c-4e8f-a1d6-0c7b9e2f4a58",
+    );
     again.trigger.text = "The second page shows the first page's last item again".to_owned();
     again.avoid = vec!["`npm run test:all` failed (exit 1); `npm test` worked".to_owned()];
 
@@ -413,10 +442,13 @@ fn refreshing_learns_prompts_slot_values_and_lessons() {
 #[test]
 fn retired_families_stay_out_of_recall() {
     let mut store = Store::open_in_memory().expect("store opens");
-    store.upsert(&pagination()).expect("stored");
+    store.upsert(&Fixture::pagination()).expect("stored");
 
     assert_eq!(store.retire("p_7f3a91c2").expect("retired"), 1);
-    let mut later = from_session(pagination(), "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24");
+    let mut later = Fixture::from_session(
+        Fixture::pagination(),
+        "2c8f1b6e-7d4a-4c3e-9b0f-5e1a3d7c9b24",
+    );
     later.steps.remove(0);
     store.upsert(&later).expect("stored");
 
@@ -438,7 +470,10 @@ fn retired_families_stay_out_of_recall() {
 #[test]
 fn stores_several_embeddings_per_revision() {
     let mut store = Store::open_in_memory().expect("store opens");
-    let rowid = store.upsert(&pagination()).expect("stored").rowid();
+    let rowid = store
+        .upsert(&Fixture::pagination())
+        .expect("stored")
+        .rowid();
 
     store
         .set_embeddings(rowid, &[vec![1, 2], vec![3, 4]])

@@ -73,15 +73,20 @@ impl Quantized {
 mod tests {
     use super::*;
 
-    fn unit(seed: usize) -> Embedding {
-        let raw: Embedding = std::array::from_fn(|i| (((i * 7 + seed * 13) % 17) as f32) - 8.0);
-        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
-        raw.map(|v| v / norm)
+    #[derive(Debug)]
+    struct Embeddings;
+
+    impl Embeddings {
+        fn unit(seed: usize) -> Embedding {
+            let raw: Embedding = std::array::from_fn(|i| (((i * 7 + seed * 13) % 17) as f32) - 8.0);
+            let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+            raw.map(|v| v / norm)
+        }
     }
 
     #[test]
     fn round_trips_through_bytes() {
-        let quantized = Quantized::new(&unit(3));
+        let quantized = Quantized::new(&Embeddings::unit(3));
 
         assert_eq!(
             Quantized::from_bytes(&quantized.to_bytes()),
@@ -92,7 +97,7 @@ mod tests {
 
     #[test]
     fn preserves_cosine_similarity() {
-        let (a, b) = (unit(1), unit(2));
+        let (a, b) = (Embeddings::unit(1), Embeddings::unit(2));
         let exact: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
 
         let approximate = Quantized::new(&a).cosine(&b);
