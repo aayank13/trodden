@@ -355,7 +355,13 @@ impl Ingest {
             )?;
             return Ok(IngestReport::default());
         }
-        trace.commit = workspace.head();
+        if trace.commit.is_none() {
+            let last_activity = trace
+                .events
+                .last()
+                .map_or(trace.started_at, |event| event.at);
+            trace.commit = workspace.head_at(last_activity);
+        }
         let mut report = IngestReport {
             sessions: 1,
             ..IngestReport::default()
@@ -607,6 +613,58 @@ mod tests {
                 })
                 .collect();
             self.append(&moved);
+        }
+
+        fn repository(&self, committed: &[&str]) -> (PathBuf, Vec<String>) {
+            let repo = self.dir.join("shop");
+            fs::create_dir_all(&repo).expect("repository directory is writable");
+            Self::git(&repo, &[], &["init", "-q"]);
+            let commits = committed
+                .iter()
+                .map(|time| {
+                    fs::write(repo.join("CHANGES"), time).expect("file is writable");
+                    Self::git(&repo, &[], &["add", "-A"]);
+                    let dated = [("GIT_COMMITTER_DATE", *time), ("GIT_AUTHOR_DATE", *time)];
+                    Self::git(&repo, &dated, &["commit", "-q", "-m", time]);
+                    Self::git(&repo, &[], &["rev-parse", "HEAD"])
+                })
+                .collect();
+            (repo, commits)
+        }
+
+        fn git(repo: &Path, env: &[(&str, &str)], args: &[&str]) -> String {
+            let output = process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "-c",
+                    "user.name=Dev",
+                    "-c",
+                    "user.email=dev@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .envs(env.iter().copied())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn commits(ingest: &Ingest) -> Vec<Option<String>> {
+            ingest
+                .store
+                .list(None, true)
+                .expect("procedures list")
+                .into_iter()
+                .flat_map(|row| row.procedure.provenance.sources)
+                .map(|source| source.commit)
+                .collect()
         }
 
         fn other_session(&self, lines: &[Value]) -> PathBuf {
@@ -1229,6 +1287,41 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn sessions_are_attributed_to_the_commit_checked_out_while_they_ran() {
+        let cases: [(&str, &[&str], Option<usize>); 3] = [
+            (
+                "commit-before",
+                &["@1790845200 +0000", "@1790852400 +0000"],
+                Some(0),
+            ),
+            ("commit-after", &["@1790852400 +0000"], None),
+            ("commit-none", &[], None),
+        ];
+        for (name, committed, expected) in cases {
+            let scratch = Scratch::new(name);
+            let (repo, commits) = scratch.repository(committed);
+            let mut ingest = scratch.ingest();
+            scratch.append_in(
+                &repo.to_string_lossy(),
+                &task(
+                    0,
+                    "The cart total in src/cart.js ignores the discount code",
+                    "src/cart.js",
+                ),
+            );
+            let report = ingest
+                .transcript(Harness::ClaudeCode, &scratch.transcript, true)
+                .expect("ingest in a repository");
+            assert_eq!(report.created, 1, "{name}");
+            assert_eq!(
+                Scratch::commits(&ingest),
+                [expected.map(|index| commits[index].clone())],
+                "{name}"
+            );
+        }
     }
 
     #[test]

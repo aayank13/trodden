@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use jiff::Timestamp;
 use trodden_core::RepoId;
 use trodden_store::Store;
 
@@ -85,9 +86,20 @@ impl Workspace {
         })
     }
 
-    pub fn head(&self) -> Option<String> {
-        Self::git(&self.root, &["rev-parse", "HEAD"])
-            .and_then(|out| out.lines().next().map(str::to_owned))
+    pub fn head_at(&self, at: Timestamp) -> Option<String> {
+        let reflog = Self::git(
+            &self.root,
+            &["log", "-g", "--date=unix", "--format=%H %gd", "HEAD"],
+        )?;
+        reflog.lines().find_map(|line| {
+            let (commit, selector) = line.split_once(' ')?;
+            let moved: i64 = selector
+                .strip_prefix("HEAD@{")?
+                .strip_suffix('}')?
+                .parse()
+                .ok()?;
+            (moved <= at.as_second()).then(|| commit.to_owned())
+        })
     }
 
     fn find_root(cwd: &Path, home: Option<&Path>) -> PathBuf {
@@ -306,6 +318,45 @@ mod tests {
             repo
         }
 
+        fn moved_at(repo: &Path, second: i64, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "-c",
+                    "user.name=Dev",
+                    "-c",
+                    "user.email=dev@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_COMMITTER_DATE", format!("@{second} +0000"))
+                .env("GIT_AUTHOR_DATE", format!("@{second} +0000"))
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            git(repo, &["rev-parse", "HEAD"])
+        }
+
+        fn commit_at(repo: &Path, second: i64) -> String {
+            fs::write(repo.join("CHANGES"), second.to_string()).expect("file is writable");
+            git(repo, &["add", "-A"]);
+            Self::moved_at(repo, second, &["commit", "-q", "-m", &second.to_string()])
+        }
+
+        fn workspace(&self, cwd: &Path) -> Workspace {
+            Workspace::resolve(cwd, &self.store).expect("workspace resolves")
+        }
+
+        fn second(second: i64) -> Timestamp {
+            Timestamp::from_second(second).expect("second is in range")
+        }
+
         fn resolve(&self, cwd: &Path) -> String {
             Workspace::resolve(cwd, &self.store)
                 .expect("workspace resolves")
@@ -344,7 +395,7 @@ mod tests {
             let workspace = Workspace::resolve(dir, &self.store).expect("workspace resolves");
             assert_eq!(workspace.root, dir);
             assert_eq!(workspace.repo.as_str(), Workspace::path_id(dir));
-            assert_eq!(workspace.head(), None);
+            assert_eq!(workspace.head_at(Timestamp::now()), None);
             let stamp = Workspace::stamp(dir).expect("git entry has a stamp");
             let key = format!("{}#{stamp}", text(dir));
             assert_eq!(self.store.repo_for_root(&key).expect("cache reads"), None);
@@ -528,6 +579,58 @@ mod tests {
         let cached =
             Workspace::resolve_read_only(&repo, &scratch.store).expect("workspace resolves");
         assert_eq!(cached.repo.as_str(), "cached");
+    }
+
+    #[test]
+    fn the_head_at_a_time_is_the_commit_checked_out_then() {
+        let scratch = Scratch::new("head-at");
+        let repo = scratch.repo("shop", &[]);
+        let first = Scratch::commit_at(&repo, 1_700_000_000);
+        let second = Scratch::commit_at(&repo, 1_700_001_000);
+        let workspace = scratch.workspace(&repo);
+
+        assert_eq!(workspace.head_at(Scratch::second(1_699_999_999)), None);
+        assert_eq!(
+            workspace.head_at(Scratch::second(1_700_000_000)),
+            Some(first.clone())
+        );
+        assert_eq!(
+            workspace.head_at(Scratch::second(1_700_000_500)),
+            Some(first.clone())
+        );
+        assert_eq!(
+            workspace.head_at(Scratch::second(1_700_001_000)),
+            Some(second.clone())
+        );
+        assert_eq!(workspace.head_at(Timestamp::now()), Some(second.clone()));
+
+        let reset = Scratch::moved_at(&repo, 1_700_002_000, &["reset", "-q", "--hard", &first]);
+        assert_eq!(reset, first);
+        assert_eq!(
+            workspace.head_at(Scratch::second(1_700_001_500)),
+            Some(second)
+        );
+        assert_eq!(workspace.head_at(Timestamp::now()), Some(first));
+    }
+
+    #[test]
+    fn directories_without_a_reflog_have_no_head() {
+        let scratch = Scratch::new("head-at-none");
+        let notes = Scratch::directory(&scratch.dir, "notes", &["Cargo.toml"]);
+        let unborn = scratch.repo("unborn", &[]);
+        let unlogged = scratch.repo("unlogged", &[]);
+        git(&unlogged, &["config", "core.logAllRefUpdates", "false"]);
+        Scratch::commit_at(&unlogged, 1_700_000_000);
+
+        for dir in [&notes, &unborn, &unlogged] {
+            let workspace = scratch.workspace(dir);
+            assert_eq!(
+                workspace.head_at(Timestamp::now()),
+                None,
+                "{}",
+                dir.display()
+            );
+        }
     }
 
     #[test]
