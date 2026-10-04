@@ -25,14 +25,12 @@ impl Home {
         let base = if cfg!(windows) {
             env::var_os("LOCALAPPDATA").map(PathBuf::from)
         } else if cfg!(target_os = "macos") {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
+            env::home_dir().map(|home| home.join("Library/Application Support"))
         } else {
             env::var_os("XDG_DATA_HOME")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from)
-                .or_else(|| {
-                    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-                })
+                .or_else(|| env::home_dir().map(|home| home.join(".local/share")))
         };
         let base = base.context("find a data directory; set TRODDEN_HOME")?;
         Ok(Self {

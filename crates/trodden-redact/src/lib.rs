@@ -375,10 +375,7 @@ impl Redactor {
     ];
 
     pub fn new() -> Self {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok();
-        Self::build(home)
+        Self::build(std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok()))
     }
 
     pub fn with_home(home: impl Into<String>) -> Self {
