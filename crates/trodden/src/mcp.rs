@@ -103,6 +103,11 @@ impl ServerHandler for Server {
 }
 
 impl Server {
+    const UNIDENTIFIED: &str = "No procedures to show: Trodden has not identified this \
+                                repository yet, and its git history is too long to read within \
+                                a tool call. Run `trodden list` in the repository once, or \
+                                finish a session there, then try again.";
+
     pub(crate) fn serve(home: Home) -> Result<()> {
         let server = Self {
             home,
@@ -124,7 +129,9 @@ impl Server {
 
     fn recall_text(&self, prompt: &str, cwd: &Path, explain: bool) -> Result<String> {
         let store = self.store()?;
-        let workspace = Workspace::resolve_read_only(cwd, &store)?;
+        let Some(workspace) = Workspace::resolve_read_only(cwd, &store)? else {
+            return Ok(Self::UNIDENTIFIED.to_owned());
+        };
         let outcome = self.home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
@@ -165,7 +172,9 @@ impl Server {
 
     fn list_text(&self, cwd: &Path) -> Result<String> {
         let store = self.store()?;
-        let workspace = Workspace::resolve_read_only(cwd, &store)?;
+        let Some(workspace) = Workspace::resolve_read_only(cwd, &store)? else {
+            return Ok(Self::UNIDENTIFIED.to_owned());
+        };
         let rows = store.list(Some(workspace.repo.as_str()), false)?;
         Ok(rows
             .iter()

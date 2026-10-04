@@ -76,6 +76,7 @@ struct PendingIngest {
 
 #[derive(Debug)]
 struct PendingIngests {
+    home: Home,
     dir: PathBuf,
 }
 
@@ -84,6 +85,7 @@ impl PendingIngests {
 
     fn new(home: &Home) -> Self {
         Self {
+            home: home.clone(),
             dir: home.pending_ingests(),
         }
     }
@@ -123,8 +125,13 @@ impl PendingIngests {
         let mut transcripts = BTreeMap::new();
         for marker in self.markers()? {
             let text = fs::read(&marker).with_context(|| format!("read {}", marker.display()))?;
+            let pending = serde_json::from_slice::<PendingIngest>(&text)
+                .with_context(|| format!("parse the queued ingest {}", marker.display()));
+            if let Err(error) = &pending {
+                self.home.log_error(error);
+            }
             fs::remove_file(&marker).with_context(|| format!("remove {}", marker.display()))?;
-            if let Ok(pending) = serde_json::from_slice::<PendingIngest>(&text) {
+            if let Ok(pending) = pending {
                 *transcripts
                     .entry((pending.harness, pending.transcript))
                     .or_default() |= pending.ended;
@@ -1506,6 +1513,38 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_queued_markers_are_logged_and_dropped() {
+        let scratch = Scratch::new("deferred-corrupt");
+        let home = scratch.home();
+        scratch.append(&task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        let queued = home.pending_ingests();
+        fs::create_dir_all(&queued).expect("queue directory is writable");
+        let corrupt = queued.join("1-1-0.marker");
+        fs::write(&corrupt, r#"{"harness":"claude-code","transcr"#).expect("marker is written");
+        fs::write(
+            queued.join("1-1-1.marker"),
+            json!({"harness": "claude-code", "transcript": scratch.transcript, "ended": true})
+                .to_string(),
+        )
+        .expect("marker is written");
+
+        let report = scratch.ingest().finish().expect("running ingest finishes");
+
+        assert_eq!((report.sessions, report.created), (1, 1));
+        assert!(!PendingIngests::new(&home).any().expect("markers list"));
+        let logged = Scratch::logged(&home);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].starts_with(&format!("parse the queued ingest {}: ", corrupt.display())),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
     fn queued_transcripts_that_fail_are_logged() {
         let scratch = Scratch::new("deferred-failures");
         let home = scratch.home();
@@ -1539,7 +1578,15 @@ mod tests {
             )
         );
         assert!(
-            logged[1].starts_with(&format!("ingest {}: ", missing.display())),
+            logged[1].starts_with(&format!(
+                "ingest {}: read the transcript: ",
+                missing.display()
+            )),
+            "{logged:?}"
+        );
+        assert_eq!(
+            logged[1].matches(&*missing.to_string_lossy()).count(),
+            1,
             "{logged:?}"
         );
         let ingest = scratch.ingest();

@@ -43,8 +43,7 @@ impl Harness {
     }
 
     pub fn read(transcript: &Path) -> Result<String> {
-        let bytes =
-            fs::read(transcript).with_context(|| format!("read {}", transcript.display()))?;
+        let bytes = fs::read(transcript).context("read the transcript")?;
         Ok(Self::decode(bytes))
     }
 
@@ -125,6 +124,18 @@ mod tests {
         assert_eq!(Harness::ClaudeCode.as_str(), "claude-code");
         assert_eq!(Harness::from_name("future-agent"), None);
         assert_eq!(Harness::from_name("Claude-Code"), None);
+    }
+
+    #[test]
+    fn read_errors_leave_the_path_to_the_caller() {
+        let missing = env::temp_dir().join(format!(
+            "trodden-harness-missing-{}.jsonl",
+            std::process::id()
+        ));
+        let error = Harness::read(&missing).expect_err("a missing transcript fails to read");
+        let message = format!("{error:#}");
+        assert!(message.starts_with("read the transcript: "), "{message}");
+        assert!(!message.contains(&*missing.to_string_lossy()), "{message}");
     }
 
     #[test]
