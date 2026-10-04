@@ -83,10 +83,10 @@ impl ClaudeCode {
     }
 
     fn projects() -> Result<PathBuf> {
-        Ok(
-            PathBuf::from(env::var_os("HOME").context("find the home directory")?)
-                .join(".claude/projects"),
-        )
+        Ok(env::home_dir()
+            .context("find the home directory")?
+            .join(".claude")
+            .join("projects"))
     }
 
     fn transcripts(projects: &Path) -> Result<Vec<PathBuf>> {

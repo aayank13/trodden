@@ -1,7 +1,9 @@
 use std::{
     env,
+    ffi::{OsStr, OsString},
     fs::{self, File, TryLockError},
     io::Write,
+    iter,
     path::PathBuf,
     process::{Command as Process, ExitCode},
 };
@@ -166,6 +168,12 @@ enum Finding {
     Healthy(String),
     Note(String),
     Problem(anyhow::Error),
+}
+
+#[derive(Debug)]
+struct ExecutableSearch {
+    dirs: Vec<PathBuf>,
+    extensions: Vec<OsString>,
 }
 
 impl Cli {
@@ -358,7 +366,8 @@ impl Command {
         for program in ["trodden", "git", "claude"] {
             report(
                 &format!("`{program}` on PATH"),
-                Self::which(program)
+                ExecutableSearch::from_env()
+                    .and_then(|search| search.find(program))
                     .map(|path| path.display().to_string())
                     .into(),
             )?;
@@ -772,14 +781,6 @@ impl Command {
         };
         Workspace::resolve(&cwd, store)
     }
-
-    fn which(program: &str) -> Result<PathBuf> {
-        let path = env::var_os("PATH").context("PATH is not set")?;
-        env::split_paths(&path)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-            .with_context(|| format!("`{program}` not found"))
-    }
 }
 
 impl Finding {
@@ -792,6 +793,56 @@ impl Finding {
             ),
             Err(error) => Self::Problem(error),
         }
+    }
+}
+
+impl ExecutableSearch {
+    const DEFAULT_EXTENSIONS: &str = ".COM;.EXE;.BAT;.CMD";
+
+    fn from_env() -> Result<Self> {
+        let path = env::var_os("PATH").context("PATH is not set")?;
+        Ok(Self::new(
+            &path,
+            env::var_os("PATHEXT").as_deref(),
+            cfg!(windows),
+        ))
+    }
+
+    fn new(path: &OsStr, extensions: Option<&OsStr>, windows: bool) -> Self {
+        let extensions = if windows {
+            extensions
+                .unwrap_or(OsStr::new(Self::DEFAULT_EXTENSIONS))
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(OsString::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            dirs: env::split_paths(path).collect(),
+            extensions,
+        }
+    }
+
+    fn find(&self, program: &str) -> Result<PathBuf> {
+        self.candidates(program)
+            .find(|candidate| candidate.is_file())
+            .with_context(|| format!("`{program}` not found"))
+    }
+
+    fn candidates<'a>(&'a self, program: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+        self.dirs.iter().flat_map(move |dir| {
+            self.extensions
+                .iter()
+                .map(move |extension| {
+                    let mut name = OsString::from(program);
+                    name.push(extension);
+                    dir.join(name)
+                })
+                .chain(iter::once(dir.join(program)))
+        })
     }
 }
 
@@ -988,5 +1039,66 @@ mod tests {
             String::from_utf8_lossy(&errors),
             "trodden: no procedure p_doesnotexist\n"
         );
+    }
+
+    #[test]
+    fn windows_search_tries_each_pathext_extension_before_the_bare_name() {
+        let path = env::join_paths(["/opt/node", "/usr/bin"]).expect("dirs join");
+
+        let search = ExecutableSearch::new(&path, Some(OsStr::new(".EXE;;.CMD")), true);
+
+        assert_eq!(
+            search.candidates("claude").collect::<Vec<_>>(),
+            [
+                "/opt/node/claude.EXE",
+                "/opt/node/claude.CMD",
+                "/opt/node/claude",
+                "/usr/bin/claude.EXE",
+                "/usr/bin/claude.CMD",
+                "/usr/bin/claude",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn windows_search_falls_back_to_the_default_extensions() {
+        let search = ExecutableSearch::new(OsStr::new("/bin"), None, true);
+
+        assert_eq!(
+            search.candidates("git").collect::<Vec<_>>(),
+            [
+                "/bin/git.COM",
+                "/bin/git.EXE",
+                "/bin/git.BAT",
+                "/bin/git.CMD",
+                "/bin/git",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn other_platforms_ignore_pathext() {
+        let search = ExecutableSearch::new(OsStr::new("/bin"), Some(OsStr::new(".EXE")), false);
+
+        assert_eq!(
+            search.candidates("git").collect::<Vec<_>>(),
+            [PathBuf::from("/bin/git")]
+        );
+    }
+
+    #[test]
+    fn windows_search_finds_a_program_installed_with_an_extension() {
+        let scratch = Scratch::new("which-extension");
+        let installed = scratch.home.dir().join("claude.CMD");
+        fs::write(&installed, "").expect("program writes");
+        let path = scratch.home.dir().as_os_str();
+
+        let windows = ExecutableSearch::new(path, Some(OsStr::new(".EXE;.CMD")), true);
+        let other = ExecutableSearch::new(path, Some(OsStr::new(".EXE;.CMD")), false);
+
+        assert_eq!(windows.find("claude").expect("program is found"), installed);
+        assert!(other.find("claude").is_err());
     }
 }
