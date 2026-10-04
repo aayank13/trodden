@@ -1,8 +1,9 @@
 use std::{
     env, fs,
     path::{self, Path, PathBuf},
-    process::Command,
-    time::UNIX_EPOCH,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -55,35 +56,43 @@ impl Workspace {
         "Makefile",
     ];
 
+    const WALK_BUDGET: Duration = Duration::from_millis(300);
+    const WALK_POLL: Duration = Duration::from_millis(5);
+    const ROOT_COMMITS: [&str; 3] = ["rev-list", "--max-parents=0", "HEAD"];
+
     pub fn resolve(cwd: &Path, store: &Store) -> Result<Self> {
-        Self::identify(cwd, store, true)
+        Self::identify(cwd, store, Lookup::Remember)?.context("identify the repository")
     }
 
     pub fn resolve_read_only(cwd: &Path, store: &Store) -> Result<Self> {
-        Self::identify(cwd, store, false)
+        Self::identify(cwd, store, Lookup::ReadOnly)?.context("identify the repository")
     }
 
-    fn identify(cwd: &Path, store: &Store, remember: bool) -> Result<Self> {
-        Self::identify_under(cwd, env::home_dir().as_deref(), store, remember)
+    pub fn resolve_cached(cwd: &Path, store: &Store) -> Result<Option<Self>> {
+        Self::identify(cwd, store, Lookup::WithinBudget(Self::WALK_BUDGET))
+    }
+
+    fn identify(cwd: &Path, store: &Store, lookup: Lookup) -> Result<Option<Self>> {
+        Self::identify_under(cwd, env::home_dir().as_deref(), store, lookup)
     }
 
     fn identify_under(
         cwd: &Path,
         home: Option<&Path>,
         store: &Store,
-        remember: bool,
-    ) -> Result<Self> {
+        lookup: Lookup,
+    ) -> Result<Option<Self>> {
         let cwd = path::absolute(cwd)
             .with_context(|| format!("resolve the working directory {:?}", cwd.display()))?;
         let root = Self::find_root(&cwd, home);
         let repo = match Self::stamp(&root) {
-            Some(stamp) => Self::cached_id(&root, &stamp, store, remember)?,
-            None => Self::path_id(&root),
+            Some(stamp) => Self::cached_id(&root, &stamp, store, lookup)?,
+            None => Some(Self::path_id(&root)),
         };
-        Ok(Self {
+        Ok(repo.map(|repo| Self {
             root,
             repo: RepoId::new(repo),
-        })
+        }))
     }
 
     pub fn head_at(&self, at: Timestamp) -> Option<String> {
@@ -133,21 +142,34 @@ impl Workspace {
             .find(|home| cwd != home && cwd.starts_with(home))
     }
 
-    fn cached_id(root: &Path, stamp: &str, store: &Store, remember: bool) -> Result<String> {
+    fn cached_id(
+        root: &Path,
+        stamp: &str,
+        store: &Store,
+        lookup: Lookup,
+    ) -> Result<Option<String>> {
         let key = format!("{}#{stamp}", root.to_string_lossy());
         if let Some(repo) = store.repo_for_root(&key)? {
-            return Ok(repo);
+            return Ok(Some(repo));
         }
-        if Self::is_unborn(root) {
-            return Ok(Self::path_id(root));
+        if Self::is_unborn(root) || !Self::has_head(root) {
+            return Ok(Some(Self::path_id(root)));
         }
-        let Some(repo) = Self::history_id(root) else {
-            return Ok(Self::path_id(root));
+        let repo = if Self::is_shallow(root) {
+            Self::remote_id(root)
+        } else {
+            match Self::root_commit(root, lookup) {
+                Walk::Finished(repo) => repo,
+                Walk::OutOfTime => return Ok(None),
+            }
         };
-        if remember {
+        let Some(repo) = repo else {
+            return Ok(Some(Self::path_id(root)));
+        };
+        if lookup != Lookup::ReadOnly {
             store.remember_repo(&key, &repo)?;
         }
-        Ok(repo)
+        Ok(Some(repo))
     }
 
     fn stamp(root: &Path) -> Option<String> {
@@ -206,23 +228,32 @@ impl Workspace {
         Some((git_dir, common))
     }
 
-    fn history_id(root: &Path) -> Option<String> {
-        let root_commit = Self::root_commit(root)?;
-        let shallow = Self::git(root, &["rev-parse", "--is-shallow-repository"])?;
-        if shallow.trim() == "true" {
-            Self::remote_id(root)
-        } else {
-            Some(root_commit)
-        }
+    fn has_head(root: &Path) -> bool {
+        Self::git(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_some()
     }
 
-    fn root_commit(root: &Path) -> Option<String> {
-        let out = Self::git(root, &["rev-list", "--max-parents=0", "HEAD"])?;
-        out.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .min()
-            .map(str::to_owned)
+    fn is_shallow(root: &Path) -> bool {
+        Self::git(root, &["rev-parse", "--is-shallow-repository"])
+            .is_some_and(|shallow| shallow.trim() == "true")
+    }
+
+    fn root_commit(root: &Path, lookup: Lookup) -> Walk {
+        let walk = match lookup {
+            Lookup::WithinBudget(budget) => Self::git_within(root, &Self::ROOT_COMMITS, budget),
+            Lookup::Remember | Lookup::ReadOnly => {
+                Walk::Finished(Self::git(root, &Self::ROOT_COMMITS))
+            }
+        };
+        match walk {
+            Walk::Finished(out) => Walk::Finished(out.and_then(|out| {
+                out.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .min()
+                    .map(str::to_owned)
+            })),
+            Walk::OutOfTime => Walk::OutOfTime,
+        }
     }
 
     fn remote_id(root: &Path) -> Option<String> {
@@ -263,6 +294,35 @@ impl Workspace {
     }
 
     fn git(root: &Path, args: &[&str]) -> Option<String> {
+        Self::finished(Self::spawn(root, args)?)
+    }
+
+    fn git_within(root: &Path, args: &[&str], budget: Duration) -> Walk {
+        let Some(mut child) = Self::spawn(root, args) else {
+            return Walk::Finished(None);
+        };
+        let deadline = Instant::now() + budget;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match child.try_wait() {
+                Ok(Some(_)) => return Walk::Finished(Self::finished(child)),
+                Ok(None) => thread::sleep(left.min(Self::WALK_POLL)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Walk::OutOfTime
+    }
+
+    fn finished(child: Child) -> Option<String> {
+        let output = child.wait_with_output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn spawn(root: &Path, args: &[&str]) -> Option<Child> {
         if !root.join(".git").exists() {
             return None;
         }
@@ -271,11 +331,15 @@ impl Workspace {
         if let Some(parent) = root.parent() {
             command.env("GIT_CEILING_DIRECTORIES", parent);
         }
-        let output = command.arg("-C").arg(&root).args(args).output().ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        command
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
     }
 
     fn path_id(root: &Path) -> String {
@@ -287,6 +351,19 @@ impl Workspace {
             (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Remember,
+    ReadOnly,
+    WithinBudget(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Walk {
+    Finished(Option<String>),
+    OutOfTime,
 }
 
 #[cfg(test)]
@@ -365,9 +442,39 @@ mod tests {
                 .to_owned()
         }
 
+        fn cached(&self, cwd: &Path) -> Option<String> {
+            Workspace::resolve_cached(cwd, &self.store)
+                .expect("cached lookup runs")
+                .map(|workspace| workspace.repo.as_str().to_owned())
+        }
+
+        fn within(&self, cwd: &Path, budget: Duration) -> Option<String> {
+            Workspace::identify(cwd, &self.store, Lookup::WithinBudget(budget))
+                .expect("budgeted lookup runs")
+                .map(|workspace| workspace.repo.as_str().to_owned())
+        }
+
+        fn cache_key(repo: &Path) -> String {
+            let stamp = Workspace::stamp(repo).expect("repository has a stamp");
+            format!("{}#{stamp}", text(repo))
+        }
+
+        #[cfg(unix)]
+        fn walking(repo: &Path) -> bool {
+            let repo = fs::canonicalize(repo).expect("repository path resolves");
+            Command::new("pgrep")
+                .arg("-f")
+                .arg(format!("{} rev-list", repo.display()))
+                .output()
+                .expect("pgrep runs")
+                .status
+                .success()
+        }
+
         fn under_home(&self, cwd: &Path, home: &Path) -> Workspace {
-            Workspace::identify_under(cwd, Some(home), &self.store, true)
+            Workspace::identify_under(cwd, Some(home), &self.store, Lookup::Remember)
                 .expect("workspace resolves")
+                .expect("a full lookup always identifies")
         }
 
         fn directory(base: &Path, relative: &str, markers: &[&str]) -> PathBuf {
@@ -722,5 +829,93 @@ mod tests {
         let workspace = scratch.under_home(&src, &home);
         assert_eq!(workspace.root, shop);
         assert_eq!(workspace.repo.as_str(), root_commit(&shop));
+    }
+
+    #[test]
+    fn a_cached_lookup_out_of_time_leaves_the_walk_to_a_full_resolve() {
+        let scratch = Scratch::new("cached-out-of-time");
+        let repo = scratch.repo("shop", &["first", "second"]);
+        let key = Scratch::cache_key(&repo);
+
+        assert_eq!(scratch.within(&repo, Duration::ZERO), None);
+        assert_eq!(scratch.within(&repo.join("src"), Duration::ZERO), None);
+        #[cfg(unix)]
+        assert!(!Scratch::walking(&repo));
+        assert_eq!(
+            scratch.store.repo_for_root(&key).expect("cache reads"),
+            None
+        );
+
+        let walked = scratch.resolve(&repo);
+        assert_eq!(walked, root_commit(&repo));
+        assert_eq!(scratch.within(&repo, Duration::ZERO), Some(walked));
+    }
+
+    #[test]
+    fn a_cached_lookup_walks_a_small_clone_within_its_budget() {
+        let scratch = Scratch::new("cached-in-time");
+        let repo = scratch.repo("shop", &["first", "second"]);
+
+        assert_eq!(scratch.cached(&repo), Some(root_commit(&repo)));
+        assert_eq!(
+            scratch
+                .store
+                .repo_for_root(&Scratch::cache_key(&repo))
+                .expect("cache reads"),
+            Some(root_commit(&repo))
+        );
+    }
+
+    #[test]
+    fn a_cached_lookup_returns_the_remembered_id() {
+        let scratch = Scratch::new("cached-hit");
+        let repo = scratch.repo("shop", &["first"]);
+        scratch
+            .store
+            .remember_repo(&Scratch::cache_key(&repo), "remembered")
+            .expect("cache writes");
+
+        let workspace = Workspace::resolve_cached(&repo, &scratch.store)
+            .expect("cached lookup runs")
+            .expect("remembered id is found");
+        assert_eq!(workspace.root, repo);
+        assert_eq!(workspace.repo.as_str(), "remembered");
+    }
+
+    #[test]
+    fn a_cached_lookup_identifies_directories_that_need_no_history() {
+        let scratch = Scratch::new("cached-path");
+        let notes = Scratch::directory(&scratch.dir, "notes", &["Cargo.toml"]);
+        let unborn = scratch.repo("unborn", &[]);
+        let shop = scratch.repo("shop", &["shop"]);
+        let empty = Scratch::invalid_git_dir(&shop, "empty");
+
+        for dir in [&notes, &unborn, &empty] {
+            assert_eq!(
+                scratch.cached(dir),
+                Some(Workspace::path_id(dir)),
+                "{}",
+                dir.display()
+            );
+        }
+        assert_eq!(scratch.within(&shop, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn a_cached_lookup_identifies_shallow_clones_by_their_remote() {
+        let scratch = Scratch::new("cached-shallow");
+        let origin = scratch.repo("origin", &["first", "second"]);
+        let url = format!("file://{}", origin.display());
+        let shallow = scratch.dir.join("shallow");
+        git(
+            &scratch.dir,
+            &["clone", "-q", "--depth", "1", &url, &text(&shallow)],
+        );
+
+        let cached = scratch
+            .cached(&shallow)
+            .expect("shallow clones need no walk");
+        assert!(cached.starts_with("remote-"));
+        assert_eq!(scratch.resolve(&shallow), cached);
     }
 }
