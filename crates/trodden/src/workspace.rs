@@ -64,8 +64,8 @@ impl Workspace {
         Self::identify(cwd, store, Lookup::Remember)?.context("identify the repository")
     }
 
-    pub fn resolve_read_only(cwd: &Path, store: &Store) -> Result<Self> {
-        Self::identify(cwd, store, Lookup::ReadOnly)?.context("identify the repository")
+    pub fn resolve_read_only(cwd: &Path, store: &Store) -> Result<Option<Self>> {
+        Self::identify(cwd, store, Lookup::ReadOnly(Self::WALK_BUDGET))
     }
 
     pub fn resolve_cached(cwd: &Path, store: &Store) -> Result<Option<Self>> {
@@ -166,7 +166,7 @@ impl Workspace {
         let Some(repo) = repo else {
             return Ok(Some(Self::path_id(root)));
         };
-        if lookup != Lookup::ReadOnly {
+        if !matches!(lookup, Lookup::ReadOnly(_)) {
             store.remember_repo(&key, &repo)?;
         }
         Ok(Some(repo))
@@ -239,10 +239,10 @@ impl Workspace {
 
     fn root_commit(root: &Path, lookup: Lookup) -> Walk {
         let walk = match lookup {
-            Lookup::WithinBudget(budget) => Self::git_within(root, &Self::ROOT_COMMITS, budget),
-            Lookup::Remember | Lookup::ReadOnly => {
-                Walk::Finished(Self::git(root, &Self::ROOT_COMMITS))
+            Lookup::WithinBudget(budget) | Lookup::ReadOnly(budget) => {
+                Self::git_within(root, &Self::ROOT_COMMITS, budget)
             }
+            Lookup::Remember => Walk::Finished(Self::git(root, &Self::ROOT_COMMITS)),
         };
         match walk {
             Walk::Finished(out) => Walk::Finished(out.and_then(|out| {
@@ -356,8 +356,8 @@ impl Workspace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lookup {
     Remember,
-    ReadOnly,
     WithinBudget(Duration),
+    ReadOnly(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +451,12 @@ mod tests {
         fn within(&self, cwd: &Path, budget: Duration) -> Option<String> {
             Workspace::identify(cwd, &self.store, Lookup::WithinBudget(budget))
                 .expect("budgeted lookup runs")
+                .map(|workspace| workspace.repo.as_str().to_owned())
+        }
+
+        fn read_only_within(&self, cwd: &Path, budget: Duration) -> Option<String> {
+            Workspace::identify(cwd, &self.store, Lookup::ReadOnly(budget))
+                .expect("read-only lookup runs")
                 .map(|workspace| workspace.repo.as_str().to_owned())
         }
 
@@ -671,8 +677,9 @@ mod tests {
         let stamp = Workspace::stamp(&repo).expect("repository has a stamp");
         let key = format!("{}#{stamp}", text(&repo));
 
-        let read_only =
-            Workspace::resolve_read_only(&repo, &scratch.store).expect("workspace resolves");
+        let read_only = Workspace::resolve_read_only(&repo, &scratch.store)
+            .expect("read-only lookup runs")
+            .expect("a small clone is walked within the budget");
         assert_eq!(read_only.repo.as_str(), root_commit(&repo));
         assert_eq!(
             scratch.store.repo_for_root(&key).expect("cache reads"),
@@ -683,9 +690,36 @@ mod tests {
             .store
             .remember_repo(&key, "cached")
             .expect("cache writes");
-        let cached =
-            Workspace::resolve_read_only(&repo, &scratch.store).expect("workspace resolves");
+        let cached = Workspace::resolve_read_only(&repo, &scratch.store)
+            .expect("read-only lookup runs")
+            .expect("the cached id is found");
         assert_eq!(cached.repo.as_str(), "cached");
+    }
+
+    #[test]
+    fn a_read_only_lookup_out_of_time_identifies_nothing_and_caches_nothing() {
+        let scratch = Scratch::new("read-only-out-of-time");
+        let repo = scratch.repo("shop", &["first", "second"]);
+        let notes = Scratch::directory(&scratch.dir, "notes", &["Cargo.toml"]);
+        let key = Scratch::cache_key(&repo);
+
+        assert_eq!(scratch.read_only_within(&repo, Duration::ZERO), None);
+        #[cfg(unix)]
+        assert!(!Scratch::walking(&repo));
+        assert_eq!(
+            scratch.store.repo_for_root(&key).expect("cache reads"),
+            None
+        );
+        assert_eq!(
+            scratch.read_only_within(&notes, Duration::ZERO),
+            Some(Workspace::path_id(&notes))
+        );
+
+        let walked = scratch.resolve(&repo);
+        assert_eq!(
+            scratch.read_only_within(&repo, Duration::ZERO),
+            Some(walked)
+        );
     }
 
     #[test]

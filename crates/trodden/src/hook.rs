@@ -265,7 +265,8 @@ impl Hook {
             return Ok(());
         };
 
-        let text = Harness::read(transcript)?;
+        let text =
+            Harness::read(transcript).with_context(|| format!("load {}", transcript.display()))?;
         let (trace, _) = harness
             .parse(&text, &Redactor::new())
             .with_context(|| format!("parse {}", transcript.display()))?;
