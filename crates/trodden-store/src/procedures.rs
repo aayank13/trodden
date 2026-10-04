@@ -1,8 +1,11 @@
+use std::{borrow::Cow, fmt::Write};
+
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use trodden_core::{
-    Procedure,
+    FamilyId, Procedure, ProcedureId, TaskKind,
     procedure::{Entity, Lifecycle, Scope, Slot},
 };
 
@@ -33,6 +36,12 @@ impl Upsert {
             | Self::Revised { rowid } => rowid,
         }
     }
+}
+
+#[derive(Debug)]
+struct Placement<'a> {
+    candidate: Cow<'a, Procedure>,
+    family: Vec<FamilyRow>,
 }
 
 #[derive(Debug)]
@@ -79,8 +88,8 @@ pub struct LexicalHit {
 impl Store {
     pub fn upsert(&mut self, candidate: &Procedure) -> Result<Upsert> {
         let tx = self.storing()?;
-        let existing = Self::family(&tx, candidate)?;
-        let outcome = Self::save(&tx, &existing, candidate)?;
+        let placement = Self::place(&tx, candidate)?;
+        let outcome = Self::save(&tx, &placement.family, &placement.candidate)?;
         tx.commit().context("commit a procedure")?;
         Ok(outcome)
     }
@@ -91,12 +100,52 @@ impl Store {
             .context("start storing a procedure")
     }
 
-    fn family(tx: &Transaction<'_>, candidate: &Procedure) -> Result<Vec<FamilyRow>> {
+    fn place<'a>(tx: &Transaction<'_>, candidate: &'a Procedure) -> Result<Placement<'a>> {
+        let family = Self::family(tx, &candidate.family)?;
+        match candidate.trigger.kind() {
+            Some(kind) if Self::kind_of(&family)?.is_some_and(|known| known != kind) => {
+                let sibling = Self::sibling(candidate, kind);
+                Ok(Placement {
+                    family: Self::family(tx, &sibling.family)?,
+                    candidate: Cow::Owned(sibling),
+                })
+            }
+            _ => Ok(Placement {
+                candidate: Cow::Borrowed(candidate),
+                family,
+            }),
+        }
+    }
+
+    fn kind_of(family: &[FamilyRow]) -> Result<Option<TaskKind>> {
+        for (_, _, _, document, _) in family {
+            let stored: Procedure =
+                serde_json::from_str(document).context("parse a stored procedure")?;
+            if let Some(kind) = stored.trigger.kind() {
+                return Ok(Some(kind));
+            }
+        }
+        Ok(None)
+    }
+
+    fn sibling(candidate: &Procedure, kind: TaskKind) -> Procedure {
+        let digest = Sha256::digest(format!("{}\n{}", candidate.family.as_str(), kind.as_str()));
+        let hash = digest.iter().take(6).fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+            hex
+        });
+        let mut sibling = candidate.clone();
+        sibling.id = ProcedureId::new(format!("p_{hash}"));
+        sibling.family = FamilyId::new(format!("f_{hash}"));
+        sibling
+    }
+
+    fn family(tx: &Transaction<'_>, family: &FamilyId) -> Result<Vec<FamilyRow>> {
         let mut statement = tx
-            .prepare_cached("SELECT rowid, revision, signature, document, state FROM procedures WHERE family = ?1")
+            .prepare_cached("SELECT rowid, revision, signature, document, state FROM procedures WHERE family = ?1 ORDER BY rowid")
             .context("prepare the family lookup")?;
         statement
-            .query_map([candidate.family.as_str()], |row| {
+            .query_map([family.as_str()], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -710,6 +759,37 @@ mod tests {
     const ELSEWHERE: &str = "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d";
 
     #[derive(Debug)]
+    struct Tasks(Store);
+
+    impl Tasks {
+        const FIX: &str = "Page 2 repeats the last product from page 1. Fix it.";
+        const ADD: &str = "Add a sort parameter to paginate";
+        const UNCLEAR: &str = "perPage values above 100 should be capped at 100.";
+
+        fn new() -> Self {
+            Self(Store::open_in_memory().expect("store opens"))
+        }
+
+        fn learn(&mut self, prompt: &str) -> Upsert {
+            let mut procedure = Procedure::example();
+            procedure.title = prompt.to_owned();
+            procedure.trigger.text = prompt.to_owned();
+            self.0.upsert(&procedure).expect("stored")
+        }
+
+        fn procedures(&self) -> Vec<(String, String)> {
+            self.0
+                .conn
+                .prepare("SELECT id, title FROM procedures ORDER BY rowid")
+                .expect("procedure query prepares")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("procedures read")
+                .collect::<Result<_, _>>()
+                .expect("procedure rows read")
+        }
+    }
+
+    #[derive(Debug)]
     struct Zebras(Store);
 
     impl Zebras {
@@ -1049,9 +1129,10 @@ mod tests {
         let candidate = Procedure::example();
 
         let tx = ingest.storing().expect("transaction starts");
-        let existing = Store::family(&tx, &candidate).expect("family reads");
+        let placement = Store::place(&tx, &candidate).expect("family reads");
         let interleaved = hook.record_injection(&Contention::injection());
-        let stored = Store::save(&tx, &existing, &candidate).expect("procedure is stored");
+        let stored =
+            Store::save(&tx, &placement.family, &placement.candidate).expect("procedure is stored");
         tx.commit().expect("procedure commits");
 
         let refusal = interleaved.expect_err("the hook waits for the procedure to be stored");
@@ -1166,5 +1247,67 @@ mod tests {
 
         assert_eq!(zebras.found(10), ["p_global", "p_stale", "p_here"]);
         assert_eq!(zebras.found(2), ["p_global", "p_stale"]);
+    }
+
+    #[test]
+    fn a_fix_and_an_add_in_the_same_files_become_separate_procedures() {
+        let mut tasks = Tasks::new();
+
+        assert_eq!(tasks.learn(Tasks::FIX), Upsert::Created { rowid: 1 });
+        assert_eq!(tasks.learn(Tasks::ADD), Upsert::Created { rowid: 2 });
+
+        let procedures = tasks.procedures();
+        assert_ne!(procedures[0].0, procedures[1].0);
+        assert_eq!(
+            procedures
+                .iter()
+                .map(|(_, title)| title)
+                .collect::<Vec<_>>(),
+            [Tasks::FIX, Tasks::ADD]
+        );
+    }
+
+    #[test]
+    fn tasks_of_the_same_or_an_unclear_kind_share_a_procedure() {
+        let mut tasks = Tasks::new();
+        tasks.learn(Tasks::FIX);
+
+        for prompt in [
+            "The listing reports one page too few. Fix totalPages.",
+            Tasks::UNCLEAR,
+        ] {
+            assert_eq!(
+                tasks.learn(prompt),
+                Upsert::Refreshed { rowid: 1 },
+                "{prompt}"
+            );
+        }
+        assert_eq!(tasks.procedures().len(), 1);
+    }
+
+    #[test]
+    fn later_tasks_join_the_procedure_of_their_kind() {
+        let mut tasks = Tasks::new();
+        tasks.learn(Tasks::FIX);
+        tasks.learn(Tasks::ADD);
+
+        assert_eq!(
+            tasks.learn("Support a descending order in paginate"),
+            Upsert::Refreshed { rowid: 2 }
+        );
+        assert_eq!(
+            tasks.learn("Page 3 is empty when the list has exactly 20 items. Fix it."),
+            Upsert::Refreshed { rowid: 1 }
+        );
+        assert_eq!(tasks.procedures().len(), 2);
+    }
+
+    #[test]
+    fn a_procedure_of_unclear_kind_takes_the_kind_of_the_first_task_that_joins_it() {
+        let mut tasks = Tasks::new();
+
+        assert_eq!(tasks.learn(Tasks::UNCLEAR), Upsert::Created { rowid: 1 });
+        assert_eq!(tasks.learn(Tasks::ADD), Upsert::Refreshed { rowid: 1 });
+        assert_eq!(tasks.learn(Tasks::FIX), Upsert::Created { rowid: 2 });
     }
 }

@@ -1,4 +1,4 @@
-use crate::Skeleton;
+use trodden_core::Skeleton;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

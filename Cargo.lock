@@ -1221,6 +1221,7 @@ dependencies = [
  "jiff",
  "rusqlite",
  "serde_json",
+ "sha2",
  "trodden-core",
  "trodden-learn",
  "unicode-normalization",

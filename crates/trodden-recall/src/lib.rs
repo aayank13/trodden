@@ -1,8 +1,6 @@
 mod artifact;
 mod envelope;
 mod index;
-mod kind;
-mod skeleton;
 
 use std::{
     cell::OnceCell,
@@ -17,7 +15,7 @@ use anyhow::{Context, Result};
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use trodden_capture::ErrorSignature;
 use trodden_core::{
-    Procedure,
+    Procedure, Skeleton, TaskKind,
     procedure::{Condition, Lifecycle},
 };
 use trodden_embed::Embedder;
@@ -28,8 +26,6 @@ use trodden_store::{ProcedureRow, Store, Terms};
 pub use artifact::{Artifact, Artifacts};
 pub use envelope::Envelope;
 pub use index::{Neighbor, VectorIndex};
-pub use kind::TaskKind;
-pub use skeleton::Skeleton;
 
 const STAGE_LIMIT: usize = 10;
 
@@ -351,7 +347,7 @@ impl<'a> Recall<'a> {
             signals.fused += signals.semantic.map_or(0.0, |(rank, _)| Self::rrf(rank));
             let trigger = &row.procedure.trigger;
             signals.same_kind = query_kind
-                .zip(TaskKind::of(&trigger.text))
+                .zip(trigger.kind())
                 .map(|(query, procedure)| query == procedure);
             let learned = Artifacts::mentioned(
                 std::iter::once(trigger.text.as_str())
@@ -442,14 +438,22 @@ impl<'a> Recall<'a> {
     }
 
     fn decide(&mut self, place: Place<'_>, candidates: &[Match]) -> Result<Decision> {
-        let Some(best) = candidates.first() else {
+        let Some(top) = candidates.first() else {
             return Ok(Decision::Abstain(Abstention::NoCandidates));
         };
+        let best = candidates
+            .iter()
+            .take_while(|candidate| {
+                candidate.signals.fused >= top.signals.fused * Gate::AMBIGUITY_RATIO
+            })
+            .find(|candidate| candidate.signals.same_kind == Some(true))
+            .unwrap_or(top);
         if !best.signals.is_confident(best.row.procedure.state) {
             return Ok(Decision::Abstain(Abstention::NotConfident));
         }
-        let ambiguous = candidates.iter().skip(1).any(|rival| {
+        let ambiguous = candidates.iter().any(|rival| {
             rival.row.procedure.family != best.row.procedure.family
+                && !(best.signals.same_kind == Some(true) && rival.signals.same_kind == Some(false))
                 && rival.signals.fused >= best.signals.fused * Gate::AMBIGUITY_RATIO
                 && rival.signals.exact_weight() >= best.signals.exact_weight()
         });
@@ -1054,6 +1058,34 @@ mod tests {
             Decision::Inject(_)
         ));
         assert!(matches!(gate(&[best, weak, distant]), Decision::Inject(_)));
+    }
+
+    #[test]
+    fn the_prompts_task_kind_settles_a_tie() {
+        let mut other_kind = scored(1, "f_add", 1.0, &["src/paginate.js"]);
+        other_kind.signals.lexical = Some((1, 1.0));
+        other_kind.signals.same_kind = Some(false);
+        let mut same_kind = scored(2, "f_fix", 0.98, &["src/paginate.js"]);
+        same_kind.signals.lexical = Some((0, 1.0));
+        same_kind.signals.same_kind = Some(true);
+        let mut unclear = same_kind.clone();
+        unclear.signals.same_kind = None;
+        let mut rival = other_kind.clone();
+        rival.signals.fused = 0.97;
+        rival.signals.same_kind = Some(true);
+
+        let Decision::Inject(served) = gate(&[other_kind.clone(), same_kind.clone()]) else {
+            panic!("the task of the prompt's kind is served");
+        };
+        assert_eq!(served.row.procedure.family.as_str(), "f_fix");
+        assert_eq!(
+            gate(&[other_kind, unclear]),
+            Decision::Abstain(Abstention::NotConfident)
+        );
+        assert_eq!(
+            gate(&[same_kind, rival]),
+            Decision::Abstain(Abstention::Ambiguous)
+        );
     }
 
     #[test]

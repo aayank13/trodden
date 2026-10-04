@@ -1,8 +1,10 @@
+use std::iter;
+
 use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{FamilyId, HarnessId, ProcedureId, RepoId, SessionId};
+use crate::{FamilyId, HarnessId, ProcedureId, RepoId, SessionId, TaskKind};
 
 mod anti_unify;
 #[cfg(any(test, feature = "test-support"))]
@@ -45,6 +47,14 @@ pub struct Trigger {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<String>,
+}
+
+impl Trigger {
+    pub fn kind(&self) -> Option<TaskKind> {
+        iter::once(&self.text)
+            .chain(&self.examples)
+            .find_map(|prompt| TaskKind::of(prompt))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -176,4 +186,38 @@ pub enum Lifecycle {
     Archived,
     Quarantined,
     Retired,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trigger_takes_the_kind_of_its_first_clear_prompt() {
+        let trigger = |text: &str, examples: &[&str]| Trigger {
+            entities: Vec::new(),
+            text: text.to_owned(),
+            examples: examples
+                .iter()
+                .map(|example| (*example).to_owned())
+                .collect(),
+        };
+
+        assert_eq!(
+            trigger("Page 2 repeats the last product. Fix it.", &["Add sorting"]).kind(),
+            Some(TaskKind::Fix)
+        );
+        assert_eq!(
+            trigger(
+                "perPage values above 100 should be capped",
+                &["Add sorting"]
+            )
+            .kind(),
+            Some(TaskKind::Add)
+        );
+        assert_eq!(
+            trigger("perPage values above 100 should be capped", &[]).kind(),
+            None
+        );
+    }
 }

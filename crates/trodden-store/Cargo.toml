@@ -13,6 +13,7 @@ anyhow.workspace = true
 jiff.workspace = true
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde_json.workspace = true
+sha2 = "0.11.0"
 trodden-core.workspace = true
 trodden-learn.workspace = true
 unicode-normalization = "0.1.25"
