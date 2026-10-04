@@ -28,6 +28,9 @@ account. It works with Claude Code today.
 4. **Learn.** Each injection is scored by whether its task ended with a
    passing check. A small share of matches is held out to compare against,
    and procedures that do worse than no procedure are taken out of recall.
+5. **Remind (optional, off by default).** If the agent changed files after a
+   procedure was injected and did not run the procedure's check afterwards,
+   the end of the turn asks it to run the check before finishing.
 
 What the agent sees:
 
@@ -64,15 +67,17 @@ trodden backfill             # learn from your existing Claude Code sessions
 | Command | What it does |
 |---|---|
 | `trodden status` | What is stored, and whether capture is on |
-| `trodden list` | Procedures learned in this repository |
+| `trodden list` | Procedures learned in this repository (`--all-repos` for every repository, `--revisions` for every revision) |
 | `trodden show <id>` | A procedure in full |
-| `trodden recall "<prompt>" --explain` | What recall would inject, and why |
+| `trodden recall "<prompt>" --explain` | What recall would inject, and why (`--cwd <dir>` to ask from another directory) |
 | `trodden rejected` | Tasks that did not become procedures, and why |
 | `trodden outcomes` | How tasks went with and without each procedure |
 | `trodden retire <id>` | Take a procedure out of recall for good |
 | `trodden forget <id>` / `--repo` / `--all --yes` | Delete procedures |
 | `trodden pause` / `resume` | Stop or restart capture and recall |
+| `trodden config` | Show the current settings |
 | `trodden config holdout <0-1 or auto>` | Share of matches held out for comparison |
+| `trodden config verify-reminder <on or off>` | Ask the agent to run a recalled procedure's check when it skipped it |
 | `trodden doctor` | Check the installation |
 | `trodden mcp` | Read-only MCP tools for agents without prompt hooks |
 
