@@ -6,16 +6,15 @@ use std::{
     io::{self, Read, Write},
     panic::{self, PanicHookInfo},
     process::{self, Command, ExitCode, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::json;
 use trodden::{Harness, Home, Workspace};
-use trodden_capture::{
-    ErrorSignature,
-    claude_code::{HookInput, Transcript},
-};
+use trodden_capture::{ErrorSignature, claude_code::HookInput};
 use trodden_core::{
     Procedure,
     trace::{Event, EventKind, ToolAction, ToolOutcome},
@@ -33,6 +32,9 @@ const MAX_INPUT_BYTES: u64 = 1 << 20;
 pub(crate) struct Hook;
 
 impl Hook {
+    const RECORD_BUDGET: Duration = Duration::from_secs(1);
+    const RECORD_PAUSE: Duration = Duration::from_millis(20);
+
     pub(crate) fn run(harness: Option<&OsStr>) -> ExitCode {
         panic::set_hook(Box::new(Self::on_panic));
         if let Err(error) = Self::handle(harness, &mut Output::stdout()) {
@@ -76,7 +78,7 @@ impl Hook {
             "PostToolUseFailure" => Self::recall_error(&home, &input, out),
             "Stop" => {
                 Self::spawn_ingest(&input, false)?;
-                Self::remind_to_verify(&home, &input, out)
+                Self::remind_to_verify(Harness::ClaudeCode, &home, &input, out)
             }
             "PreCompact" => Self::spawn_ingest(&input, false),
             "SessionEnd" => Self::spawn_ingest(&input, true),
@@ -153,19 +155,40 @@ impl Hook {
             Decision::Abstain(_) => return Ok(()),
         };
         let procedure = &chosen.row.procedure;
-        if !holdout {
-            writeln!(out, "{}", format(&Envelope::render(procedure)))
-                .context("print the recalled procedure")?;
-            out.flush().context("flush the recalled procedure")?;
-        }
-        store.record_injection(&Injection {
+        let injection = Injection {
             session: input.session_id.clone(),
             procedure: procedure.id.to_string(),
             revision: procedure.revision,
             holdout,
             cue,
             at: Timestamp::now(),
+        };
+        Self::retry(Self::RECORD_BUDGET, Store::is_busy, || {
+            store.record_injection(&injection)
         })
+        .context("record the injection before showing the procedure")?;
+        if !holdout {
+            writeln!(out, "{}", format(&Envelope::render(procedure)))
+                .context("print the recalled procedure")?;
+            out.flush().context("flush the recalled procedure")?;
+        }
+        Ok(())
+    }
+
+    fn retry(
+        budget: Duration,
+        transient: impl Fn(&anyhow::Error) -> bool,
+        mut attempt: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match attempt() {
+                Err(error) if transient(&error) && Instant::now() < deadline => {
+                    thread::sleep(Self::RECORD_PAUSE);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn edited_since_check(events: &[Event], injected: Timestamp, check: &str) -> bool {
@@ -198,6 +221,7 @@ impl Hook {
     }
 
     fn remind_to_verify(
+        harness: Harness,
         home: &Home,
         input: &HookInput,
         out: &mut Output<impl Write>,
@@ -238,9 +262,10 @@ impl Hook {
             return Ok(());
         };
 
-        let text = std::fs::read_to_string(transcript)
-            .with_context(|| format!("read {}", transcript.display()))?;
-        let trace = Transcript::parse(&text, &Redactor::new()).context("parse the transcript")?;
+        let text = Harness::read(transcript)?;
+        let (trace, _) = harness
+            .parse(&text, &Redactor::new())
+            .with_context(|| format!("parse {}", transcript.display()))?;
         let edited_since_check =
             Self::edited_since_check(&trace.events, injected.injection.at, check);
         if edited_since_check {
@@ -324,12 +349,151 @@ impl Hook {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, fs, path::PathBuf};
+
     use serde_json::Value;
+    use trodden_capture::claude_code::Transcript;
     use trodden_core::procedure::{Slot, SlotKind};
+    use trodden_recall::Signals;
+    use trodden_store::ProcedureRow;
 
     use super::*;
 
     const CWD: &str = "/home/dev/shop";
+
+    struct Serving {
+        store: Store,
+        dir: Option<PathBuf>,
+    }
+
+    impl Serving {
+        fn in_memory() -> Self {
+            Self {
+                store: Store::open_in_memory().expect("store opens"),
+                dir: None,
+            }
+        }
+
+        fn read_only(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("trodden-hook-{name}-{}", process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch dir is writable");
+            let database = dir.join("trodden.db");
+            drop(Store::open(&database, Patience::Batch).expect("store opens"));
+            Self {
+                store: Store::open_read_only(&database, Patience::Interactive)
+                    .expect("store opens for reading"),
+                dir: Some(dir),
+            }
+        }
+
+        fn serve(&self, decision: fn(Box<Match>) -> Decision) -> (Result<()>, String) {
+            let input: HookInput = serde_json::from_value(json!({
+                "session_id": "s", "cwd": CWD, "hook_event_name": "UserPromptSubmit",
+            }))
+            .expect("valid hook payload");
+            let chosen = Box::new(Match {
+                row: ProcedureRow {
+                    rowid: 1,
+                    procedure: Procedure::example(),
+                },
+                signals: Signals::default(),
+            });
+            let outcome = Outcome {
+                decision: decision(chosen),
+                candidates: Vec::new(),
+                semantic_error: None,
+            };
+            let mut printed = Vec::new();
+            let result = Hook::serve(
+                &self.store,
+                &input,
+                outcome,
+                Cue::Prompt,
+                &mut Output::new(&mut printed),
+                str::to_owned,
+            );
+            (
+                result,
+                String::from_utf8(printed).expect("printed text is UTF-8"),
+            )
+        }
+
+        fn recorded(&self) -> Vec<bool> {
+            self.store
+                .injections(Some("s"))
+                .expect("injections read")
+                .into_iter()
+                .map(|record| record.injection.holdout)
+                .collect()
+        }
+    }
+
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            if let Some(dir) = &self.dir {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    struct Reminding {
+        home: Home,
+    }
+
+    impl Reminding {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("trodden-hook-{name}-{}", process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let home = Home::at(dir);
+            let mut store = home.initialize().expect("home initializes");
+            store.set_verify_reminder(true).expect("setting writes");
+            store
+                .upsert(&Procedure::example())
+                .expect("procedure is stored");
+            let stored = store
+                .revisions(Procedure::example().id.as_str())
+                .expect("revisions read")
+                .pop()
+                .expect("procedure was stored");
+            store
+                .record_injection(&Injection {
+                    session: "s".to_owned(),
+                    procedure: stored.procedure.id.to_string(),
+                    revision: stored.procedure.revision,
+                    holdout: false,
+                    cue: Cue::Prompt,
+                    at: "2026-09-21T14:00:00.120Z".parse().expect("valid timestamp"),
+                })
+                .expect("injection is recorded");
+            Self { home }
+        }
+
+        fn remind(&self, transcript: &[u8]) -> String {
+            let path = self.home.dir().join("transcript.jsonl");
+            fs::write(&path, transcript).expect("transcript is writable");
+            let input: HookInput = serde_json::from_value(json!({
+                "session_id": "s", "cwd": CWD, "hook_event_name": "Stop",
+                "transcript_path": path,
+            }))
+            .expect("valid hook payload");
+            let mut printed = Vec::new();
+            Hook::remind_to_verify(
+                Harness::ClaudeCode,
+                &self.home,
+                &input,
+                &mut Output::new(&mut printed),
+            )
+            .expect("reminder runs");
+            String::from_utf8(printed).expect("printed text is UTF-8")
+        }
+    }
+
+    impl Drop for Reminding {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.home.dir());
+        }
+    }
 
     #[derive(Default)]
     struct Session {
@@ -400,6 +564,129 @@ mod tests {
             let injected = injected.parse().expect("valid timestamp");
             Hook::edited_since_check(&trace.events, injected, check)
         }
+    }
+
+    #[test]
+    fn an_injection_is_recorded_and_shown() {
+        let serving = Serving::in_memory();
+
+        let (result, printed) = serving.serve(Decision::Inject);
+
+        result.expect("injection is served");
+        assert_eq!(
+            printed,
+            format!("{}\n", Envelope::render(&Procedure::example()))
+        );
+        assert_eq!(serving.recorded(), [false]);
+    }
+
+    #[test]
+    fn a_held_out_injection_is_recorded_without_being_shown() {
+        let serving = Serving::in_memory();
+
+        let (result, printed) = serving.serve(Decision::Withhold);
+
+        result.expect("holdout is served");
+        assert_eq!(printed, "");
+        assert_eq!(serving.recorded(), [true]);
+    }
+
+    #[test]
+    fn an_injection_that_cannot_be_recorded_is_not_shown() {
+        let serving = Serving::read_only("unrecorded");
+        let started = Instant::now();
+
+        let (result, printed) = serving.serve(Decision::Inject);
+
+        assert!(started.elapsed() < Hook::RECORD_BUDGET);
+        let error = result.expect_err("a read-only store cannot record");
+        assert!(
+            format!("{error:#}").starts_with("record the injection before showing the procedure"),
+            "{error:#}"
+        );
+        assert_eq!(printed, "");
+        assert!(serving.recorded().is_empty());
+    }
+
+    #[test]
+    fn recording_retries_while_the_database_is_busy() {
+        let attempts = Cell::new(0);
+
+        let result = Hook::retry(
+            Duration::from_secs(1),
+            |_| true,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 4 {
+                    bail!("database is locked");
+                }
+                Ok(())
+            },
+        );
+
+        result.expect("recording succeeds once the lock is released");
+        assert_eq!(attempts.get(), 4);
+    }
+
+    #[test]
+    fn recording_gives_up_when_its_budget_runs_out() {
+        let attempts = Cell::new(0);
+        let budget = Duration::from_millis(100);
+        let started = Instant::now();
+
+        let result = Hook::retry(
+            budget,
+            |_| true,
+            || {
+                attempts.set(attempts.get() + 1);
+                bail!("database is locked")
+            },
+        );
+
+        result.expect_err("the lock is never released");
+        assert!(started.elapsed() >= budget);
+        assert!(attempts.get() > 1);
+    }
+
+    #[test]
+    fn recording_fails_at_once_on_errors_that_are_not_busy() {
+        let attempts = Cell::new(0);
+
+        let result = Hook::retry(Duration::from_secs(1), Store::is_busy, || {
+            attempts.set(attempts.get() + 1);
+            bail!("disk I/O error")
+        });
+
+        result.expect_err("the error is not transient");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn a_transcript_with_invalid_bytes_still_gets_its_reminder() {
+        let reminding = Reminding::new("invalid-bytes");
+        let session = Session::default()
+            .prompt(
+                "2026-09-21T14:00:00.000Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/paginate.js");
+        let mut transcript: Vec<u8> = session
+            .lines
+            .iter()
+            .flat_map(|line| format!("{line}\n").into_bytes())
+            .collect();
+        transcript.extend(b"{\"type\":\"user\",\"sessionId\":\"s\",\"note\":\"caf\xe9\"}\n");
+
+        let printed = reminding.remind(&transcript);
+
+        let reminder: Value = serde_json::from_str(&printed).expect("reminder is JSON");
+        assert_eq!(reminder["decision"], "block");
+        assert!(
+            reminder["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("`npm test`")),
+            "{printed}"
+        );
     }
 
     #[test]

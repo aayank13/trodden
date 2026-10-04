@@ -42,7 +42,7 @@ impl Harness {
         }
     }
 
-    pub(crate) fn read(transcript: &Path) -> Result<String> {
+    pub fn read(transcript: &Path) -> Result<String> {
         let bytes =
             fs::read(transcript).with_context(|| format!("read {}", transcript.display()))?;
         Ok(Self::decode(bytes))
@@ -53,7 +53,7 @@ impl Harness {
             .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
     }
 
-    pub(crate) fn parse(self, text: &str, redactor: &Redactor) -> Result<(Trace, Option<PathBuf>)> {
+    pub fn parse(self, text: &str, redactor: &Redactor) -> Result<(Trace, Option<PathBuf>)> {
         match self {
             Self::ClaudeCode => Ok((
                 Transcript::parse(text, redactor)?,
