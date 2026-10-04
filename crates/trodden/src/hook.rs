@@ -73,7 +73,7 @@ impl Hook {
             "UserPromptSubmit" => Self::recall(&home, &input, out),
             "SessionStart" => {
                 let store = home.open_store(Patience::Interactive)?;
-                Workspace::resolve(&input.cwd, &store).map(drop)
+                Workspace::resolve_cached(&input.cwd, &store).map(drop)
             }
             "PostToolUseFailure" => Self::recall_error(&home, &input, out),
             "Stop" => {
@@ -94,7 +94,9 @@ impl Hook {
         if store.paused()? {
             return Ok(());
         }
-        let workspace = Workspace::resolve(&input.cwd, &store)?;
+        let Some(workspace) = Workspace::resolve_cached(&input.cwd, &store)? else {
+            return Ok(());
+        };
         let outcome = home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
@@ -123,7 +125,9 @@ impl Hook {
         if store.paused()? {
             return Ok(());
         }
-        let workspace = Workspace::resolve(&input.cwd, &store)?;
+        let Some(workspace) = Workspace::resolve_cached(&input.cwd, &store)? else {
+            return Ok(());
+        };
         let outcome = Recall::new(&store, None).recall_error(&ErrorQuery {
             signature: &signature,
             repo: workspace.repo.as_str(),
