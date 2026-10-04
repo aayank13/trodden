@@ -268,11 +268,16 @@ impl Ingest {
                 ended,
             } in batch
             {
-                let Some(harness) = Harness::from_name(&harness) else {
+                let Some(known) = Harness::from_name(&harness) else {
+                    self.home.log_error(format_args!(
+                        "ingest {}: unsupported harness `{harness}`",
+                        transcript.display()
+                    ));
                     continue;
                 };
-                if let Ok(one) = self.transcript(harness, &transcript, ended) {
-                    report.absorb(one);
+                match self.transcript(known, &transcript, ended) {
+                    Ok(one) => report.absorb(one),
+                    Err(error) => self.home.log_error(error),
                 }
             }
         }
@@ -284,7 +289,9 @@ impl Ingest {
         transcript: &Path,
         ended: bool,
     ) -> Result<IngestReport> {
-        let mut report = self.session(harness, transcript, ended)?;
+        let mut report = self
+            .session(harness, transcript, ended)
+            .with_context(|| format!("ingest {}", transcript.display()))?;
         report.absorb(self.finish_idle_sessions(harness)?);
         Ok(report)
     }
@@ -322,7 +329,7 @@ impl Ingest {
         let text = Harness::read(transcript)?;
         let (mut trace, cwd) = harness
             .parse(&text, &self.redactor)
-            .with_context(|| format!("parse {}", transcript.display()))?;
+            .context("parse the transcript")?;
         let ended = ended || Self::is_idle(transcript);
         let session = trace.session.as_str().to_owned();
         let progress = self.store.progress(&session)?;
@@ -334,7 +341,7 @@ impl Ingest {
 
         let cwd = cwd
             .filter(|cwd| cwd.is_absolute())
-            .with_context(|| format!("{} has no usable working directory", transcript.display()))?;
+            .context("the transcript has no usable working directory")?;
         let workspace = Workspace::resolve(&cwd, &self.store)?;
         let recorded = path::absolute(transcript)
             .with_context(|| format!("resolve {}", transcript.display()))?;
@@ -696,6 +703,17 @@ mod tests {
                 .ended
         }
 
+        fn logged(home: &Home) -> Vec<String> {
+            fs::read_to_string(home.error_log())
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    let (_, message) = line.split_once(' ').expect("line has a timestamp");
+                    message.to_owned()
+                })
+                .collect()
+        }
+
         fn stored(&self) -> String {
             ["trodden.db", "trodden.db-wal"]
                 .iter()
@@ -991,11 +1009,12 @@ mod tests {
         let error = ingest
             .transcript(Harness::ClaudeCode, &scratch.transcript, true)
             .expect_err("a relative directory is refused");
-        assert!(
-            error
-                .to_string()
-                .ends_with("has no usable working directory"),
-            "{error}"
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "ingest {}: the transcript has no usable working directory",
+                scratch.transcript.display()
+            )
         );
     }
 
@@ -1477,6 +1496,60 @@ mod tests {
 
         assert_eq!(report, IngestReport::default());
         assert!(!PendingIngests::new(&home).any().expect("markers list"));
+        assert_eq!(
+            Scratch::logged(&home),
+            [format!(
+                "ingest {}: unsupported harness `future-agent`",
+                scratch.transcript.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn queued_transcripts_that_fail_are_logged() {
+        let scratch = Scratch::new("deferred-failures");
+        let home = scratch.home();
+        scratch.append_in(
+            "shop",
+            &task(
+                0,
+                "Page 2 in src/paginate.js repeats the last product from page 1",
+                "src/paginate.js",
+            ),
+        );
+        let missing = scratch.dir.join("missing.jsonl");
+        let healthy = scratch.other_session(&task(
+            0,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        ));
+
+        for transcript in [&scratch.transcript, &missing, &healthy] {
+            Ingest::run_or_defer(&home, Harness::ClaudeCode, transcript, true)
+                .expect("background ingest runs");
+        }
+
+        let logged = Scratch::logged(&home);
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert_eq!(
+            logged[0],
+            format!(
+                "ingest {}: the transcript has no usable working directory",
+                scratch.transcript.display()
+            )
+        );
+        assert!(
+            logged[1].starts_with(&format!("ingest {}: ", missing.display())),
+            "{logged:?}"
+        );
+        let ingest = scratch.ingest();
+        assert!(
+            ingest
+                .store
+                .progress(OTHER_SESSION)
+                .expect("progress reads")
+                .is_some_and(|progress| progress.ended)
+        );
     }
 
     #[test]

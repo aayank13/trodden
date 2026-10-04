@@ -1,9 +1,13 @@
 use std::{
-    env, fs,
+    env,
+    fmt::Display,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use jiff::Timestamp;
 use trodden_embed::Embedder;
 use trodden_recall::{Recall, VectorIndex};
 use trodden_store::{Patience, Store};
@@ -15,6 +19,7 @@ pub struct Home {
 
 impl Home {
     pub const ENV: &str = "TRODDEN_HOME";
+    const ERROR_LOG_LIMIT: u64 = 64 * 1024;
 
     pub fn locate() -> Result<Self> {
         if let Some(dir) = env::var_os(Self::ENV).filter(|dir| !dir.is_empty()) {
@@ -81,8 +86,27 @@ impl Home {
         self.dir.join("ingest.pending")
     }
 
-    pub fn hook_log(&self) -> PathBuf {
+    pub fn error_log(&self) -> PathBuf {
         self.dir.join("hook.log")
+    }
+
+    pub fn log_error(&self, error: impl Display) {
+        if !self.is_initialized() {
+            return;
+        }
+        let path = self.error_log();
+        let full = fs::metadata(&path).is_ok_and(|log| log.len() >= Self::ERROR_LOG_LIMIT);
+        let mut options = OpenOptions::new();
+        if full {
+            options.create(true).write(true).truncate(true);
+        } else {
+            options.create(true).append(true);
+        }
+        let message = format!("{error:#}").replace(['\r', '\n'], " ");
+        let line = format!("{} {message}\n", Timestamp::now());
+        if let Ok(mut log) = options.open(&path) {
+            let _ = log.write_all(line.as_bytes());
+        }
     }
 
     pub fn open_store(&self, patience: Patience) -> Result<Store> {
@@ -190,6 +214,19 @@ mod tests {
             );
             outcome.semantic_error
         }
+
+        fn logged(&self) -> Vec<String> {
+            fs::read_to_string(self.home.error_log())
+                .expect("error log reads")
+                .lines()
+                .map(|line| {
+                    let (at, message) = line.split_once(' ').expect("line has a timestamp");
+                    at.parse::<Timestamp>()
+                        .expect("line starts with a timestamp");
+                    message.to_owned()
+                })
+                .collect()
+        }
     }
 
     impl Drop for Scratch {
@@ -258,5 +295,46 @@ mod tests {
         assert!(format!("{error:#}").starts_with("load the recall index: "));
         let reported = scratch.semantic_error().expect("recall notes the error");
         assert_eq!(reported, format!("{error:#}"));
+    }
+
+    #[test]
+    fn errors_are_logged_one_per_line_with_their_causes() {
+        let scratch = Scratch::new("log-lines");
+        let error = anyhow::anyhow!("line 3 is not JSON\nexpected value")
+            .context("parse the transcript")
+            .context("ingest /home/dev/.claude/projects/shop/session.jsonl");
+
+        scratch.home.log_error(&error);
+        scratch.home.log_error("start a background ingest");
+
+        assert_eq!(
+            scratch.logged(),
+            [
+                "ingest /home/dev/.claude/projects/shop/session.jsonl: parse the transcript: line 3 is not JSON expected value",
+                "start a background ingest",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_uninitialized_home_logs_nothing() {
+        let scratch = Scratch::new("log-uninitialized");
+        let elsewhere = Home::at(scratch.home.dir().join("elsewhere"));
+
+        elsewhere.log_error("parse the hook payload");
+
+        assert!(!elsewhere.dir().exists());
+    }
+
+    #[test]
+    fn a_full_error_log_starts_over() {
+        let scratch = Scratch::new("log-full");
+        let old = "2026-10-01T10:00:00Z parse the hook payload\n";
+        let lines = usize::try_from(Home::ERROR_LOG_LIMIT).expect("limit fits") / old.len() + 1;
+        Scratch::write(&scratch.home.error_log(), old.repeat(lines).as_bytes());
+
+        scratch.home.log_error("start a background ingest");
+
+        assert_eq!(scratch.logged(), ["start a background ingest"]);
     }
 }

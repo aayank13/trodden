@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, TryLockError},
     io::Write,
     iter,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command as Process, ExitCode},
 };
 
@@ -233,7 +233,7 @@ impl Command {
                 background,
             } => {
                 let report = if background {
-                    Ingest::run_or_defer(&home, Harness::ClaudeCode, &transcript, ended)?
+                    Self::ingest_in_background(&home, &transcript, ended)
                 } else {
                     Some(Ingest::run(&home, Harness::ClaudeCode, &transcript, ended)?)
                 };
@@ -372,9 +372,9 @@ impl Command {
                     .into(),
             )?;
         }
-        if let Ok(log) = fs::read_to_string(home.hook_log()) {
+        if let Ok(log) = fs::read_to_string(home.error_log()) {
             for line in log.lines().rev().take(3) {
-                writeln!(out, "note     recent hook error: {line}")?;
+                writeln!(out, "note     recent background error: {line}")?;
             }
         }
         ensure!(problems == 0, "{problems} problem(s) found");
@@ -658,7 +658,7 @@ impl Command {
         if let Forget::Procedure(id) = target {
             ensure!(deleted > 0, "no procedure {id}");
         }
-        let log = home.hook_log();
+        let log = home.error_log();
         if matches!(target, Forget::All) && log.exists() {
             fs::remove_file(&log).with_context(|| format!("remove {}", log.display()))?;
         }
@@ -702,6 +702,15 @@ impl Command {
             writeln!(err, "skipped {}: {error}", transcript.display())?;
         }
         Ok(())
+    }
+
+    fn ingest_in_background(home: &Home, transcript: &Path, ended: bool) -> Option<IngestReport> {
+        Ingest::run_or_defer(home, Harness::ClaudeCode, transcript, ended)
+            .with_context(|| format!("ingest {}", transcript.display()))
+            .unwrap_or_else(|error| {
+                home.log_error(error);
+                None
+            })
     }
 
     fn print_report(out: &mut Output<impl Write>, report: &IngestReport) -> Result<()> {
@@ -908,14 +917,14 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_everything_removes_the_hook_log_and_repositories() {
+    fn forgetting_everything_removes_the_error_log_and_repositories() {
         let scratch = Scratch::new("forget-all");
         let home = &scratch.home;
         fs::write(
-            home.hook_log(),
+            home.error_log(),
             "2026-10-01T10:00:00Z parse the hook payload\n",
         )
-        .expect("hook log is writable");
+        .expect("error log is writable");
         home.open_store(Patience::Batch)
             .expect("store opens")
             .remember_repo("/home/dev/shop", "path-5f0c1d2e3a4b6978")
@@ -929,7 +938,7 @@ mod tests {
             String::from_utf8_lossy(&printed),
             "Deleted 0 revision(s).\n"
         );
-        assert!(!home.hook_log().exists());
+        assert!(!home.error_log().exists());
         assert_eq!(
             home.open_store(Patience::Batch)
                 .expect("store opens")
@@ -981,6 +990,35 @@ mod tests {
                 .procedure
                 .state,
             trodden_core::procedure::Lifecycle::Retired
+        );
+    }
+
+    #[test]
+    fn a_background_ingest_that_cannot_start_logs_why_for_the_doctor() {
+        let scratch = Scratch::new("background-failure");
+        let home = &scratch.home;
+        fs::write(home.pending_ingests(), "").expect("queue path is writable");
+        let transcript = home.dir().join("session.jsonl");
+
+        let report = Command::ingest_in_background(home, &transcript, true);
+
+        assert_eq!(report, None);
+        let log = fs::read_to_string(home.error_log()).expect("error log reads");
+        let [line] = log.lines().collect::<Vec<_>>()[..] else {
+            panic!("one logged error: {log:?}");
+        };
+        let expected = format!(
+            "ingest {}: create {}: ",
+            transcript.display(),
+            home.pending_ingests().display()
+        );
+        assert!(line.contains(&expected), "{line}");
+        let (_, printed) = scratch.doctor();
+        assert!(
+            printed
+                .lines()
+                .any(|note| note == format!("note     recent background error: {line}")),
+            "{printed}"
         );
     }
 

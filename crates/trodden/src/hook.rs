@@ -2,7 +2,6 @@ use std::{
     env,
     ffi::OsStr,
     fmt::Display,
-    fs::OpenOptions,
     io::{self, Read, Write},
     panic::{self, PanicHookInfo},
     process::{self, Command, ExitCode, Stdio},
@@ -44,7 +43,7 @@ impl Hook {
     }
 
     fn on_panic(panic: &PanicHookInfo<'_>) {
-        Self::log(panic.to_string().replace('\n', " "));
+        Self::log(panic);
         process::exit(0);
     }
 
@@ -337,16 +336,8 @@ impl Hook {
     }
 
     fn log(message: impl Display) {
-        let Ok(home) = Home::locate() else { return };
-        if !home.is_initialized() {
-            return;
-        }
-        if let Ok(mut log) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(home.hook_log())
-        {
-            let _ = writeln!(log, "{} {message:#}", Timestamp::now());
+        if let Ok(home) = Home::locate() {
+            home.log_error(message);
         }
     }
 }
