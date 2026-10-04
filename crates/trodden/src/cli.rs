@@ -161,6 +161,13 @@ enum EmbeddingsCommand {
     },
 }
 
+#[derive(Debug)]
+enum Finding {
+    Healthy(String),
+    Note(String),
+    Problem(anyhow::Error),
+}
+
 impl Cli {
     pub(crate) fn run() -> ExitCode {
         let cli = Self::parse();
@@ -310,51 +317,50 @@ impl Command {
 
     fn doctor(home: &Home, out: &mut Output<impl Write>) -> Result<()> {
         let mut problems = 0;
-        let mut check = |label: &str, result: Result<String>| match result {
-            Ok(detail) => writeln!(out, "ok       {label}: {detail}"),
-            Err(error) => {
+        let mut report = |label: &str, finding: Finding| match finding {
+            Finding::Healthy(detail) => writeln!(out, "ok       {label}: {detail}"),
+            Finding::Note(detail) => writeln!(out, "note     {label}: {detail}"),
+            Finding::Problem(error) => {
                 problems += 1;
                 writeln!(out, "PROBLEM  {label}: {error:#}")
             }
         };
-        check(
+        report(
             "data directory",
             if home.is_initialized() {
-                Ok(home.dir().display().to_string())
+                Finding::Healthy(home.dir().display().to_string())
             } else {
-                Err(anyhow::anyhow!("not initialized; run `trodden init`"))
+                Finding::Problem(anyhow::anyhow!("not initialized; run `trodden init`"))
             },
         )?;
         if home.is_initialized() {
-            check(
+            report(
                 "database",
                 home.open_store(Patience::Batch)
                     .and_then(|store| store.stats())
-                    .map(|stats| format!("{} procedures", stats.procedures)),
+                    .map(|stats| format!("{} procedures", stats.procedures))
+                    .into(),
             )?;
         }
-        check(
-            "embedding model",
-            home.open_embedder().and_then(|embedder| {
-                embedder
-                    .map(|_| "installed".to_owned())
-                    .context("not installed; semantic matching is off")
-            }),
-        )?;
-        check(
+        report("embedding model", Finding::embedding_model(home))?;
+        report(
             "recall index",
-            home.open_index().map(|index| {
-                if index.is_some() {
-                    "readable".to_owned()
-                } else {
-                    "not built yet".to_owned()
-                }
-            }),
+            home.open_index()
+                .map(|index| {
+                    if index.is_some() {
+                        "readable".to_owned()
+                    } else {
+                        "not built yet".to_owned()
+                    }
+                })
+                .into(),
         )?;
         for program in ["trodden", "git", "claude"] {
-            check(
+            report(
                 &format!("`{program}` on PATH"),
-                Self::which(program).map(|path| path.display().to_string()),
+                Self::which(program)
+                    .map(|path| path.display().to_string())
+                    .into(),
             )?;
         }
         if let Ok(log) = fs::read_to_string(home.hook_log()) {
@@ -776,6 +782,28 @@ impl Command {
     }
 }
 
+impl Finding {
+    fn embedding_model(home: &Home) -> Self {
+        match home.open_embedder() {
+            Ok(Some(_)) => Self::Healthy("installed".to_owned()),
+            Ok(None) => Self::Note(
+                "not installed; semantic matching is off (run `trodden embeddings install` to turn it on)"
+                    .to_owned(),
+            ),
+            Err(error) => Self::Problem(error),
+        }
+    }
+}
+
+impl From<Result<String>> for Finding {
+    fn from(result: Result<String>) -> Self {
+        match result {
+            Ok(detail) => Self::Healthy(detail),
+            Err(error) => Self::Problem(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
@@ -794,6 +822,15 @@ mod tests {
             let home = Home::at(dir);
             home.initialize().expect("home initializes");
             Self { home }
+        }
+
+        fn doctor(&self) -> (Result<()>, String) {
+            let mut printed = Vec::new();
+            let result = Command::doctor(&self.home, &mut Output::new(&mut printed));
+            (
+                result,
+                String::from_utf8(printed).expect("doctor prints UTF-8"),
+            )
         }
     }
 
@@ -893,6 +930,34 @@ mod tests {
                 .procedure
                 .state,
             trodden_core::procedure::Lifecycle::Retired
+        );
+    }
+
+    #[test]
+    fn a_missing_embedding_model_is_a_note() {
+        let scratch = Scratch::new("doctor-no-model");
+
+        let note = "note     embedding model: not installed; semantic matching is off (run `trodden embeddings install` to turn it on)";
+
+        let (result, printed) = scratch.doctor();
+
+        assert!(printed.lines().any(|line| line == note));
+        assert!(!printed.contains("PROBLEM  embedding model"));
+        assert_eq!(result.is_ok(), !printed.contains("PROBLEM"));
+    }
+
+    #[test]
+    fn a_corrupt_embedding_model_is_a_problem() {
+        let scratch = Scratch::new("doctor-corrupt-model");
+        fs::write(scratch.home.embeddings(), b"TRDEMB\x01\0short").expect("model file is writable");
+
+        let (result, printed) = scratch.doctor();
+
+        assert!(result.is_err());
+        assert!(
+            printed
+                .lines()
+                .any(|line| line.starts_with("PROBLEM  embedding model: "))
         );
     }
 
