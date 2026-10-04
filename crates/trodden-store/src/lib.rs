@@ -85,6 +85,17 @@ impl Store {
         Ok(store)
     }
 
+    pub fn is_busy(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            matches!(
+                cause
+                    .downcast_ref::<rusqlite::Error>()
+                    .and_then(rusqlite::Error::sqlite_error_code),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        })
+    }
+
     pub fn paused(&self) -> Result<bool> {
         Ok(self.setting("paused")?.as_deref() == Some("1"))
     }
@@ -319,6 +330,46 @@ mod tests {
             .conn
             .execute_batch("COMMIT;")
             .expect("writer commits");
+    }
+
+    #[test]
+    fn a_write_blocked_by_another_writer_is_busy() {
+        let scratch = Scratch::new("busy");
+        let writer = Store::open(&scratch.database(), Patience::Batch).expect("store opens");
+        writer
+            .conn
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO repos (root, repo) VALUES ('a', 'b');")
+            .expect("writer locks the database");
+        let blocked = Store::open(&scratch.database(), Patience::Interactive).expect("store opens");
+
+        let busy = blocked
+            .set_paused(true)
+            .expect_err("the writer holds the lock");
+        writer
+            .conn
+            .execute_batch("COMMIT;")
+            .expect("writer commits");
+
+        assert!(Store::is_busy(&busy), "{busy:#}");
+        assert!(Store::is_busy(&busy.context("pause capture")));
+        blocked
+            .set_paused(true)
+            .expect("setting writes once the lock is free");
+    }
+
+    #[test]
+    fn other_store_errors_are_not_busy() {
+        let scratch = Scratch::new("not-busy");
+        drop(Store::open(&scratch.database(), Patience::Batch).expect("store opens"));
+        let reader =
+            Store::open_read_only(&scratch.database(), Patience::Batch).expect("store opens");
+
+        let refusal = reader
+            .set_paused(true)
+            .expect_err("a read-only store cannot write");
+
+        assert!(!Store::is_busy(&refusal), "{refusal:#}");
+        assert!(!Store::is_busy(&anyhow::anyhow!("database is locked")));
     }
 
     #[test]
