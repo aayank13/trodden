@@ -8,6 +8,8 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    pub const ALL: [Self; 3] = [Self::Fix, Self::Add, Self::Meta];
+
     const FIX: &[&str] = &[
         "fix",
         "bug",
@@ -83,6 +85,14 @@ impl TaskKind {
         "add", "adds", "adding", "write", "writes", "writing", "create", "cover", "covers",
         "covering", "extend",
     ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fix => "fix",
+            Self::Add => "add",
+            Self::Meta => "meta",
+        }
+    }
 
     pub fn of(prompt: &str) -> Option<Self> {
         let text = Skeleton::of(prompt)

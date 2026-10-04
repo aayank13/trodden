@@ -11,9 +11,10 @@ use std::{
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use trodden_core::Skeleton;
 use trodden_embed::{Embedder, Quantized};
 use trodden_extract::{Extractor, ProjectChecks};
-use trodden_recall::{Skeleton, VectorIndex};
+use trodden_recall::VectorIndex;
 use trodden_redact::Redactor;
 use trodden_store::{ExtractionRecord, Patience, Progress, Store, Upsert};
 
