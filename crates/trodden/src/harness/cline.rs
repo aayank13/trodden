@@ -567,6 +567,7 @@ impl Agent for Cline {
 
     fn render(&self, event: &HookEvent, reply: Reply<'_>) -> Option<String> {
         match (&event.moment, reply) {
+            (Moment::Prompt(_), Reply::Recall(_)) if event.name != "UserPromptSubmit" => None,
             (Moment::Prompt(_) | Moment::CommandFailed(_), Reply::Recall(envelope)) => {
                 Some(json!({ "cancel": false, "contextModification": envelope }).to_string())
             }
@@ -860,7 +861,7 @@ mod tests {
     #[test]
     fn replies_inject_context_and_never_continue() {
         let event = |moment| HookEvent {
-            name: String::new(),
+            name: "UserPromptSubmit".to_owned(),
             session: "s".to_owned(),
             cwd: PathBuf::from(CWD),
             transcript: None,
@@ -889,6 +890,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn cli_prompts_are_journaled_but_never_recalled() {
+        let event = Payload::event(&json!({
+            "clineVersion": "3.0.70", "hookName": "prompt_submit", "timestamp": "2026-10-09T10:00:00.000Z",
+            "taskId": "run_1", "sessionContext": {"rootSessionId": "1791540000000_k3x9q"},
+            "workspaceRoots": [CWD], "userId": "me", "agent_id": "lead", "parent_agent_id": null,
+            "userPromptSubmit": {"prompt": "Fix the paging bug in src/paginate.js"}
+        }))
+        .expect("event");
+
+        assert_eq!(
+            event.moment,
+            Moment::Prompt("Fix the paging bug in src/paginate.js".to_owned())
+        );
+        assert_eq!(event.observed.len(), 1);
+        assert_eq!(Cline.render(&event, Reply::Recall("<m/>")), None);
     }
 
     #[test]
