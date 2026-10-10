@@ -220,6 +220,12 @@ struct Exec<'a> {
 }
 
 impl<'a> Exec<'a> {
+    const REJECTIONS: [&'static str; 3] = [
+        "rejected by user",
+        "exec command rejected by user",
+        "patch rejected by user",
+    ];
+
     fn parse(text: &'a str) -> Option<Self> {
         let mut exec = Self {
             exit_code: None,
@@ -282,7 +288,21 @@ impl<'a> Exec<'a> {
     }
 
     fn interrupted(text: &str) -> bool {
-        text.contains("aborted by user") || text.contains("rejected by user")
+        let text = text.trim();
+        let aborted = match text.split_once('\n') {
+            Some((wall, rest)) => {
+                rest == "aborted by user"
+                    && wall
+                        .strip_prefix("Wall time: ")
+                        .and_then(Self::milliseconds)
+                        .is_some()
+            }
+            None => text
+                .strip_prefix("aborted by user after ")
+                .and_then(|secs| secs.strip_suffix('s'))
+                .is_some_and(|secs| secs.parse::<f64>().is_ok()),
+        };
+        aborted || Self::REJECTIONS.contains(&text)
     }
 }
 
@@ -1048,6 +1068,70 @@ mod tests {
 
         assert_eq!(calls[0].outcome, ToolOutcome::Interrupted);
         assert_eq!(calls[1].outcome, ToolOutcome::Interrupted);
+    }
+
+    #[test]
+    fn rejections_and_aborts_are_interrupted() {
+        let mut session = Session::new();
+        session
+            .turn("019f0a11-0000-7000-8000-000000000001", "Clean the build")
+            .exec("call_aborted", "npm run build")
+            .output("call_aborted", "Wall time: 4.2 seconds\naborted by user")
+            .record(
+                "response_item",
+                json!({"type": "function_call", "name": "shell_command",
+                "arguments": json!({"command": "make dist"}).to_string(), "call_id": "call_shell"}),
+            )
+            .output("call_shell", "aborted by user after 2.5s")
+            .exec("call_rejected", "rm -rf build")
+            .output("call_rejected", "rejected by user")
+            .record(
+                "response_item",
+                json!({"type": "custom_tool_call", "status": "completed",
+                "call_id": "call_patch", "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Delete File: build/out.js\n*** End Patch\n"}),
+            )
+            .record(
+                "response_item",
+                json!({"type": "custom_tool_call_output",
+                "call_id": "call_patch", "output": "patch rejected by user"}),
+            );
+
+        let outcomes: Vec<ToolOutcome> = session
+            .calls()
+            .into_iter()
+            .map(|call| call.outcome)
+            .collect();
+
+        assert_eq!(outcomes, [ToolOutcome::Interrupted; 4]);
+    }
+
+    #[test]
+    fn outputs_that_mention_a_rejection_keep_their_exit_code() {
+        let mut session = Session::new();
+        session
+            .turn("019f0a11-0000-7000-8000-000000000001", "Return 403 for cancelled uploads")
+            .exec("call_test", "npm test")
+            .exec("call_grep", "rg -n 'rejected by user' src")
+            .exec("call_lint", "npm run lint")
+            .exited("call_test", 0, "  upload\n    ✔ returns 403 when the upload is rejected by user\n\n  1 passing (14ms)\n")
+            .exited("call_grep", 0, "src/upload.js:12:    // upload rejected by user\n")
+            .exited("call_lint", 1, "src/upload.js:3:7 error 'aborted by user' is assigned a value but never used\n");
+
+        let outcomes: Vec<ToolOutcome> = session
+            .calls()
+            .into_iter()
+            .map(|call| call.outcome)
+            .collect();
+
+        assert_eq!(
+            outcomes,
+            [
+                ToolOutcome::Succeeded,
+                ToolOutcome::Succeeded,
+                ToolOutcome::Failed { exit_code: Some(1) }
+            ]
+        );
     }
 
     #[test]
