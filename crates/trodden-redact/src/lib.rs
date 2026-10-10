@@ -10,7 +10,7 @@ const ENTROPY_THRESHOLD: f64 = 4.3;
 
 const PATH_WORD_MIN_LEN: usize = 3;
 
-type Check = fn(&Captures<'_>) -> bool;
+type Check = fn(&str, &Captures<'_>) -> bool;
 
 #[derive(Debug, Clone)]
 pub struct Redactor {
@@ -85,13 +85,23 @@ impl Rule {
         ),
         (
             "url-password",
-            r"(?i)(?-u:\b)[a-z][a-z0-9+.-]*://[^/\s:@]+:(?P<secret>[^/\s@]+)@",
+            r"(?i)(?-u:\b)[a-z][a-z0-9+.-]*://[^/\s:@\[]*:(?P<secret>[^/\s]+)@",
+            Self::never,
+        ),
+        (
+            "url-token",
+            r"(?i)(?-u:\b)[a-z][a-z0-9+.-]*://(?P<secret>[0-9a-f]{32,})@",
             Self::never,
         ),
         (
             "auth-header",
-            r"(?i)(?-u:\b)authorization:\s*(?:bearer|basic|token)\s+(?P<secret>[A-Za-z0-9._~+/=-]{8,})",
+            r#"(?i)(?-u:\b)authorization["'`]?\s*[:=]\s*["'`]?(?:bearer|basic|token|bot|negotiate|apikey|api-key|key|sso-key)\s+(?P<secret>[A-Za-z0-9._~+/=-]{8,})"#,
             Self::never,
+        ),
+        (
+            "auth-header",
+            r#"(?i)(?-u:\b)authorization["'`]?\s*[:=]\s*["'`]?(?P<secret>[A-Za-z0-9._~+/=-]{8,})"#,
+            Self::is_unmixed,
         ),
         (
             "cookie",
@@ -100,7 +110,7 @@ impl Rule {
         ),
         (
             "assignment",
-            r#"(?i)(?P<name>[a-z0-9_.-]*(?:secret|token|pass|api[_.-]?key|access[_.-]?key|private[_.-]?key|credential)[a-z0-9_.-]*)["']?\s*[=:]\s*(?P<secret>"[^"]*"|'[^']*'|[^\s"'=:][^\s"']*)"#,
+            r#"(?i)(?P<name>[a-z0-9_.-]*(?:secret|token|pass|pwd|api[_.-]?key|access[_.-]?key|private[_.-]?key|credential)[a-z0-9_.-]*)["']?\s*[=:]\s*(?P<secret>"[^"]*"|'[^']*'|[^\s"'=:][^\s"']*)"#,
             Self::is_harmless_assignment,
         ),
         (
@@ -110,7 +120,7 @@ impl Rule {
         ),
         (
             "cli-password",
-            r#"(?-u:\b)curl(?-u:\b)[^\n|;&]*?\s(?:-u|--user)(?:\s+|=)?["']?[^\s:"']*:(?P<secret>[^\s"']+)"#,
+            r#"(?-u:\b)curl(?-u:\b)[^\n|;&]*?\s(?:-u|--user)(?:\s+|=)?["']?[^\s:"'\[]*:(?P<secret>[^\s"']+)"#,
             Self::is_reference,
         ),
         (
@@ -124,26 +134,47 @@ impl Rule {
             Self::is_reference,
         ),
         (
+            "cli-password",
+            r#"(?-u:\b)(?:docker|podman|buildah|skopeo|nerdctl|helm|oras)(?-u:\b)[^\n|;&]*?\slogin(?-u:\b)[^\n|;&]*?\s-p(?:\s+|=)?["']?(?P<secret>[^\s"']+)"#,
+            Self::is_reference,
+        ),
+        (
+            "cli-password",
+            r#"(?-u:\b)(?:redis|valkey|keydb)-cli(?-u:\b)[^\n|;&]*?\s-a\s+["']?(?P<secret>[^\s"']+)"#,
+            Self::is_reference,
+        ),
+        (
+            "cli-password",
+            r#"(?-u:\b)htpasswd\s(?:[^\n|;&<>`]*?\s)?-[A-Za-z]*b[A-Za-z]*\s[^\n|;&<>`]*?(?P<secret>"[^"]*"|'[^']*'|[^\s"'|;&<>`)]+)[ \t]*(?:$|[\n|;&<>`)])"#,
+            Self::is_reference,
+        ),
+        (
             "hex-secret",
-            r#"(?P<name>[A-Za-z0-9_.-]+)["']?\s*[=:]\s*["']?(?P<secret>[0-9A-Fa-f]{32,})(?-u:\b)"#,
+            r#"(?P<name>[A-Za-z0-9_.-]+)["']?(?P<separator>\s*[=:]\s*|\s+)["']?(?P<secret>[0-9A-Fa-f]{32,})(?-u:\b)"#,
             Self::is_harmless_hex,
         ),
         (
             "email",
-            r"(?-u:\b)(?P<secret>(?P<user>[A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?-u:\b)(?P<remote>[:/])?",
-            Self::is_git_remote,
+            r"(?-u:\b)(?P<secret>(?P<user>[A-Za-z0-9._%+-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?-u:\b)(?P<remote>[:/])?(?P<path>[/~])?",
+            Self::is_remote_target,
         ),
     ];
 
-    fn never(_: &Captures<'_>) -> bool {
+    fn never(_: &str, _: &Captures<'_>) -> bool {
         false
     }
 
-    fn is_reference(caps: &Captures<'_>) -> bool {
+    fn is_reference(_: &str, caps: &Captures<'_>) -> bool {
         Value::new(&caps["secret"]).is_reference()
     }
 
-    fn is_harmless_assignment(caps: &Captures<'_>) -> bool {
+    fn is_unmixed(_: &str, caps: &Captures<'_>) -> bool {
+        let secret = &caps["secret"];
+        !secret.bytes().any(|b| b.is_ascii_digit())
+            || !secret.bytes().any(|b| b.is_ascii_alphabetic())
+    }
+
+    fn is_harmless_assignment(_: &str, caps: &Captures<'_>) -> bool {
         let name = Name::parse(&caps["name"]);
         let value = Value::new(&caps["secret"]);
         value.is_single()
@@ -152,21 +183,26 @@ impl Rule {
                 || value.is_harmless(name.ends_with_secret()))
     }
 
-    fn is_harmless_flag(caps: &Captures<'_>) -> bool {
+    fn is_harmless_flag(_: &str, caps: &Captures<'_>) -> bool {
         let name = Name::parse(&caps["name"]);
         let value = Value::new(&caps["secret"]);
         value.is_single() && (!name.is_secret_flag() || value.is_harmless(true))
     }
 
-    fn is_harmless_hex(caps: &Captures<'_>) -> bool {
-        let hex = &caps["secret"];
-        Name::parse(&caps["name"]).names_hash()
-            || !hex.bytes().any(|b| b.is_ascii_digit())
-            || !hex.bytes().any(|b| b.is_ascii_alphabetic())
+    fn is_harmless_hex(text: &str, caps: &Captures<'_>) -> bool {
+        let raw = &caps["name"];
+        let name = Name::parse(raw);
+        let spaced = caps["separator"].trim().is_empty();
+        name.names_hash()
+            || (spaced && (raw.starts_with('-') || !name.names_key()))
+            || Self::is_unmixed(text, caps)
     }
 
-    fn is_git_remote(caps: &Captures<'_>) -> bool {
-        &caps["user"] == "git" && caps.name("remote").is_some()
+    fn is_remote_target(text: &str, caps: &Captures<'_>) -> bool {
+        let remote = caps.name("remote").map(|remote| remote.as_str());
+        (&caps["user"] == "git" && remote.is_some())
+            || (remote == Some(":") && caps.name("path").is_some())
+            || Login::new(text, caps.name("secret").expect("email rule has a secret")).is_target()
     }
 }
 
@@ -269,6 +305,7 @@ impl Name {
                 .words
                 .iter()
                 .any(|word| Self::PASS_WORDS.contains(&word.as_str()))
+            || self.ends_with_pwd()
     }
 
     fn ends_with_secret(&self) -> bool {
@@ -278,11 +315,20 @@ impl Name {
             .any(|word| self.joined.ends_with(word))
             || Self::PASS_WORDS.contains(&self.last())
             || (self.joined.ends_with("key") && self.mentions_secret())
+            || self.ends_with_pwd()
+    }
+
+    fn ends_with_pwd(&self) -> bool {
+        self.words.len() > 1 && self.last() == "pwd"
     }
 
     fn is_secret_flag(&self) -> bool {
         self.first() != "no"
             && (self.ends_with_secret() || ["auth", "cookie"].contains(&self.last()))
+    }
+
+    fn names_key(&self) -> bool {
+        self.ends_with_secret() || ["key", "token"].contains(&self.last())
     }
 
     fn names_hash(&self) -> bool {
@@ -369,6 +415,85 @@ impl<'a> Value<'a> {
     }
 }
 
+#[derive(Debug)]
+struct Login<'a> {
+    before: &'a str,
+}
+
+impl<'a> Login<'a> {
+    const COPY_PROGRAMS: &'static [&'static str] =
+        &["scp", "rsync", "sftp", "sshfs", "ssh-copy-id"];
+
+    const SHELL_PROGRAMS: &'static [&'static str] = &["ssh", "autossh", "mosh"];
+
+    const WRAPPERS: &'static [&'static str] = &[
+        "sudo", "doas", "env", "time", "timeout", "nohup", "nice", "exec", "command", "sshpass",
+    ];
+
+    const VALUE_OPTIONS: &'static [u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+
+    fn new(text: &'a str, target: regex::Match<'_>) -> Self {
+        let before = &text[..target.start()];
+        let start = before
+            .rfind(['\n', '|', ';', '&', '(', '`'])
+            .map_or(0, |index| index + 1);
+        Self {
+            before: &before[start..],
+        }
+    }
+
+    fn is_target(&self) -> bool {
+        let last = self.before.rsplit([' ', '\t']).next().unwrap_or_default();
+        if !(last.is_empty() || (last.starts_with('-') && last.ends_with('='))) {
+            return false;
+        }
+        let mut words = self
+            .before
+            .split_whitespace()
+            .skip_while(|word| !word.starts_with('-') && word.contains('='))
+            .peekable();
+        if !words
+            .peek()
+            .is_some_and(|first| Self::WRAPPERS.contains(first) || Self::program(first).is_some())
+        {
+            return false;
+        }
+        while let Some(word) = words.next() {
+            if word.contains(['"', '\'']) {
+                return false;
+            }
+            if let Some(program) = Self::program(word) {
+                return Self::COPY_PROGRAMS.contains(&program) || Self::is_destination(words);
+            }
+        }
+        false
+    }
+
+    fn program(word: &str) -> Option<&str> {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        Self::COPY_PROGRAMS
+            .iter()
+            .chain(Self::SHELL_PROGRAMS)
+            .find(|&&program| program == name)
+            .copied()
+    }
+
+    fn is_destination<'w>(words: impl Iterator<Item = &'w str>) -> bool {
+        let mut takes_value = false;
+        for word in words {
+            if std::mem::take(&mut takes_value) {
+                continue;
+            }
+            match word.as_bytes() {
+                [b'-', option] => takes_value = Self::VALUE_OPTIONS.contains(option),
+                [b'-', ..] => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
 impl Redactor {
     const PATH_DELIMITERS: &[char] = &[
         '"', '\'', '`', '=', ':', ',', ';', '(', ')', '[', ']', '{', '}', '<', '>', '|', '&',
@@ -412,7 +537,7 @@ impl Redactor {
         let mut text = Cow::Borrowed(text);
         for rule in &self.rules {
             if let Cow::Owned(replaced) = rule.regex.replace_all(&text, |caps: &Captures<'_>| {
-                if (rule.is_harmless)(caps) {
+                if (rule.is_harmless)(&text, caps) {
                     caps[0].to_owned()
                 } else {
                     Self::replace_secret(rule.id, caps)
@@ -858,7 +983,100 @@ mod tests {
                     &["hunter2"],
                 ),
                 case(
+                    "redis-cli -u redis://:hunter2@localhost:6379 ping".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "psql postgres://app:p@ss@db/shop".to_owned(),
+                    &["p@ss", "ss@db"],
+                ),
+                case(
+                    format!("git clone https://{hex}@github.com/org/repo.git"),
+                    &[&hex],
+                ),
+                case(format!("deploy with token {hex}"), &[&hex]),
+                case(format!("the key {hex}"), &[&hex]),
+                case("docker login -u ada -p hunter2".to_owned(), &["hunter2"]),
+                case(
+                    "docker login -p hunter2 -u ada ghcr.io".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "podman login --username ada -p=hunter2 quay.io".to_owned(),
+                    &["hunter2"],
+                ),
+                case("redis-cli -a hunter2 ping".to_owned(), &["hunter2"]),
+                case(
+                    "redis-cli -h db -p 6379 -a 'hunter2' ping".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "htpasswd -b .htpasswd admin hunter2".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "htpasswd -nbB admin hunter2 > .htpasswd".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "htpasswd -B -C 12 -b .htpasswd admin 'correct horse'".to_owned(),
+                    &["correct horse"],
+                ),
+                case(
+                    "echo $(htpasswd -nb admin hunter2)".to_owned(),
+                    &["hunter2"],
+                ),
+                case("export MYSQL_PWD=hunter2".to_owned(), &["hunter2"]),
+                case("./bin/cli --password=hunter2".to_owned(), &["hunter2"]),
+                case("mysql -u root -phunter2 shop".to_owned(), &["hunter2"]),
+                case("PASSWORD=hunter2 ./run.sh".to_owned(), &["hunter2"]),
+                case(
+                    "curl https://ada:hunter2@example.com/report".to_owned(),
+                    &["hunter2"],
+                ),
+                case(
+                    "Authorization: Basic YWRhOmh1bnRlcjI=".to_owned(),
+                    &["YWRhOmh1bnRlcjI="],
+                ),
+                case(
+                    r#"requests.get(url, headers={"Authorization": "Bearer abcdefgh123"})"#
+                        .to_owned(),
+                    &["abcdefgh123"],
+                ),
+                case(
+                    "fetch(url, { headers: { Authorization: `Bearer abcdefgh123` } })".to_owned(),
+                    &["abcdefgh123"],
+                ),
+                case(
+                    format!(r#"curl -H "Authorization: Bot {api_key}" https://discord.com"#),
+                    &[&api_key],
+                ),
+                case(
+                    format!(r#"curl -H "Authorization: lin_api_{api_key}" https://api.linear.app"#),
+                    &[&api_key],
+                ),
+                case(
                     "mail ada@example.com < report.txt".to_owned(),
+                    &["ada@example.com"],
+                ),
+                case(
+                    "git commit -m 'use ssh ada@example.com'".to_owned(),
+                    &["ada@example.com"],
+                ),
+                case(
+                    "ssh deploy@staging.example.com 'mail ada@example.com < report.txt'".to_owned(),
+                    &["ada@example.com"],
+                ),
+                case(
+                    "ssh deploy@staging.example.com; mail ada@example.com".to_owned(),
+                    &["ada@example.com"],
+                ),
+                case(
+                    "curl -u ada@example.com:hunter2 https://ci.example.com".to_owned(),
+                    &["ada@example.com", "hunter2"],
+                ),
+                case(
+                    "contact ada@example.com: today".to_owned(),
                     &["ada@example.com"],
                 ),
                 case(
@@ -904,6 +1122,27 @@ mod tests {
                 "mysql -P 3306 -h db shop",
                 "sshpass -f ~/.pw ssh -p 2222 deploy@staging",
                 "ssh -p 2222 deploy@staging",
+                "ssh deploy@staging.example.com",
+                "ssh -i ~/.ssh/deploy deploy@staging.example.com 'systemctl restart shop'",
+                "ssh -p 2222 -J bastion@jump.example.com deploy@staging.example.com uptime",
+                "ssh -oProxyJump=bastion@jump.example.com deploy@staging.example.com",
+                "sudo -u ops ssh deploy@staging.example.com",
+                "cd infra && ssh deploy@staging.example.com",
+                "scp build.tar ubuntu@ec2-1-2-3-4.compute.amazonaws.com:/tmp",
+                "scp -P 2222 ubuntu@ec2-1-2-3-4.compute.amazonaws.com:app.log .",
+                "rsync -avz dist/ deploy@staging.example.com:/srv/shop",
+                "sftp deploy@staging.example.com",
+                "ssh-copy-id -i ~/.ssh/deploy.pub deploy@staging.example.com",
+                "./scripts/deploy.sh deploy@staging.example.com:/srv/shop",
+                "make deploy TARGET=deploy@staging.example.com:~/shop",
+                "redis-cli -a $REDIS_PASSWORD ping",
+                r#"docker login -u ada -p "$REGISTRY_PASSWORD" ghcr.io"#,
+                "htpasswd -D .htpasswd admin",
+                r#"curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com"#,
+                "Authorization: required",
+                "def check(authorization: Optional[str] = Header(None)):",
+                "fetch(url, { headers: { Authorization: authHeader } })",
+                "PWD=/home/ada/shop ./scripts/run.sh",
                 "cargo test -p invoicer",
                 "npm test",
                 "cd .claude/worktrees/agent-a3f9c2d17e5b4c08 && cargo test",
@@ -916,6 +1155,9 @@ mod tests {
                 format!("pip install requests --hash=sha256:{sha256}"),
                 format!(r#"checksum = "{sha256}""#),
                 format!(r#"{{"head_sha": "{sha1}"}}"#),
+                format!("git checkout {sha1}"),
+                format!("gpg --recv-key {sha1}"),
+                format!("sha256 {sha256}"),
             ])
             .collect()
         }
@@ -964,6 +1206,26 @@ mod tests {
             (
                 "git clone git@github.com:org/repo.git && mail ada@example.com".to_owned(),
                 "git clone git@github.com:org/repo.git && mail [REDACTED:email]",
+            ),
+            (
+                "psql postgres://app:p@ss@db/shop".to_owned(),
+                "psql postgres://app:[REDACTED:url-password]@db/shop",
+            ),
+            (
+                "redis-cli -u redis://:hunter2@localhost:6379 ping".to_owned(),
+                "redis-cli -u redis://:[REDACTED:url-password]@localhost:6379 ping",
+            ),
+            (
+                "docker login -u ada -p hunter2 ghcr.io".to_owned(),
+                "docker login -u ada -p [REDACTED:cli-password] ghcr.io",
+            ),
+            (
+                "htpasswd -nbB admin hunter2 > .htpasswd".to_owned(),
+                "htpasswd -nbB admin [REDACTED:cli-password] > .htpasswd",
+            ),
+            (
+                "ssh deploy@staging.example.com mail ada@example.com".to_owned(),
+                "ssh deploy@staging.example.com mail [REDACTED:email]",
             ),
         ];
         for (text, expected) in cases {
