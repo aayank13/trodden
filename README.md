@@ -91,12 +91,14 @@ trodden backfill             # learn from your existing sessions
 | OpenCode | `opencode` | yes | yes | no | hooks | no |
 | Kilo Code | `kilo` | yes | yes | no | hooks | no |
 | Kimi Code | `kimi` | yes | no | yes | hooks | no |
-| Cline | `cline` | yes | yes | no | hooks | no |
+| Cline | `cline` | extension only | yes | no | hooks | no |
 
 "no" means the agent's hooks cannot do it: Cursor cannot add context to a
 prompt, Kimi Code ignores output after a failed command, and OpenCode, Kilo
-Code and Cline cannot continue a finished turn. Agents that learn from hooks
-only learn from sessions after they are connected.
+Code and Cline cannot continue a finished turn. The Cline CLI cannot add
+context to a prompt either, so Cline recalls on a prompt only in its VS Code
+and JetBrains extension. Agents that learn from hooks only learn from sessions
+after they are connected.
 
 A few agents need one step of their own after `trodden connect`: Codex asks
 you to trust the new hooks the next time it starts, Cline needs its "Enable
