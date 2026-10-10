@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{mem, sync::LazyLock};
 
 use regex::Regex;
 use trodden_capture::Command;
@@ -139,6 +139,73 @@ impl Verification {
         }
         let program = |command: &str| Command::normalize(&Self::clean(command), "").program();
         program(passed) == program(failed)
+    }
+
+    pub(crate) fn hides_status(command: &str) -> bool {
+        let segments = Self::segments(command);
+        let Some(check) = segments.iter().position(|(segment, separator)| {
+            segment.split_whitespace().next() != Some("cd")
+                || !["&&", ";", "\n"].contains(separator)
+        }) else {
+            return false;
+        };
+        segments[check..]
+            .windows(2)
+            .any(|pair| pair[0].1 != "&&" && !pair[1].0.trim().is_empty())
+    }
+
+    fn segments(command: &str) -> Vec<(String, &'static str)> {
+        let chars: Vec<char> = command.chars().collect();
+        let mut segments = Vec::new();
+        let mut segment = String::new();
+        let mut quote = None;
+        let mut index = 0;
+        while let Some(&c) = chars.get(index) {
+            let next = chars.get(index + 1).copied();
+            let separator = match (quote, c) {
+                (Some(open), _) if c == open => {
+                    quote = None;
+                    None
+                }
+                (Some('\''), _) => None,
+                (_, '\\') => {
+                    segment.push(c);
+                    segment.extend(next);
+                    index += 2;
+                    continue;
+                }
+                (Some(_), _) => None,
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    None
+                }
+                (None, '|') => Some(match next {
+                    Some('|') => "||",
+                    Some('&') => "|&",
+                    _ => "|",
+                }),
+                (None, '&') if next == Some('&') => Some("&&"),
+                (None, '&')
+                    if index.checked_sub(1).map(|before| chars[before]) == Some('>')
+                        || next == Some('>') =>
+                {
+                    None
+                }
+                (None, '&') => Some("&"),
+                (None, ';') => Some(";"),
+                (None, '\n') => Some("\n"),
+                (None, _) => None,
+            };
+            if let Some(separator) = separator {
+                segments.push((mem::take(&mut segment), separator));
+                index += separator.len();
+            } else {
+                segment.push(c);
+                index += 1;
+            }
+        }
+        segments.push((segment, ""));
+        segments
     }
 
     pub(crate) fn clean(command: &str) -> String {
@@ -282,6 +349,41 @@ mod tests {
             "tsc --noEmit",
         ] {
             assert!(!Verification::runs_tests(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn finds_what_hides_a_checks_exit_status() {
+        for command in [
+            "cargo test 2>&1 | tail -20",
+            "cargo test |& tee test.log",
+            "cargo test | sort",
+            "npm test || true",
+            "npm test || exit 0",
+            "npm test; echo ok",
+            "npm test & wait",
+            "cd web && npm test | head",
+            "cargo test && echo ok; true",
+            "pytest -q\necho done",
+        ] {
+            assert!(Verification::hides_status(command), "{command}");
+        }
+        for command in [
+            "cargo test",
+            "cargo test 2>&1",
+            "npm test &> out.log",
+            "npm test >&2",
+            "cargo build && cargo test",
+            "cargo test && echo ok",
+            "cd web && npm test",
+            "cd web; npm test",
+            "cd web\nnpm test",
+            "npm test;",
+            "pytest -k 'paging | totals'",
+            "pytest -k \"paging; totals\"",
+            "grep -q a\\|b x && pytest",
+        ] {
+            assert!(!Verification::hides_status(command), "{command}");
         }
     }
 
