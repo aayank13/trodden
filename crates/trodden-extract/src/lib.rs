@@ -90,6 +90,7 @@ pub enum Rejection {
     NoEdits,
     NotVerified,
     VerificationFailed { command: String },
+    StatusHidden { command: String },
     TooManySteps { steps: usize },
     ContainsSecret,
     Dangerous { rule: &'static str, command: String },
@@ -102,6 +103,9 @@ impl fmt::Display for Rejection {
             Self::NoEdits => f.write_str("no files were changed"),
             Self::NotVerified => f.write_str("no check ran after the last edit"),
             Self::VerificationFailed { command } => write!(f, "the last check failed: `{command}`"),
+            Self::StatusHidden { command } => {
+                write!(f, "the last check hid its exit status: `{command}`")
+            }
             Self::TooManySteps { steps } => write!(f, "{steps} steps is more than {MAX_STEPS}"),
             Self::ContainsSecret => f.write_str("a step depends on a redacted secret"),
             Self::Dangerous { rule, command } => write!(f, "{rule}: `{command}`"),
@@ -165,6 +169,12 @@ impl<'a> Call<'a> {
         self.call.outcome == ToolOutcome::Succeeded
     }
 
+    fn hides_status(&self) -> bool {
+        self.succeeded()
+            && !self.call.confirmed_by_output
+            && self.command().is_some_and(Verification::hides_status)
+    }
+
     fn is_edit(&self) -> bool {
         self.call.action == ToolAction::Edit && self.succeeded() && !self.call.changes.is_empty()
     }
@@ -215,10 +225,13 @@ impl<'a> Builder<'a> {
     }
 
     fn outcome(&self) -> TaskOutcome {
-        match self.calls.iter().rposition(Call::is_edit) {
-            None => TaskOutcome::Unjudged,
-            Some(last_edit) if self.final_verification(last_edit).is_ok() => TaskOutcome::Succeeded,
-            Some(_) => TaskOutcome::Failed,
+        let Some(last_edit) = self.calls.iter().rposition(Call::is_edit) else {
+            return TaskOutcome::Unjudged;
+        };
+        match self.final_verification(last_edit) {
+            Ok(_) => TaskOutcome::Succeeded,
+            Err(Rejection::StatusHidden { .. }) => TaskOutcome::Unjudged,
+            Err(_) => TaskOutcome::Failed,
         }
     }
 
@@ -268,20 +281,26 @@ impl<'a> Builder<'a> {
 
     fn final_verification(&self, last_edit: usize) -> Result<usize, Rejection> {
         let learned = self.learned_checks(last_edit);
-        let is_check = |call: &Call<'_>| {
+        let runs_check = |call: &Call<'_>| {
             call.command().is_some_and(|command| {
                 Verification::is_verify(command)
                     || learned.contains(&command)
                     || self.checks.find(command).is_some()
             })
         };
+        let is_check = |call: &Call<'_>| runs_check(call) && !call.hides_status();
         let failure = |call: &Call<'_>| Rejection::VerificationFailed {
             command: Verification::clean(call.command().unwrap_or_default()),
         };
         let after_edit = || self.calls.iter().enumerate().skip(last_edit + 1);
-        let (index, call) = after_edit()
-            .rfind(|(_, call)| is_check(call))
-            .ok_or(Rejection::NotVerified)?;
+        let Some((index, call)) = after_edit().rfind(|(_, call)| is_check(call)) else {
+            return Err(after_edit().rfind(|(_, call)| runs_check(call)).map_or(
+                Rejection::NotVerified,
+                |(_, call)| Rejection::StatusHidden {
+                    command: call.command().unwrap_or_default().to_owned(),
+                },
+            ));
+        };
         if !call.succeeded() {
             return Err(failure(call));
         }
@@ -488,6 +507,7 @@ impl<'a> Builder<'a> {
                 .take_while(|call| not_found || !call.is_edit())
                 .find(|call| {
                     call.succeeded()
+                        && !call.hides_status()
                         && call.command().is_some_and(|other| {
                             other != command
                                 && Self::lint(other).is_ok()
@@ -953,6 +973,7 @@ mod tests {
                 changes: Vec::new(),
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -974,6 +995,7 @@ mod tests {
                 }],
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -989,6 +1011,7 @@ mod tests {
                 changes: Vec::new(),
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -1000,6 +1023,18 @@ mod tests {
             }) = self.0.events.last_mut()
             {
                 call.changes[0].created = true;
+            }
+            self
+        }
+
+        fn confirmed(mut self, command: &str, exit_code: i32) -> Self {
+            self = self.run(command, exit_code);
+            if let Some(Event {
+                kind: EventKind::ToolCall(call),
+                ..
+            }) = self.0.events.last_mut()
+            {
+                call.confirmed_by_output = true;
             }
             self
         }
@@ -1231,16 +1266,83 @@ mod tests {
     }
 
     #[test]
-    fn stores_checks_without_tails_that_hide_their_result() {
+    fn a_check_whose_status_is_hidden_does_not_pass() {
         for command in [
             "npm test 2>&1 | tail -5",
+            "cargo test 2>&1 | head -40",
             "npm test || true",
             "npm test; echo ok",
+            "cd web && npm test | tee test.log",
         ] {
+            let edited = || {
+                Sketch::new()
+                    .prompt("Fix the pagination bug in the catalog")
+                    .edit("src/paginate.js", &[])
+            };
+
+            assert_eq!(
+                edited().run(command, 0).extract_one(),
+                Err(Rejection::StatusHidden {
+                    command: command.to_owned()
+                }),
+                "{command}"
+            );
+            assert_eq!(
+                edited().run("npm test", 1).run(command, 0).extract_one(),
+                Err(Rejection::VerificationFailed {
+                    command: "npm test".to_owned()
+                }),
+                "{command}"
+            );
+            let procedure = edited()
+                .run("npm test", 0)
+                .run(command, 0)
+                .extract_one()
+                .expect("the earlier check passed");
+            assert_eq!(
+                procedure.verify.map(|verify| verify.command).as_deref(),
+                Some("npm test"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_status_confirmed_by_output_counts() {
+        let edited = || {
+            Sketch::new()
+                .prompt("Fix the pagination bug in the catalog")
+                .edit("src/paginate.js", &[])
+        };
+
+        let procedure = edited()
+            .run("npm test", 1)
+            .confirmed("npm test 2>&1 | tail -20", 0)
+            .extract_one()
+            .expect("the output showed the check passing");
+        assert_eq!(
+            procedure.verify.map(|verify| verify.command).as_deref(),
+            Some("npm test")
+        );
+        assert_eq!(
+            edited()
+                .run("npm test", 0)
+                .confirmed("npm test 2>&1 | tail -20", 1)
+                .extract_one(),
+            Err(Rejection::VerificationFailed {
+                command: "npm test".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn stores_checks_without_redirects_and_tails() {
+        for command in ["npm test 2>&1", "npm test 2>&1 | tail -5"] {
             let procedure = Sketch::new()
                 .prompt("Fix the pagination bug in the catalog")
                 .edit("src/paginate.js", &[])
-                .run(command, 0)
+                .run(command, 1)
+                .run("npm test 2>&1", 0)
                 .extract_one()
                 .expect("the check passed");
 
@@ -1250,6 +1352,20 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn a_hidden_status_does_not_teach_a_replacement() {
+        let procedure = Sketch::new()
+            .prompt("Fix the pagination bug in the catalog")
+            .run("cargo test --lib", 101)
+            .run("cargo test 2>&1 | tail -20", 0)
+            .edit("src/paginate.rs", &[])
+            .run("cargo test", 0)
+            .extract_one()
+            .expect("cargo test passed after the edit");
+
+        assert!(procedure.avoid.is_empty(), "{:?}", procedure.avoid);
     }
 
     #[test]
@@ -1879,6 +1995,29 @@ mod tests {
                     .prompt("Fix the off-by-one in src/paginate.js")
                     .edit("src/paginate.js", &[])
                     .run("npm test", 1)
+                    .0,
+                &RepoId::new("5f0c3a1e"),
+                true,
+            )
+            .into_iter()
+            .map(|extraction| extraction.outcome)
+            .collect();
+
+        assert_eq!(outcomes, [TaskOutcome::Unjudged, TaskOutcome::Failed]);
+    }
+
+    #[test]
+    fn a_hidden_exit_status_leaves_the_task_unjudged() {
+        let outcomes: Vec<TaskOutcome> = Extractor::default()
+            .extract(
+                &Sketch::new()
+                    .prompt("Fix the off-by-one in src/paginate.js")
+                    .edit("src/paginate.js", &[])
+                    .run("npm test 2>&1 | tail -20", 0)
+                    .prompt("Fix the rounding in src/totals.js")
+                    .edit("src/totals.js", &[])
+                    .run("npm test", 1)
+                    .run("npm test || true", 0)
                     .0,
                 &RepoId::new("5f0c3a1e"),
                 true,

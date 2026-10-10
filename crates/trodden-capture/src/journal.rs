@@ -47,6 +47,8 @@ pub enum Observed {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<FileChange>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        confirmed_by_output: bool,
     },
     Compaction {
         automatic: bool,
@@ -99,6 +101,7 @@ impl Observer<'_> {
             error: None,
             duration_ms: None,
             changes: Vec::new(),
+            confirmed_by_output: false,
         }
     }
 
@@ -136,6 +139,7 @@ impl Observer<'_> {
             error,
             duration_ms: ran.duration_ms,
             changes: Vec::new(),
+            confirmed_by_output: verdict.is_some() && outcome != ToolOutcome::Interrupted,
         })
     }
 
@@ -173,6 +177,7 @@ impl Observer<'_> {
             error: None,
             duration_ms: None,
             changes,
+            confirmed_by_output: false,
         })
     }
 
@@ -251,6 +256,7 @@ impl Journal {
                     error,
                     duration_ms,
                     changes,
+                    confirmed_by_output,
                 } => {
                     let call = Self::relative(
                         &builder,
@@ -262,6 +268,7 @@ impl Journal {
                             changes,
                             duration_ms,
                             error,
+                            confirmed_by_output,
                         },
                     );
                     builder.emit(EventKind::ToolCall(call));
@@ -418,6 +425,44 @@ mod tests {
 
         assert_eq!(call.outcome, ToolOutcome::Failed { exit_code: Some(1) });
         assert!(call.error.is_some());
+    }
+
+    #[test]
+    fn masked_checks_record_when_their_output_decided() {
+        let cases = [
+            (
+                "cargo test 2>&1 | tail -3",
+                "test result: ok. 3 passed",
+                true,
+            ),
+            (
+                "cargo test 2>&1 | tail -3",
+                "test result: FAILED. 1 failed",
+                true,
+            ),
+            ("cargo test 2>&1 | tail -3", "running 3 tests", false),
+            ("cargo test", "test result: ok. 3 passed", false),
+        ];
+        for (command, output, confirmed) in cases {
+            let mut session = Session::new();
+            session.observe("/home/dev/shop", "2026-10-09T10:00:09Z", |o| {
+                o.command(
+                    "Shell",
+                    command,
+                    Ran {
+                        output,
+                        exit_code: Some(0),
+                        failed: false,
+                        interrupted: false,
+                        duration_ms: None,
+                    },
+                )
+            });
+
+            let call = session.calls().remove(0);
+
+            assert_eq!(call.confirmed_by_output, confirmed, "{command}: {output}");
+        }
     }
 
     #[test]
