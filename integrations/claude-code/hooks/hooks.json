@@ -2,22 +2,22 @@
   "description": "Recall a learned procedure on each prompt and when a command fails with an error a past session fixed; learn from the session when a turn or session ends.",
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ],
     "PostToolUseFailure": [
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ],
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ],
     "PreCompact": [
-      { "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ],
     "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "PATH=${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "case :$PATH: in *:\"${CARGO_HOME:-$HOME/.cargo}/bin\":*) ;; *) PATH=${CARGO_HOME:-$HOME/.cargo}/bin${PATH:+:$PATH} ;; esac; command -v trodden >/dev/null 2>&1 || exit 0; exec trodden hook claude-code", "timeout": 5 }] }
     ]
   }
 }
