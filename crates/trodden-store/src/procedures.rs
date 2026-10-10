@@ -686,6 +686,12 @@ impl Store {
         if matches!(target, Forget::All) {
             tx.execute_batch("DELETE FROM extractions; DELETE FROM sessions; DELETE FROM repos;")
                 .context("delete ingest history")?;
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES ('forgotten_before', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [Timestamp::now().to_string()],
+            )
+            .context("remember when everything was forgotten")?;
         }
         tx.commit().context("commit forgetting")?;
         Ok(deleted)
@@ -1068,6 +1074,26 @@ mod tests {
                 rejections: 0,
                 injections: 0,
             }
+        );
+    }
+
+    #[test]
+    fn forgetting_everything_remembers_when() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        assert_eq!(store.forgotten_before().expect("setting reads"), None);
+        let before = Timestamp::now();
+
+        store.forget(Forget::All).expect("forgotten");
+
+        let forgotten = store
+            .forgotten_before()
+            .expect("setting reads")
+            .expect("the forget time is recorded");
+        assert!(before <= forgotten && forgotten <= Timestamp::now());
+        store.forget(Forget::Repo(REPO)).expect("forgotten again");
+        assert_eq!(
+            store.forgotten_before().expect("setting reads"),
+            Some(forgotten)
         );
     }
 

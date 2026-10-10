@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use jiff::Timestamp;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 pub use ingest::{ExtractionRecord, Progress};
@@ -123,6 +124,15 @@ impl Store {
 
     pub fn set_verify_reminder(&self, on: bool) -> Result<()> {
         self.set_setting("verify_reminder", if on { "1" } else { "0" })
+    }
+
+    pub fn forgotten_before(&self) -> Result<Option<Timestamp>> {
+        self.setting("forgotten_before")?
+            .map(|at| {
+                at.parse()
+                    .context("parse the time everything was forgotten")
+            })
+            .transpose()
     }
 
     pub fn embedding_scheme(&self) -> Result<Option<String>> {

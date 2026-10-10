@@ -386,11 +386,16 @@ impl Ingest {
         };
         let mut extracted_through = already;
         let mut tasks = Vec::new();
+        let forgotten = self.store.forgotten_before()?;
+        let done = |seq: u32, at: Timestamp| {
+            already.is_some_and(|through| seq <= through)
+                || forgotten.is_some_and(|forgot| at <= forgot)
+        };
 
         let checks = ProjectChecks::discover(&workspace.root)
             .redacted(|command| self.redactor.redact(command).into_owned());
         for extraction in Extractor::new(checks).extract(&trace, &workspace.repo, ended) {
-            if already.is_some_and(|done| extraction.last_seq <= done) {
+            if done(extraction.last_seq, extraction.ended_at) {
                 continue;
             }
             tasks.push(TaskSpan {
@@ -398,7 +403,7 @@ impl Ingest {
                 last_seq: extraction.last_seq,
                 outcome: extraction.outcome,
             });
-            if already.is_some_and(|done| extraction.first_seq <= done) {
+            if done(extraction.first_seq, extraction.started_at) {
                 continue;
             }
             report.tasks += 1;
@@ -552,7 +557,7 @@ impl Ingest {
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use trodden_store::{Cue, Injection};
+    use trodden_store::{Cue, Forget, Injection};
 
     use super::*;
 
@@ -806,6 +811,21 @@ mod tests {
             ]
         }
 
+        fn tomorrow(lines: &[Value]) -> Vec<Value> {
+            let tomorrow = Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_hours(24))
+                .expect("tomorrow is representable")
+                .strftime("%Y-%m-%d")
+                .to_string();
+            lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str(&line.to_string().replace("2026-10-01", &tomorrow))
+                        .expect("moved line is JSON")
+                })
+                .collect()
+        }
+
         fn inject(ingest: &Ingest, minute: u32) {
             let row = ingest
                 .store
@@ -936,6 +956,57 @@ mod tests {
             (resumed.sessions, resumed.tasks, resumed.created),
             (1, 1, 1)
         );
+        let titles: Vec<_> = ingest
+            .store
+            .list(None, true)
+            .expect("procedures list")
+            .into_iter()
+            .map(|row| row.procedure.title)
+            .collect();
+        assert_eq!(
+            titles,
+            ["The cart total in src/cart.js ignores the discount code"]
+        );
+    }
+
+    #[test]
+    fn live_sessions_do_not_relearn_what_was_forgotten() {
+        let scratch = Scratch::new("forget-live");
+        let mut ingest = scratch.ingest();
+        scratch.append(&Scratch::task(
+            0,
+            "Page 2 in src/paginate.js repeats the last product from page 1",
+            "src/paginate.js",
+        ));
+        scratch.append(&Scratch::task(
+            5,
+            "Checkout in src/checkout.js charges shipping twice",
+            "src/checkout.js",
+        ));
+        let learned = ingest
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
+            .expect("ingest before forgetting");
+        assert_eq!((learned.tasks, learned.created), (1, 1));
+
+        ingest
+            .store
+            .forget(Forget::All)
+            .expect("everything is forgotten");
+        scratch.append(&Scratch::tomorrow(&Scratch::task(
+            10,
+            "The cart total in src/cart.js ignores the discount code",
+            "src/cart.js",
+        )));
+        scratch.append(&Scratch::tomorrow(&Scratch::task(
+            15,
+            "The search in src/search.js drops accented names",
+            "src/search.js",
+        )));
+        let next = ingest
+            .transcript(Harness::ClaudeCode, &scratch.transcript, false)
+            .expect("ingest after forgetting");
+
+        assert_eq!((next.tasks, next.created), (1, 1));
         let titles: Vec<_> = ingest
             .store
             .list(None, true)
