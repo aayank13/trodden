@@ -590,6 +590,14 @@ mod tests {
             Session::outcome("npm run build | tee build.log", "built in 2.1s", false),
             ToolOutcome::Succeeded
         );
+        assert_eq!(
+            Session::outcome(
+                "sed -n '1,40p' src/report.rs; echo done",
+                "fn lookup(id: u32) {\nerror: unknown customer id\n}\ndone",
+                false
+            ),
+            ToolOutcome::Succeeded
+        );
     }
 
     #[test]

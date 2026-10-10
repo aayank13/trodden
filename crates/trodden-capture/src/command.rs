@@ -281,12 +281,29 @@ impl Command {
     pub fn action(&self) -> ToolAction {
         let program = self.program();
         let name = program.split_whitespace().next().unwrap_or_default();
-        if Self::READ_PROGRAMS.contains(&name) {
+        if Self::READ_PROGRAMS.contains(&name) || self.reads_stream(name) {
             ToolAction::Read
         } else if Self::SEARCH_PROGRAMS.contains(&name) || program == "git grep" {
             ToolAction::Search
         } else {
             ToolAction::Run
+        }
+    }
+
+    fn reads_stream(&self, name: &str) -> bool {
+        let argv = self.argv();
+        let arguments = argv.get(1..).unwrap_or_default();
+        match name {
+            "sed" => !arguments.iter().any(|argument| {
+                argument.starts_with("--in-place")
+                    || (argument.starts_with('-')
+                        && !argument.starts_with("--")
+                        && argument.contains('i'))
+            }),
+            "awk" | "gawk" => !arguments
+                .iter()
+                .any(|argument| argument.contains("inplace")),
+            _ => false,
         }
     }
 
@@ -794,5 +811,30 @@ mod tests {
             Command::normalize("npm test", "/w").action(),
             ToolAction::Run
         );
+        for command in [
+            "sed -n '1,40p' src/report.rs",
+            "sed -E 's/-i/x/' src/report.rs",
+            "awk 'NR<=40' src/report.rs",
+            "cd src && gawk -F, '{print $2}' totals.csv",
+        ] {
+            assert_eq!(
+                Command::normalize(command, "/w").action(),
+                ToolAction::Read,
+                "{command}"
+            );
+        }
+        for command in [
+            "sed -i 's/old/new/' src/report.rs",
+            "sed -i.bak 's/old/new/' src/report.rs",
+            "sed -Ei 's/old/new/' src/report.rs",
+            "sed --in-place=.bak 's/old/new/' src/report.rs",
+            "gawk -i inplace '{print}' totals.csv",
+        ] {
+            assert_eq!(
+                Command::normalize(command, "/w").action(),
+                ToolAction::Run,
+                "{command}"
+            );
+        }
     }
 }

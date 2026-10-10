@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::error::ANSI;
+use crate::{command::Command, error::ANSI};
 
 static FAILED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -13,25 +13,98 @@ static FAILED: LazyLock<Regex> = LazyLock::new(|| {
 
 static PASSED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:test result: ok\.|# pass [1-9]|ℹ pass [1-9]|ok\s+\S+\s+[\d.]+s|All checks passed!|Finished\b.*\btarget\(s\))|(?:^|[\s(,])[1-9]\d* passed(?:[\s,;.)]|$)",
+        r"(?m)^\s*(?:test result: ok\.|# pass [1-9]|ℹ pass [1-9]|ok\s+\S+\s+[\d.]+s|All checks passed!)|(?:^|[\s(,])[1-9]\d* passed(?:[\s,;.)]|$)",
     )
     .expect("success pattern is valid")
+});
+
+static BUILT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*Finished\b.*\btarget\(s\)").expect("build pattern is valid")
+});
+
+static CHECK_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[/_.-])(?:test|tests|check|lint|verify|typecheck|ci)(?:$|[/_.-])")
+        .expect("check word pattern is valid")
 });
 
 #[derive(Debug)]
 pub(crate) struct CheckOutput;
 
 impl CheckOutput {
+    const CHECK_PROGRAMS: &[&str] = &[
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo build",
+        "cargo nextest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "bun test",
+        "deno test",
+        "npm run",
+        "pnpm run",
+        "yarn run",
+        "bun run",
+        "go test",
+        "go vet",
+        "go build",
+        "python -m pytest",
+        "python -m unittest",
+        "python -m mypy",
+        "pytest",
+        "tox",
+        "nox",
+        "mypy",
+        "ruff",
+        "eslint",
+        "tsc",
+        "jest",
+        "vitest",
+        "mocha",
+        "rspec",
+        "mix test",
+        "dotnet test",
+        "dotnet build",
+        "swift test",
+        "phpunit",
+    ];
+
+    const BUILD_PROGRAMS: &[&str] = &["cargo build", "cargo check", "cargo clippy"];
+
+    const TASK_RUNNERS: &[&str] = &["make", "just", "rake", "mvn", "gradle"];
+
+    const SHELLS: &[&str] = &["sh", "bash", "zsh"];
+
     pub(crate) fn verdict(command: &str, output: &str) -> Option<bool> {
         if !Self::hides_exit_code(command) {
+            return None;
+        }
+        let command = Command::normalize(command, "");
+        let program = command.program();
+        if !Self::runs_check(&command, &program) {
             return None;
         }
         let output = ANSI.replace_all(output, "");
         if FAILED.is_match(&output) {
             Some(false)
         } else {
-            PASSED.is_match(&output).then_some(true)
+            let built = Self::BUILD_PROGRAMS.contains(&program.as_str()) && BUILT.is_match(&output);
+            (built || PASSED.is_match(&output)).then_some(true)
         }
+    }
+
+    fn runs_check(command: &Command, program: &str) -> bool {
+        let runner = program.split_whitespace().next().unwrap_or_default();
+        let argv = command.argv();
+        let script = if Self::SHELLS.contains(&runner) {
+            argv.get(1)
+        } else {
+            argv.first().filter(|executable| executable.contains('/'))
+        };
+        Self::CHECK_PROGRAMS.contains(&program)
+            || Self::TASK_RUNNERS.contains(&runner)
+            || script.is_some_and(|script| CHECK_WORD.is_match(script))
     }
 
     fn hides_exit_code(command: &str) -> bool {
@@ -95,8 +168,37 @@ mod tests {
     }
 
     #[test]
+    fn only_checks_are_judged_by_output() {
+        let printed = "fn lookup(id: u32) {\nerror: unknown customer id\n}\ndone";
+        for command in [
+            "sed -n '1,40p' src/report.rs; echo done",
+            "cat src/report.rs | head -40",
+            "git log --oneline | head",
+            "echo 'test result: FAILED'; true",
+            "python scripts/gen.py | tail",
+            "bash -c 'cat notes.txt' | head",
+        ] {
+            assert_eq!(CheckOutput::verdict(command, printed), None, "{command}");
+        }
+        for command in [
+            "cd api && cargo test 2>&1 | tail -20",
+            "npx jest --ci | tail",
+            "uv run pytest -q || true",
+            "make check | tail",
+            "./scripts/test.sh 2>&1 | tail",
+            "bash ci.sh; echo exit=$?",
+        ] {
+            assert_eq!(
+                CheckOutput::verdict(command, printed),
+                Some(false),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_common_runner_summaries() {
-        let piped = "check | tail";
+        let piped = "cargo test | tail";
         for output in [
             "test result: FAILED. 0 passed; 1 failed",
             "error[E0308]: mismatched types\n --> src/lib.rs:4:5",
@@ -118,10 +220,21 @@ mod tests {
             "# pass 3\n# fail 0",
             "ok  \texample.com/paging\t0.012s",
             "All checks passed!",
-            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s",
         ] {
             assert_eq!(CheckOutput::verdict(piped, output), Some(true), "{output}");
         }
+        let built = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s";
+        assert_eq!(
+            CheckOutput::verdict("cargo build 2>&1 | tail", built),
+            Some(true)
+        );
+        assert_eq!(
+            CheckOutput::verdict(
+                "cargo test 2>&1 | head -6",
+                &format!("{built}\n     Running unittests src/lib.rs\n\nrunning 2 tests")
+            ),
+            None
+        );
         assert_eq!(
             CheckOutput::verdict(piped, "line 18\nline 19\nline 20"),
             None
