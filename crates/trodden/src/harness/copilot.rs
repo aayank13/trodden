@@ -270,16 +270,22 @@ impl Copilot {
         let Some(kind) = input.kind() else {
             return Ok(None);
         };
+        let transcript = input
+            .transcript_path
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| config.and_then(|config| Self::transcript_of(config, &input.session_id)));
         let moment = match kind {
             CopilotEvent::SessionStart => Moment::SessionStart,
             CopilotEvent::Prompt => match &input.prompt {
                 Some(prompt) => Moment::Prompt(prompt.clone()),
                 None => return Ok(None),
             },
+            // Subagent tool hooks carry the agent id, which has no transcript to settle a recall.
             CopilotEvent::ToolDone | CopilotEvent::ToolFailed => {
                 match input.failure(kind, redactor) {
-                    Some(error) => Moment::CommandFailed(error),
-                    None => return Ok(None),
+                    Some(error) if transcript.is_some() => Moment::CommandFailed(error),
+                    _ => return Ok(None),
                 }
             }
             CopilotEvent::Stop => Moment::TurnEnd {
@@ -291,10 +297,6 @@ impl Copilot {
         let Some(cwd) = input.cwd.filter(|cwd| cwd.is_absolute()) else {
             return Ok(None);
         };
-        let transcript = input
-            .transcript_path
-            .filter(|path| !path.as_os_str().is_empty())
-            .or_else(|| config.and_then(|config| Self::transcript_of(config, &input.session_id)));
         Ok(Some(HookEvent {
             name: input.hook_event_name.unwrap_or_else(|| format!("{kind:?}")),
             session: input.session_id,
@@ -384,6 +386,17 @@ mod tests {
             for change in changes {
                 change.apply().expect("change applies");
             }
+        }
+
+        fn transcript(&self, session: &str) -> PathBuf {
+            let events = self
+                .dir
+                .join("session-state")
+                .join(session)
+                .join("events.jsonl");
+            fs::create_dir_all(events.parent().expect("has a parent")).expect("dir is writable");
+            fs::write(&events, "{}\n").expect("written");
+            events
         }
 
         fn event(&self, payload: Value) -> Option<HookEvent> {
@@ -482,6 +495,7 @@ mod tests {
     #[test]
     fn shell_failures_come_from_either_tool_event() {
         let scratch = Scratch::new("failures");
+        scratch.transcript(SESSION);
         let failing = "Error: Cannot find module 'left-pad'\n<exited with exit code 1>";
 
         assert_eq!(
@@ -517,15 +531,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_failures_in_a_subagent_are_ignored() {
+        let scratch = Scratch::new("subagent");
+        scratch.transcript(SESSION);
+        let failing = "Error: Cannot find module 'left-pad'\n<exited with exit code 1>";
+        let payloads = [
+            json!({"toolName": "bash", "toolArgs": {"command": "npm test"},
+                "toolResult": {"resultType": "success", "textResultForLlm": failing}}),
+            json!({"toolName": "bash", "toolArgs": {"command": "npm test"}, "error": "Command timed out: npm test"}),
+            json!({"hook_event_name": "PostToolUse", "tool_name": "bash", "tool_input": {"command": "npm test"},
+                "tool_result": {"result_type": "success", "text_result_for_llm": failing}}),
+        ];
+
+        for payload in payloads {
+            let mut subagent = payload.clone();
+            subagent
+                .as_object_mut()
+                .expect("object")
+                .insert("sessionId".to_owned(), json!("explore-0"));
+            assert!(matches!(
+                scratch.moment(payload),
+                Some(Moment::CommandFailed(_))
+            ));
+            assert_eq!(scratch.moment(subagent), None);
+        }
+    }
+
+    #[test]
     fn the_transcript_is_found_by_session_id() {
         let scratch = Scratch::new("transcript");
-        let events = scratch
-            .dir
-            .join("session-state")
-            .join(SESSION)
-            .join("events.jsonl");
-        fs::create_dir_all(events.parent().expect("has a parent")).expect("dir is writable");
-        fs::write(&events, "{}\n").expect("written");
+        let events = scratch.transcript(SESSION);
 
         let event = scratch
             .event(json!({"sessionId": SESSION, "cwd": "/home/dev/shop", "reason": "complete"}))
