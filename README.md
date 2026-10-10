@@ -8,11 +8,14 @@ passed) and gives them back to the agent the next time a similar task comes
 up.
 
 It is one Rust binary. It runs locally, makes no network calls and needs no
-account. It works with Claude Code today.
+account. It works with Claude Code, Codex, Gemini CLI, Qwen Code, GitHub
+Copilot CLI, Factory Droid, Cursor, OpenCode, Kilo Code, Kimi Code and Cline.
 
 ## How it works
 
-1. **Capture.** When a turn or session ends, Trodden reads the transcript.
+1. **Capture.** When a turn or session ends, Trodden reads the transcript
+   (for agents that do not keep one with command results, it follows the
+   session through the agent's hooks instead).
    It keeps the first line of each prompt (up to 200 characters), commands,
    file paths, touched function names and exit codes, with secrets redacted.
    From a failed tool call it keeps at most one normalized error line, used
@@ -45,22 +48,63 @@ Task: Page 2 of the product listing repeats the last product from page 1
 
 ## Install
 
-Requires Rust and Claude Code.
+Requires Rust.
 
 ```sh
 git clone https://github.com/aayank13/trodden && cd trodden
 cargo install --locked --path crates/trodden
 trodden init
-claude plugin marketplace add aayank13/trodden
-claude plugin install trodden@trodden
 ```
+
+Then connect your agents. `trodden connect <agent>` adds Trodden's hooks to
+the agent's user settings, next to any hooks you already have
+(`trodden connect` alone lists the agents and which are installed;
+`--dry-run` shows the change first; `trodden disconnect <agent>` removes it):
+
+```sh
+trodden connect claude-code
+trodden connect codex
+```
+
+Claude Code can also load the same hooks as a plugin instead
+(`claude plugin marketplace add aayank13/trodden`, then
+`claude plugin install trodden@trodden`); use one or the other.
 
 Optional:
 
 ```sh
 trodden embeddings install   # semantic matching, a one-time 32 MB download
-trodden backfill             # learn from your existing Claude Code sessions
+trodden backfill             # learn from your existing sessions
 ```
+
+## Agents
+
+| Agent | `connect` name | Recall on prompt | Recall on a failed command | Verify reminder | Learns from | Backfill |
+|---|---|---|---|---|---|---|
+| Claude Code | `claude-code` | yes | yes | yes | transcript | yes |
+| Codex | `codex` | yes | yes | yes | transcript | yes |
+| Gemini CLI | `gemini` | yes | yes | yes | transcript | yes |
+| Qwen Code | `qwen` | yes | yes | yes | transcript | yes |
+| GitHub Copilot CLI | `copilot` | yes | yes | yes | transcript | yes |
+| Factory Droid | `droid` | yes | yes | yes | transcript | yes |
+| Cursor | `cursor` | no | yes | yes | hooks | no |
+| OpenCode | `opencode` | yes | yes | no | hooks | no |
+| Kilo Code | `kilo` | yes | yes | no | hooks | no |
+| Kimi Code | `kimi` | yes | no | yes | hooks | no |
+| Cline | `cline` | yes | yes | no | hooks | no |
+
+"no" means the agent's hooks cannot do it: Cursor cannot add context to a
+prompt, Kimi Code ignores output after a failed command, and OpenCode, Kilo
+Code and Cline cannot continue a finished turn. Agents that learn from hooks
+only learn from sessions after they are connected.
+
+A few agents need one step of their own after `trodden connect`: Codex asks
+you to trust the new hooks the next time it starts, Cline needs its "Enable
+Hooks" setting turned on, and running Factory Droid, OpenCode and Kilo Code
+sessions must be restarted. `trodden connect` prints the step.
+
+Agents with MCP support but no usable hooks can still ask Trodden directly
+through `trodden mcp`.
 
 ## Commands
 
@@ -78,13 +122,15 @@ trodden backfill             # learn from your existing Claude Code sessions
 | `trodden config` | Show the current settings |
 | `trodden config holdout <0-1 or auto>` | Share of matches held out for comparison |
 | `trodden config verify-reminder <on or off>` | Ask the agent to run a recalled procedure's check when it skipped it |
+| `trodden connect [<agent>]` / `disconnect <agent>` | Install or remove an agent's hooks |
+| `trodden backfill [--agent <agent>]` | Learn from sessions already on disk |
 | `trodden doctor` | Check the installation |
 | `trodden mcp` | Read-only MCP tools for agents without prompt hooks |
 
 ## Status
 
-Pre-alpha. Formats and commands may change between versions. Support for
-Codex and other agents, and prebuilt binaries, come next.
+Pre-alpha. Formats and commands may change between versions. Prebuilt
+binaries come next.
 
 ## License
 

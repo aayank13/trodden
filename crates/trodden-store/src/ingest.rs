@@ -77,6 +77,13 @@ impl Store {
             .context("read open sessions")
     }
 
+    pub fn forget_session(&self, session: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM sessions WHERE session = ?1", [session])
+            .context("forget a session")?;
+        Ok(())
+    }
+
     pub fn end_session(&self, session: &str, at: &str) -> Result<()> {
         self.conn
             .execute(

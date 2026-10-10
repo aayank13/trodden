@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
-use trodden::{Harness, Home, Ingest, IngestReport, Workspace};
+use trodden::{Change, Harness, Home, Ingest, IngestReport, Program, Workspace};
 use trodden_core::RepoId;
 use trodden_embed::ModelPack;
 use trodden_recall::{Abstention, Decision, Envelope, Match, Outcome, Query};
@@ -102,18 +102,43 @@ enum Command {
         #[arg(long, help = "Confirm deleting everything")]
         yes: bool,
     },
-    #[command(about = "Learn from existing Claude Code transcripts")]
+    #[command(about = "Install Trodden's hooks into a coding agent, or list the agents")]
+    Connect {
+        #[arg(help = "Agent to connect; omit to list every supported agent")]
+        agent: Option<Harness>,
+        #[arg(long, help = "Show the files that would change without changing them")]
+        dry_run: bool,
+    },
+    #[command(about = "Remove Trodden's hooks from a coding agent")]
+    Disconnect {
+        #[arg(help = "Agent to disconnect")]
+        agent: Harness,
+    },
+    #[command(about = "Learn from existing agent sessions")]
     Backfill {
         #[arg(
             long,
-            help = "Claude Code's projects directory [default: ~/.claude/projects]"
+            help = "Only this agent [default: every agent with sessions on disk]"
         )]
-        projects: Option<PathBuf>,
+        agent: Option<Harness>,
+        #[arg(
+            long,
+            alias = "projects",
+            requires = "agent",
+            help = "Where the agent keeps its sessions [default: the agent's own directory]"
+        )]
+        from: Option<PathBuf>,
     },
     #[command(about = "Learn from one transcript. Hooks run this in the background")]
     Ingest {
-        #[arg(help = "Claude Code transcript (`.jsonl`)")]
+        #[arg(help = "Session transcript")]
         transcript: PathBuf,
+        #[arg(
+            long,
+            default_value = "claude-code",
+            help = "Agent that wrote the transcript"
+        )]
+        agent: Harness,
         #[arg(long, help = "The session has ended, so its last task is complete")]
         ended: bool,
         #[arg(long, help = "Print nothing")]
@@ -132,9 +157,11 @@ enum Command {
     },
     #[command(about = "Serve read-only MCP tools over stdio")]
     Mcp,
-    #[command(about = "Handle a harness hook (used by the Claude Code plugin)")]
+    #[command(
+        about = "Handle an agent hook (installed by `trodden connect` and the Claude Code plugin)"
+    )]
     Hook {
-        #[arg(help = "Harness name")]
+        #[arg(help = "Agent name")]
         harness: Harness,
     },
 }
@@ -199,7 +226,14 @@ impl Cli {
 impl Command {
     fn execute(self, out: &mut Output<impl Write>) -> Result<()> {
         let home = Home::locate()?;
-        if !matches!(self, Self::Init | Self::Doctor | Self::Hook { .. }) {
+        if !matches!(
+            self,
+            Self::Init
+                | Self::Doctor
+                | Self::Hook { .. }
+                | Self::Connect { .. }
+                | Self::Disconnect { .. }
+        ) {
             ensure!(home.is_initialized(), "run `trodden init` first");
         }
         match self {
@@ -225,17 +259,23 @@ impl Command {
             Self::Forget { id, repo, all, .. } => {
                 Self::forget(&home, out, id.as_deref(), repo, all)
             }
-            Self::Backfill { projects } => Self::backfill(&home, out, projects),
+            Self::Connect { agent, dry_run } => match agent {
+                Some(agent) => Self::connect(out, agent, dry_run),
+                None => Self::agents(out),
+            },
+            Self::Disconnect { agent } => Self::disconnect(out, agent),
+            Self::Backfill { agent, from } => Self::backfill(&home, out, agent, from),
             Self::Ingest {
                 transcript,
+                agent,
                 ended,
                 quiet,
                 background,
             } => {
                 let report = if background {
-                    Self::ingest_in_background(&home, &transcript, ended)
+                    Self::ingest_in_background(&home, agent, &transcript, ended)
                 } else {
-                    Some(Ingest::run(&home, Harness::ClaudeCode, &transcript, ended)?)
+                    Some(Ingest::run(&home, agent, &transcript, ended)?)
                 };
                 if let Some(report) = report.filter(|_| !quiet) {
                     Self::print_report(out, &report)?;
@@ -259,7 +299,7 @@ impl Command {
         if fresh {
             writeln!(
                 out,
-                "\nTrodden now learns from Claude Code sessions in this account. It stores\n\
+                "\nTrodden now learns from the sessions of the agents you connect. It stores\n\
                  the first line of each prompt (up to 200 characters), commands, file paths,\n\
                  touched function names, exit codes and one normalized line per error, with\n\
                  secrets redacted. It never stores file contents, other tool output or the\n\
@@ -268,9 +308,18 @@ impl Command {
             )?;
         }
         writeln!(out, "\nNext steps:")?;
-        writeln!(out, "  1. Install the Claude Code plugin:")?;
-        writeln!(out, "       claude plugin marketplace add aayank13/trodden")?;
-        writeln!(out, "       claude plugin install trodden@trodden")?;
+        writeln!(out, "  1. Connect your coding agents:")?;
+        let detected: Vec<Harness> = Harness::all()
+            .iter()
+            .copied()
+            .filter(|agent| agent.detected())
+            .collect();
+        for agent in &detected {
+            writeln!(out, "       trodden connect {}", agent.as_str())?;
+        }
+        if detected.is_empty() {
+            writeln!(out, "       trodden connect   (lists the supported agents)")?;
+        }
         if home.embedder().is_none() {
             writeln!(
                 out,
@@ -295,6 +344,20 @@ impl Command {
             out,
             "Capture and recall {}",
             if store.paused()? { "paused" } else { "on" }
+        )?;
+        let connected: Vec<&str> = Harness::all()
+            .iter()
+            .filter(|agent| agent.connected().unwrap_or(false))
+            .map(|agent| agent.as_str())
+            .collect();
+        writeln!(
+            out,
+            "Agents             {}",
+            if connected.is_empty() {
+                "none connected (run `trodden connect`)".to_owned()
+            } else {
+                connected.join(", ")
+            }
         )?;
         writeln!(
             out,
@@ -363,7 +426,20 @@ impl Command {
                 })
                 .into(),
         )?;
-        for program in ["trodden", "git", "claude"] {
+        for agent in Harness::all().iter().filter(|agent| agent.detected()) {
+            report(
+                &format!("agent {}", agent.as_str()),
+                match agent.connected() {
+                    Ok(true) => Finding::Healthy("connected".to_owned()),
+                    Ok(false) => Finding::Note(format!(
+                        "installed but not connected (run `trodden connect {}`)",
+                        agent.as_str()
+                    )),
+                    Err(error) => Finding::Problem(error),
+                },
+            )?;
+        }
+        for program in ["trodden", "git"] {
             report(
                 &format!("`{program}` on PATH"),
                 ExecutableSearch::from_env()
@@ -662,6 +738,11 @@ impl Command {
         if matches!(target, Forget::All) && log.exists() {
             fs::remove_file(&log).with_context(|| format!("remove {}", log.display()))?;
         }
+        let journals = home.journals();
+        if matches!(target, Forget::All) && journals.exists() {
+            fs::remove_dir_all(&journals)
+                .with_context(|| format!("remove {}", journals.display()))?;
+        }
         ingest.rebuild_index()?;
         writeln!(out, "Deleted {deleted} revision(s).")?;
         Ok(())
@@ -688,14 +769,37 @@ impl Command {
     fn backfill(
         home: &Home,
         out: &mut Output<impl Write>,
-        projects: Option<PathBuf>,
+        agent: Option<Harness>,
+        from: Option<PathBuf>,
     ) -> Result<()> {
-        let harness = Harness::ClaudeCode;
-        let history = match projects {
-            Some(projects) => projects,
-            None => harness.history_dir()?,
-        };
-        let (report, failures) = Ingest::start(home)?.backfill(harness, &history)?;
+        let mut sources = Vec::new();
+        match (agent, from) {
+            (Some(agent), Some(from)) => sources.push((agent, from)),
+            (Some(agent), None) => match agent.history_dir()? {
+                Some(history) => sources.push((agent, history)),
+                None => bail!(
+                    "{} keeps no sessions Trodden can read; it learns from them as they happen",
+                    agent.title()
+                ),
+            },
+            (None, _) => {
+                for agent in Harness::all() {
+                    if let Some(history) = agent.history_dir()?.filter(|dir| dir.exists()) {
+                        sources.push((*agent, history));
+                    }
+                }
+            }
+        }
+        let mut ingest = Ingest::start(home)?;
+        let mut report = IngestReport::default();
+        let mut failures = Vec::new();
+        for (agent, history) in sources {
+            let (one, failed) = ingest.backfill(agent, &history).with_context(|| {
+                format!("backfill {} from {}", agent.title(), history.display())
+            })?;
+            report.absorb(one);
+            failures.extend(failed);
+        }
         Self::print_report(out, &report)?;
         let mut err = Output::stderr();
         for (transcript, error) in &failures {
@@ -704,8 +808,76 @@ impl Command {
         Ok(())
     }
 
-    fn ingest_in_background(home: &Home, transcript: &Path, ended: bool) -> Option<IngestReport> {
-        Ingest::run_or_defer(home, Harness::ClaudeCode, transcript, ended)
+    fn agents(out: &mut Output<impl Write>) -> Result<()> {
+        writeln!(
+            out,
+            "{:<12} {:<20} {:<10} CONNECTED",
+            "AGENT", "NAME", "INSTALLED"
+        )?;
+        for agent in Harness::all() {
+            let connected = match agent.connected() {
+                Ok(true) => "yes".to_owned(),
+                Ok(false) => "no".to_owned(),
+                Err(error) => format!("unknown ({error:#})"),
+            };
+            writeln!(
+                out,
+                "{:<12} {:<20} {:<10} {connected}",
+                agent.as_str(),
+                agent.title(),
+                if agent.detected() { "yes" } else { "no" },
+            )?;
+        }
+        writeln!(out, "\nRun `trodden connect <agent>` to install the hooks.")?;
+        Ok(())
+    }
+
+    fn connect(out: &mut Output<impl Write>, agent: Harness, dry_run: bool) -> Result<()> {
+        let changes = agent.connect(&Program::current()?)?;
+        Self::apply(out, &changes, dry_run)?;
+        if !dry_run {
+            writeln!(out, "Connected {}.", agent.title())?;
+            if let Some(notice) = agent.notice() {
+                writeln!(out, "{notice}")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn disconnect(out: &mut Output<impl Write>, agent: Harness) -> Result<()> {
+        let changes = agent.disconnect()?;
+        Self::apply(out, &changes, false)?;
+        writeln!(out, "Disconnected {}.", agent.title())?;
+        Ok(())
+    }
+
+    fn apply(out: &mut Output<impl Write>, changes: &[Change], dry_run: bool) -> Result<()> {
+        for change in changes.iter().filter(|change| change.is_needed()) {
+            let verb = if change.contents.is_some() {
+                "write"
+            } else {
+                "remove"
+            };
+            if dry_run {
+                writeln!(out, "would {verb} {}", change.path.display())?;
+                if let Some(contents) = &change.contents {
+                    writeln!(out, "{contents}")?;
+                }
+            } else {
+                change.apply()?;
+                writeln!(out, "{verb} {}", change.path.display())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ingest_in_background(
+        home: &Home,
+        agent: Harness,
+        transcript: &Path,
+        ended: bool,
+    ) -> Option<IngestReport> {
+        Ingest::run_or_defer(home, agent, transcript, ended)
             .with_context(|| format!("ingest {}", transcript.display()))
             .unwrap_or_else(|error| {
                 home.log_error(error);
@@ -925,6 +1097,10 @@ mod tests {
             "2026-10-01T10:00:00Z parse the hook payload\n",
         )
         .expect("error log is writable");
+        let journal = home.journal("cursor", "conv-1");
+        fs::create_dir_all(journal.parent().expect("journals have a directory"))
+            .expect("journal directory is writable");
+        fs::write(&journal, "{}\n").expect("journal is writable");
         home.open_store(Patience::Batch)
             .expect("store opens")
             .remember_repo("/home/dev/shop", "path-5f0c1d2e3a4b6978")
@@ -939,6 +1115,7 @@ mod tests {
             "Deleted 0 revision(s).\n"
         );
         assert!(!home.error_log().exists());
+        assert!(!home.journals().exists());
         assert_eq!(
             home.open_store(Patience::Batch)
                 .expect("store opens")
@@ -1000,7 +1177,7 @@ mod tests {
         fs::write(home.pending_ingests(), "").expect("queue path is writable");
         let transcript = home.dir().join("session.jsonl");
 
-        let report = Command::ingest_in_background(home, &transcript, true);
+        let report = Command::ingest_in_background(home, Harness::ClaudeCode, &transcript, true);
 
         assert_eq!(report, None);
         let log = fs::read_to_string(home.error_log()).expect("error log reads");

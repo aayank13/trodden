@@ -400,6 +400,15 @@ impl Redactor {
 
     #[must_use]
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let text = self.redact_secrets(text);
+        match &self.home {
+            Some(home) if text.contains(home.as_str()) => Cow::Owned(Self::fold_home(&text, home)),
+            _ => text,
+        }
+    }
+
+    #[must_use]
+    pub fn redact_secrets<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let mut text = Cow::Borrowed(text);
         for rule in &self.rules {
             if let Cow::Owned(replaced) = rule.regex.replace_all(&text, |caps: &Captures<'_>| {
@@ -418,22 +427,11 @@ impl Redactor {
         {
             text = Cow::Owned(replaced);
         }
-        match &self.home {
-            Some(home) if text.contains(home.as_str()) => Cow::Owned(Self::fold_home(&text, home)),
-            _ => text,
-        }
+        text
     }
 
     pub fn contains_secret(&self, text: &str) -> bool {
-        self.redact_secrets_only(text) != text
-    }
-
-    fn redact_secrets_only(&self, text: &str) -> String {
-        let without_home = Self {
-            home: None,
-            ..self.clone()
-        };
-        without_home.redact(text).into_owned()
+        self.redact_secrets(text) != text
     }
 
     fn replace_secret(rule: &str, caps: &Captures<'_>) -> String {

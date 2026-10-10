@@ -45,6 +45,7 @@ pub struct InjectionRecord {
     pub injection: Injection,
     pub task: Option<u32>,
     pub outcome: Option<String>,
+    pub reminded: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,7 +118,8 @@ impl Store {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT rowid, session, procedure, revision, holdout, cue, at, task, outcome
+                "SELECT rowid, session, procedure, revision, holdout, cue, at, task, outcome,
+                        reminded_at IS NOT NULL
                  FROM injections WHERE ?1 IS NULL OR session = ?1 ORDER BY rowid",
             )
             .context("prepare the injection listing")?;
@@ -133,11 +135,12 @@ impl Store {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<u32>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
                 ))
             })
             .context("list injections")?;
         rows.map(|row| {
-            let (rowid, session, procedure, revision, holdout, cue, at, task, outcome) =
+            let (rowid, session, procedure, revision, holdout, cue, at, task, outcome, reminded) =
                 row.context("read an injection")?;
             Ok(InjectionRecord {
                 rowid,
@@ -151,9 +154,20 @@ impl Store {
                 },
                 task,
                 outcome,
+                reminded,
             })
         })
         .collect()
+    }
+
+    pub fn mark_reminded(&self, rowid: i64, at: Timestamp) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE injections SET reminded_at = ?2 WHERE rowid = ?1",
+                params![rowid, at.to_string()],
+            )
+            .context("record the verify reminder")?;
+        Ok(())
     }
 
     pub fn settle_injection(
@@ -513,6 +527,36 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reminder_is_remembered_per_injection() {
+        let store = Store::open_in_memory().expect("store opens");
+        for session in ["s", "s", "t"] {
+            store
+                .record_injection(&Injection {
+                    session: session.to_owned(),
+                    procedure: "p_7f3a91c2".to_owned(),
+                    revision: 1,
+                    holdout: false,
+                    cue: Cue::Prompt,
+                    at: Timestamp::UNIX_EPOCH,
+                })
+                .expect("recorded");
+        }
+        let first = store.injections(Some("s")).expect("injections read")[0].rowid;
+
+        store
+            .mark_reminded(first, Timestamp::UNIX_EPOCH)
+            .expect("reminder recorded");
+
+        let reminded: Vec<bool> = store
+            .injections(None)
+            .expect("injections read")
+            .iter()
+            .map(|record| record.reminded)
+            .collect();
+        assert_eq!(reminded, [true, false, false]);
+    }
 
     #[test]
     fn a_failed_settlement_leaves_the_injection_for_the_next_run() {

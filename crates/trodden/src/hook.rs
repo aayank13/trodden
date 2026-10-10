@@ -2,8 +2,10 @@ use std::{
     env,
     ffi::OsStr,
     fmt::Display,
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
     panic::{self, PanicHookInfo},
+    path::Path,
     process::{self, Command, ExitCode, Stdio},
     thread,
     time::{Duration, Instant},
@@ -11,9 +13,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
-use serde_json::json;
-use trodden::{Harness, Home, Workspace};
-use trodden_capture::{ErrorSignature, claude_code::HookInput};
+use trodden::{Harness, Home, HookEvent, Moment, Reply, Workspace};
+use trodden_capture::{ErrorSignature, Reminder, journal::Observation};
 use trodden_core::{
     Procedure,
     trace::{Event, EventKind, ToolAction, ToolOutcome},
@@ -48,15 +49,9 @@ impl Hook {
     }
 
     fn handle(harness: Option<&OsStr>, out: &mut Output<impl Write>) -> Result<()> {
-        let Some(known) = harness.and_then(OsStr::to_str).and_then(Harness::from_name) else {
+        let Some(harness) = harness.and_then(OsStr::to_str).and_then(Harness::from_name) else {
             bail!("unsupported harness {harness:?}");
         };
-        match known {
-            Harness::ClaudeCode => Self::claude_code(out),
-        }
-    }
-
-    fn claude_code(out: &mut Output<impl Write>) -> Result<()> {
         let home = Home::locate()?;
         if !home.is_initialized() {
             return Ok(());
@@ -66,91 +61,123 @@ impl Hook {
             .take(MAX_INPUT_BYTES)
             .read_to_string(&mut raw)
             .context("read the hook payload")?;
-        let input: HookInput = serde_json::from_str(&raw).context("parse the hook payload")?;
+        let Some(mut event) = harness.event(&raw, &Redactor::new())? else {
+            return Ok(());
+        };
+        if harness.journaled() {
+            let journal = home.journal(harness.as_str(), &event.session);
+            Self::journal(&home, &journal, &event.observed)?;
+            event.transcript = Some(journal);
+        }
+        Self::respond(harness, &home, &event, out)
+    }
 
-        match input.hook_event_name.as_str() {
-            "UserPromptSubmit" => Self::recall(&home, &input, out),
-            "SessionStart" => {
+    fn respond(
+        harness: Harness,
+        home: &Home,
+        event: &HookEvent,
+        out: &mut Output<impl Write>,
+    ) -> Result<()> {
+        match &event.moment {
+            Moment::SessionStart => {
                 let store = home.open_store(Patience::Interactive)?;
-                Workspace::resolve_cached(&input.cwd, &store).map(drop)
+                Workspace::resolve_cached(&event.cwd, &store).map(drop)
             }
-            "PostToolUseFailure" => Self::recall_error(&home, &input, out),
-            "Stop" => {
-                Self::spawn_ingest(&input, false)?;
-                Self::remind_to_verify(Harness::ClaudeCode, &home, &input, out)
+            Moment::Prompt(prompt) => Self::recall(harness, home, event, prompt, out),
+            Moment::CommandFailed(error) => Self::recall_error(harness, home, event, error, out),
+            Moment::ToolDone => Ok(()),
+            Moment::TurnEnd { continued } => {
+                Self::spawn_ingest(harness, event, false)?;
+                if *continued {
+                    return Ok(());
+                }
+                Self::remind_to_verify(harness, home, event, out)
             }
-            "PreCompact" => Self::spawn_ingest(&input, false),
-            "SessionEnd" => Self::spawn_ingest(&input, true),
-            _ => Ok(()),
+            Moment::Compacting => Self::spawn_ingest(harness, event, false),
+            Moment::SessionEnd => Self::spawn_ingest(harness, event, true),
         }
     }
 
-    fn recall(home: &Home, input: &HookInput, out: &mut Output<impl Write>) -> Result<()> {
-        let Some(prompt) = input.prompt.as_deref() else {
+    fn journal(home: &Home, journal: &Path, observed: &[Observation]) -> Result<()> {
+        if observed.is_empty() || home.open_store(Patience::Interactive)?.paused()? {
             return Ok(());
-        };
+        }
+        let mut lines = String::new();
+        for observation in observed {
+            lines.push_str(&observation.to_line()?);
+        }
+        if let Some(dir) = journal.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal)
+            .and_then(|mut file| file.write_all(lines.as_bytes()))
+            .with_context(|| format!("append to {}", journal.display()))
+    }
+
+    fn recall(
+        harness: Harness,
+        home: &Home,
+        event: &HookEvent,
+        prompt: &str,
+        out: &mut Output<impl Write>,
+    ) -> Result<()> {
         let store = home.open_store(Patience::Interactive)?;
         if store.paused()? {
             return Ok(());
         }
-        let Some(workspace) = Workspace::resolve_cached(&input.cwd, &store)? else {
+        let Some(workspace) = Workspace::resolve_cached(&event.cwd, &store)? else {
             return Ok(());
         };
         let outcome = home.recall(&store).recall(&Query {
             prompt,
             repo: workspace.repo.as_str(),
             root: &workspace.root,
-            session: Some(&input.session_id),
+            session: Some(&event.session),
         })?;
         if let Some(error) = &outcome.semantic_error {
             Self::log(format_args!("recalled without semantic matching: {error}"));
         }
-        Self::serve(&store, input, outcome, Cue::Prompt, out, |envelope| {
-            envelope.to_owned()
-        })
+        Self::serve(harness, &store, event, outcome, Cue::Prompt, out)
     }
 
-    fn recall_error(home: &Home, input: &HookInput, out: &mut Output<impl Write>) -> Result<()> {
-        let signature = match (&input.tool_name, &input.error) {
-            (Some(tool), Some(error)) if tool == "Bash" && !input.is_interrupt => {
-                ErrorSignature::of(error, &Redactor::new())
-            }
-            _ => None,
-        };
-        let Some(signature) = signature else {
+    fn recall_error(
+        harness: Harness,
+        home: &Home,
+        event: &HookEvent,
+        error: &str,
+        out: &mut Output<impl Write>,
+    ) -> Result<()> {
+        let Some(signature) = ErrorSignature::of(error, &Redactor::new()) else {
             return Ok(());
         };
         let store = home.open_store(Patience::Interactive)?;
         if store.paused()? {
             return Ok(());
         }
-        let Some(workspace) = Workspace::resolve_cached(&input.cwd, &store)? else {
+        let Some(workspace) = Workspace::resolve_cached(&event.cwd, &store)? else {
             return Ok(());
         };
         let outcome = Recall::new(&store, None).recall_error(&ErrorQuery {
             signature: &signature,
             repo: workspace.repo.as_str(),
             root: &workspace.root,
-            session: Some(&input.session_id),
+            session: Some(&event.session),
         })?;
-        Self::serve(&store, input, outcome, Cue::Failure, out, |envelope| {
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUseFailure",
-                    "additionalContext": envelope,
-                }
-            })
-            .to_string()
-        })
+        Self::serve(harness, &store, event, outcome, Cue::Failure, out)
     }
 
+    // Nothing is recorded when the agent cannot show it: an unseen holdout would skew the
+    // comparison.
     fn serve(
+        harness: Harness,
         store: &Store,
-        input: &HookInput,
+        event: &HookEvent,
         outcome: Outcome,
         cue: Cue,
         out: &mut Output<impl Write>,
-        format: impl Fn(&str) -> String,
     ) -> Result<()> {
         let (chosen, holdout): (Box<Match>, bool) = match outcome.decision {
             Decision::Inject(chosen) => (chosen, false),
@@ -158,8 +185,12 @@ impl Hook {
             Decision::Abstain(_) => return Ok(()),
         };
         let procedure = &chosen.row.procedure;
+        let envelope = Envelope::render(procedure);
+        let Some(rendered) = harness.render(event, Reply::Recall(&envelope)) else {
+            return Ok(());
+        };
         let injection = Injection {
-            session: input.session_id.clone(),
+            session: event.session.clone(),
             procedure: procedure.id.to_string(),
             revision: procedure.revision,
             holdout,
@@ -171,8 +202,7 @@ impl Hook {
         })
         .context("record the injection before showing the procedure")?;
         if !holdout {
-            writeln!(out, "{}", format(&Envelope::render(procedure)))
-                .context("print the recalled procedure")?;
+            writeln!(out, "{rendered}").context("print the recalled procedure")?;
             out.flush().context("flush the recalled procedure")?;
         }
         Ok(())
@@ -194,12 +224,16 @@ impl Hook {
         }
     }
 
+    // Gemini CLI and Qwen Code write the prompt after its hook ran, so it can be stamped after
+    // its injection.
+    const PROMPT_LAG: jiff::SignedDuration = jiff::SignedDuration::from_secs(10);
+
     fn edited_since_check(events: &[Event], injected: Timestamp, check: &str) -> bool {
         let turn = match events
             .iter()
             .rposition(|event| matches!(event.kind, EventKind::Prompt { .. }))
         {
-            Some(start) if events[start].at > injected => return false,
+            Some(start) if events[start].at > injected + Self::PROMPT_LAG => return false,
             Some(start) => &events[start..],
             None => events,
         };
@@ -223,32 +257,31 @@ impl Hook {
         edited_since_check
     }
 
+    // At most one reminder per injection: several agents never say a turn already continued.
     fn remind_to_verify(
         harness: Harness,
         home: &Home,
-        input: &HookInput,
+        event: &HookEvent,
         out: &mut Output<impl Write>,
     ) -> Result<()> {
-        if input.stop_hook_active {
-            return Ok(());
-        }
-        let (Some(transcript), store) = (
-            &input.transcript_path,
-            home.open_store(Patience::Interactive)?,
-        ) else {
+        let Some(transcript) = &event.transcript else {
             return Ok(());
         };
+        let store = home.open_store(Patience::Interactive)?;
         if !store.verify_reminder()? || store.paused()? {
             return Ok(());
         }
         let Some(injected) = store
-            .injections(Some(&input.session_id))?
+            .injections(Some(&event.session))?
             .into_iter()
             .rev()
             .find(|record| !record.injection.holdout)
         else {
             return Ok(());
         };
+        if injected.reminded {
+            return Ok(());
+        }
         let Some(procedure) = store
             .revisions(&injected.injection.procedure)?
             .into_iter()
@@ -270,14 +303,16 @@ impl Hook {
         let (trace, _) = harness
             .parse(&text, &Redactor::new())
             .with_context(|| format!("parse {}", transcript.display()))?;
-        let edited_since_check =
-            Self::edited_since_check(&trace.events, injected.injection.at, check);
-        if edited_since_check {
-            let reason = Self::reminder(&procedure, check);
-            writeln!(out, "{}", json!({ "decision": "block", "reason": reason }))
-                .context("print the verify reminder")?;
-            out.flush().context("flush the verify reminder")?;
+        if !Self::edited_since_check(&trace.events, injected.injection.at, check) {
+            return Ok(());
         }
+        let reason = Self::reminder(&procedure, check);
+        let Some(rendered) = harness.render(event, Reply::Remind(&reason)) else {
+            return Ok(());
+        };
+        store.mark_reminded(injected.rowid, Timestamp::now())?;
+        writeln!(out, "{rendered}").context("print the verify reminder")?;
+        out.flush().context("flush the verify reminder")?;
         Ok(())
     }
 
@@ -306,20 +341,23 @@ impl Hook {
             format!(" ({}; fill in what fits this change)", slots.join("; "))
         };
         format!(
-            "Trodden: the procedure recalled for this task is checked with `{check}`{fill}, \
-             which has not run since your last change. Run it once before finishing."
+            "{} for this task is checked with `{check}`{fill}, \
+             which has not run since your last change. Run it once before finishing.",
+            Reminder::PREFIX
         )
     }
 
-    fn spawn_ingest(input: &HookInput, ended: bool) -> Result<()> {
-        let Some(transcript) = &input.transcript_path else {
+    fn spawn_ingest(harness: Harness, event: &HookEvent, ended: bool) -> Result<()> {
+        let Some(transcript) = &event.transcript else {
             return Ok(());
         };
         let mut command = Command::new(env::current_exe().context("find the trodden executable")?);
-        command
-            .arg("ingest")
-            .arg(transcript)
-            .args(["--quiet", "--background"]);
+        command.arg("ingest").arg(transcript).args([
+            "--agent",
+            harness.as_str(),
+            "--quiet",
+            "--background",
+        ]);
         if ended {
             command.arg("--ended");
         }
@@ -347,7 +385,7 @@ impl Hook {
 mod tests {
     use std::{cell::Cell, fs, path::PathBuf};
 
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use trodden_capture::claude_code::Transcript;
     use trodden_core::procedure::{Slot, SlotKind};
     use trodden_recall::Signals;
@@ -384,10 +422,14 @@ mod tests {
         }
 
         fn serve(&self, decision: fn(Box<Match>) -> Decision) -> (Result<()>, String) {
-            let input: HookInput = serde_json::from_value(json!({
-                "session_id": "s", "cwd": CWD, "hook_event_name": "UserPromptSubmit",
-            }))
-            .expect("valid hook payload");
+            let event = HookEvent {
+                name: "UserPromptSubmit".to_owned(),
+                session: "s".to_owned(),
+                cwd: PathBuf::from(CWD),
+                transcript: None,
+                moment: Moment::Prompt("Fix the paging bug".to_owned()),
+                observed: Vec::new(),
+            };
             let chosen = Box::new(Match {
                 row: ProcedureRow {
                     rowid: 1,
@@ -402,12 +444,12 @@ mod tests {
             };
             let mut printed = Vec::new();
             let result = Hook::serve(
+                Harness::ClaudeCode,
                 &self.store,
-                &input,
+                &event,
                 outcome,
                 Cue::Prompt,
                 &mut Output::new(&mut printed),
-                str::to_owned,
             );
             (
                 result,
@@ -468,16 +510,19 @@ mod tests {
         fn remind(&self, transcript: &[u8]) -> String {
             let path = self.home.dir().join("transcript.jsonl");
             fs::write(&path, transcript).expect("transcript is writable");
-            let input: HookInput = serde_json::from_value(json!({
-                "session_id": "s", "cwd": CWD, "hook_event_name": "Stop",
-                "transcript_path": path,
-            }))
-            .expect("valid hook payload");
+            let event = HookEvent {
+                name: "Stop".to_owned(),
+                session: "s".to_owned(),
+                cwd: PathBuf::from(CWD),
+                transcript: Some(path),
+                moment: Moment::TurnEnd { continued: false },
+                observed: Vec::new(),
+            };
             let mut printed = Vec::new();
             Hook::remind_to_verify(
                 Harness::ClaudeCode,
                 &self.home,
-                &input,
+                &event,
                 &mut Output::new(&mut printed),
             )
             .expect("reminder runs");
@@ -674,7 +719,9 @@ mod tests {
         transcript.extend(b"{\"type\":\"user\",\"sessionId\":\"s\",\"note\":\"caf\xe9\"}\n");
 
         let printed = reminding.remind(&transcript);
+        let again = reminding.remind(&transcript);
 
+        assert_eq!(again, "", "an injection is reminded once");
         let reminder: Value = serde_json::from_str(&printed).expect("reminder is JSON");
         assert_eq!(reminder["decision"], "block");
         assert!(
@@ -721,6 +768,18 @@ mod tests {
         assert!(edited.needs_check("2026-09-21T14:05:00.120Z"));
         assert!(edited.needs_check("2026-09-21T14:05:00.000Z"));
         assert!(!checked.needs_check("2026-09-21T14:05:00.120Z"));
+    }
+
+    #[test]
+    fn a_prompt_recorded_after_its_injection_still_starts_its_turn() {
+        let session = Session::default()
+            .prompt(
+                "2026-09-21T14:00:01.500Z",
+                "Fix the paging bug in src/paginate.js",
+            )
+            .edit("2026-09-21T14:00:05.000Z", "src/paginate.js");
+
+        assert!(session.needs_check("2026-09-21T14:00:00.120Z"));
     }
 
     #[test]
