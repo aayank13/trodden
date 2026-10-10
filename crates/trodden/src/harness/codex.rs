@@ -201,12 +201,14 @@ impl Agent for Codex {
     fn event(&self, payload: &str, redactor: &Redactor) -> Result<Option<HookEvent>> {
         let input: CodexHookInput =
             serde_json::from_str(payload).context("parse the hook payload")?;
-        let subagent = input.agent_id.is_some();
+        if input.agent_id.is_some() {
+            return Ok(None);
+        }
         let moment = match input.hook_event_name.as_str() {
             "SessionStart" => Moment::SessionStart,
             "UserPromptSubmit" => match &input.prompt {
-                Some(prompt) if !subagent => Moment::Prompt(prompt.clone()),
-                _ => return Ok(None),
+                Some(prompt) => Moment::Prompt(prompt.clone()),
+                None => return Ok(None),
             },
             "PostToolUse" => match input.failure(redactor) {
                 Some(output) => Moment::CommandFailed(output),
@@ -393,13 +395,33 @@ mod tests {
     }
 
     #[test]
-    fn subagent_prompts_and_odd_payloads_are_ignored() {
-        assert_eq!(
-            Payload::moment(
-                json!({"hook_event_name": "UserPromptSubmit", "prompt": "Review the diff", "agent_id": "a1", "agent_type": "reviewer"})
-            ),
-            None
-        );
+    fn subagent_events_are_left_to_the_parent_session() {
+        let failing =
+            "error[E0425]: cannot find value `total` in this scope\n --> src/lib.rs:3:5\n";
+        let subagent = json!({"session_id": "019f0c00-0000-7000-8000-00000000c41d",
+            "agent_id": "019f0c00-0000-7000-8000-00000000c41d", "agent_type": "worker"});
+        let events = [
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Review the diff"}),
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"}, "tool_response": failing}),
+            json!({"hook_event_name": "Stop", "stop_hook_active": false}),
+            json!({"hook_event_name": "PreCompact", "trigger": "auto"}),
+            json!({"hook_event_name": "SessionStart", "source": "startup"}),
+            json!({"hook_event_name": "SessionEnd", "reason": "other"}),
+        ];
+
+        for mut event in events {
+            assert!(Payload::moment(event.clone()).is_some(), "{event}");
+            event
+                .as_object_mut()
+                .expect("object")
+                .extend(subagent.as_object().expect("object").clone());
+            assert_eq!(Payload::moment(event.clone()), None, "{event}");
+        }
+    }
+
+    #[test]
+    fn odd_payloads_are_ignored() {
         assert_eq!(
             Payload::moment(json!({"hook_event_name": "Stop", "cwd": "shop"})),
             None
