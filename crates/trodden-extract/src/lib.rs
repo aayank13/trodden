@@ -170,7 +170,9 @@ impl<'a> Call<'a> {
     }
 
     fn hides_status(&self) -> bool {
-        self.succeeded() && self.command().is_some_and(Verification::hides_status)
+        self.succeeded()
+            && !self.call.confirmed_by_output
+            && self.command().is_some_and(Verification::hides_status)
     }
 
     fn is_edit(&self) -> bool {
@@ -971,6 +973,7 @@ mod tests {
                 changes: Vec::new(),
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -992,6 +995,7 @@ mod tests {
                 }],
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -1007,6 +1011,7 @@ mod tests {
                 changes: Vec::new(),
                 duration_ms: None,
                 error: None,
+                confirmed_by_output: false,
             }))
         }
 
@@ -1018,6 +1023,18 @@ mod tests {
             }) = self.0.events.last_mut()
             {
                 call.changes[0].created = true;
+            }
+            self
+        }
+
+        fn confirmed(mut self, command: &str, exit_code: i32) -> Self {
+            self = self.run(command, exit_code);
+            if let Some(Event {
+                kind: EventKind::ToolCall(call),
+                ..
+            }) = self.0.events.last_mut()
+            {
+                call.confirmed_by_output = true;
             }
             self
         }
@@ -1288,6 +1305,34 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn a_hidden_status_confirmed_by_output_counts() {
+        let edited = || {
+            Sketch::new()
+                .prompt("Fix the pagination bug in the catalog")
+                .edit("src/paginate.js", &[])
+        };
+
+        let procedure = edited()
+            .run("npm test", 1)
+            .confirmed("npm test 2>&1 | tail -20", 0)
+            .extract_one()
+            .expect("the output showed the check passing");
+        assert_eq!(
+            procedure.verify.map(|verify| verify.command).as_deref(),
+            Some("npm test")
+        );
+        assert_eq!(
+            edited()
+                .run("npm test", 0)
+                .confirmed("npm test 2>&1 | tail -20", 1)
+                .extract_one(),
+            Err(Rejection::VerificationFailed {
+                command: "npm test".to_owned()
+            })
+        );
     }
 
     #[test]

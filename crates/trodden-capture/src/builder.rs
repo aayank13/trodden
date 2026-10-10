@@ -250,6 +250,7 @@ impl<'a> TraceBuilder<'a> {
             changes: Vec::new(),
             duration_ms: None,
             error: None,
+            confirmed_by_output: false,
         }));
         if let Some(id) = id {
             self.pending.insert(id.to_owned(), index);
@@ -298,6 +299,7 @@ impl<'a> TraceBuilder<'a> {
             (Finish::Succeeded, Some(false)) => ToolOutcome::Failed { exit_code: None },
             (Finish::Succeeded, _) => ToolOutcome::Succeeded,
         };
+        call.confirmed_by_output = verdict.is_some() && call.outcome != ToolOutcome::Interrupted;
         if matches!(call.outcome, ToolOutcome::Failed { .. }) {
             call.error = ErrorSignature::of(output, redactor);
         }
