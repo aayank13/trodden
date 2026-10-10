@@ -114,6 +114,16 @@ impl Signals {
         }
     }
 
+    fn is_anchored(&self) -> bool {
+        self.exact
+            .iter()
+            .any(|(_, kind)| matches!(kind.as_str(), "path" | "error"))
+    }
+
+    fn fits_the_task(&self) -> bool {
+        self.same_kind != Some(false) && self.same_object != Some(false)
+    }
+
     fn ranked_cosine(&self) -> f32 {
         self.semantic.map_or(0.0, |(_, cosine)| cosine)
     }
@@ -122,9 +132,13 @@ impl Signals {
         let cosine = self.ranked_cosine();
         let top_lexical = self.lexical.is_some_and(|(rank, _)| rank == 0);
         if state == Lifecycle::Stale {
-            return self.exact_weight() >= 2.0 && top_lexical && cosine >= Gate::STALE_COSINE;
+            let confirmed = match self.cosine {
+                Some(_) => cosine >= Gate::STALE_COSINE,
+                None => self.is_anchored() && self.fits_the_task(),
+            };
+            return self.exact_weight() >= 2.0 && top_lexical && confirmed;
         }
-        if self.same_kind == Some(false) || self.same_object == Some(false) {
+        if !self.fits_the_task() {
             return cosine >= Gate::STRONG_COSINE;
         }
         let on_topic = self
@@ -1042,6 +1056,110 @@ mod tests {
             .expect("decision succeeds");
 
         assert_eq!(decision, Decision::Abstain(Abstention::NoCandidates));
+    }
+
+    #[derive(Debug)]
+    struct Aged;
+
+    impl Aged {
+        fn store(state: Lifecycle) -> Store {
+            let mut store = StaleIndex::indexed().store;
+            store
+                .upsert(&Fixture::unrelated(0))
+                .expect("procedure stores");
+            store
+                .set_states("p_7f3a91c2", &[(1, state)])
+                .expect("state changes");
+            store
+        }
+
+        fn decisions(prompt: &str) -> (Decision, Decision) {
+            (
+                Fixture::outcome(&Self::store(Lifecycle::Active), prompt).decision,
+                Fixture::outcome(&Self::store(Lifecycle::Stale), prompt).decision,
+            )
+        }
+
+        fn signals(cosine: f32) -> Signals {
+            Signals {
+                exact: vec![("src/paginate.js".to_owned(), "path".to_owned())],
+                lexical: Some((0, 1.0)),
+                semantic: Some((0, cosine)),
+                cosine: Some(cosine),
+                ..Signals::default()
+            }
+        }
+    }
+
+    #[test]
+    fn recalls_a_stale_procedure_on_an_exact_path_without_embeddings() {
+        let (active, stale) = Aged::decisions(PROMPT);
+
+        assert!(matches!(active, Decision::Inject(_)), "{active:?}");
+        let Decision::Inject(chosen) = stale else {
+            panic!("expected an injection, got {stale:?}");
+        };
+        assert_eq!(chosen.row.procedure.state, Lifecycle::Stale);
+        assert_eq!(chosen.signals.cosine, None);
+    }
+
+    #[test]
+    fn needs_more_than_an_active_procedure_to_recall_a_stale_one_without_embeddings() {
+        let unanchored = "Run npm test after you fix paginate so page 2 stops repeating.";
+        let (active, stale) = Aged::decisions(unanchored);
+        assert!(matches!(active, Decision::Inject(_)), "{active:?}");
+        assert_eq!(stale, Decision::Abstain(Abstention::NotConfident));
+
+        for prompt in [
+            "Add a page size option to src/paginate.js.",
+            "Rotate the staging credentials of service 0.",
+            "Why does the checkout total round down?",
+        ] {
+            let (_, stale) = Aged::decisions(prompt);
+            assert!(!matches!(stale, Decision::Inject(_)), "{prompt}: {stale:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_cosine_threshold_for_stale_procedures_with_embeddings() {
+        for (cosine, confident) in [(0.5, false), (0.59, false), (0.6, true), (0.9, true)] {
+            let signals = Aged::signals(cosine);
+
+            assert!(signals.is_confident(Lifecycle::Active), "{cosine}");
+            assert_eq!(
+                signals.is_confident(Lifecycle::Stale),
+                confident,
+                "{cosine}"
+            );
+        }
+        let mut unranked = Aged::signals(0.9);
+        unranked.semantic = None;
+        assert!(!unranked.is_confident(Lifecycle::Stale));
+    }
+
+    #[test]
+    fn abstains_on_a_stale_procedure_with_embeddings_when_the_prompt_is_far() {
+        let mut stale = StaleIndex::indexed();
+        stale
+            .store
+            .set_states("p_7f3a91c2", &[(1, Lifecycle::Stale)])
+            .expect("state changes");
+        let vectors = [(stale.rowid, Fixture::direction(&[(1, 1.0)]))];
+
+        let outcome = Recall::new(&stale.store, Some(Fixture::semantic("stale-far", &vectors)))
+            .seeded(7)
+            .recall(&Query {
+                prompt: CRASH_PROMPT,
+                repo: REPO,
+                root: Path::new("."),
+                session: None,
+            })
+            .expect("recall succeeds");
+
+        assert_eq!(
+            outcome.decision,
+            Decision::Abstain(Abstention::NotConfident)
+        );
     }
 
     #[test]
