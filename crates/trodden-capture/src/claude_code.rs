@@ -1,52 +1,26 @@
-use std::{collections::HashMap, path::PathBuf};
-
-use anyhow::{Result, bail};
-use jiff::Timestamp;
-use serde::Deserialize;
+use anyhow::Result;
 use serde_json::{Map, Value};
 use trodden_core::{
-    HarnessId, SessionId, Trace,
-    trace::{Event, EventKind, FileChange, ToolAction, ToolArgs, ToolCall, ToolOutcome},
+    Trace,
+    trace::{FileChange, ToolAction, ToolArgs},
 };
 use trodden_redact::Redactor;
 
 use crate::{
-    ErrorSignature,
-    command::Command,
-    evidence::CheckOutput,
-    symbols::{Hunk, SymbolFinder},
+    builder::{Finish, Prompts, TraceBuilder},
+    diff::Diff,
 };
 
 pub const HARNESS: &str = "claude-code";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HookInput {
-    pub session_id: String,
-    #[serde(default)]
-    pub transcript_path: Option<PathBuf>,
-    pub cwd: PathBuf,
-    pub hook_event_name: String,
-    #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
-    pub tool_name: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub is_interrupt: bool,
-    #[serde(default)]
-    pub stop_hook_active: bool,
-}
 
 #[derive(Debug)]
 pub struct Transcript;
 
 impl Transcript {
-    const SUMMARY_CHARS: usize = 200;
-
-    const SUMMARY_SOURCE_BYTES: usize = 64 * 1024;
-
-    const REDACTED: &str = "[REDACTED:";
+    const PROMPTS: Prompts = Prompts {
+        skipped: Self::NON_PROMPT_PREFIXES,
+        pasted: Some("<pasted_content"),
+    };
 
     const NON_PROMPT_PREFIXES: &[&str] = &[
         "<command-name>",
@@ -62,10 +36,6 @@ impl Transcript {
         "[Request interrupted",
         "Caveat:",
     ];
-
-    const PASTED: &str = "<pasted_content";
-
-    const SEPARATORS: &[char] = &['/', '\\'];
 
     const BOOKKEEPING_TOOLS: &[&str] = &[
         "TodoWrite",
@@ -88,11 +58,11 @@ impl Transcript {
     ];
 
     pub fn parse(text: &str, redactor: &Redactor) -> Result<Trace> {
-        let mut builder = TraceBuilder::new(redactor);
+        let mut reader = Reader::new(redactor);
         for line in text.lines().filter_map(Line::parse) {
-            builder.push(line);
+            reader.push(line);
         }
-        builder.finish()
+        reader.finish()
     }
 }
 
@@ -317,30 +287,14 @@ impl Block {
     }
 }
 
-struct TraceBuilder<'a> {
-    redactor: &'a Redactor,
-    session: Option<String>,
-    cwd: String,
-    here: String,
-    model: Option<String>,
-    started_at: Option<Timestamp>,
-    now: Timestamp,
-    events: Vec<Event>,
-    pending: HashMap<String, usize>,
+struct Reader<'a> {
+    builder: TraceBuilder<'a>,
 }
 
-impl<'a> TraceBuilder<'a> {
+impl<'a> Reader<'a> {
     fn new(redactor: &'a Redactor) -> Self {
         Self {
-            redactor,
-            session: None,
-            cwd: String::new(),
-            here: String::new(),
-            model: None,
-            started_at: None,
-            now: Timestamp::UNIX_EPOCH,
-            events: Vec::new(),
-            pending: HashMap::new(),
+            builder: TraceBuilder::new(HARNESS, redactor),
         }
     }
 
@@ -348,23 +302,14 @@ impl<'a> TraceBuilder<'a> {
         if line.is_sidechain {
             return;
         }
-        if self.session.is_none() {
-            self.session.clone_from(&line.session_id);
+        if let Some(session) = &line.session_id {
+            self.builder.session(session);
         }
         if let Some(cwd) = &line.cwd {
-            let cwd = cwd.trim_end_matches(Transcript::SEPARATORS);
-            if self.cwd.is_empty() {
-                cwd.clone_into(&mut self.cwd);
-            }
-            cwd.clone_into(&mut self.here);
+            self.builder.directory(cwd);
         }
-        if let Some(at) = line
-            .timestamp
-            .as_deref()
-            .and_then(|t| t.parse::<Timestamp>().ok())
-        {
-            self.now = at;
-            self.started_at.get_or_insert(at);
+        if let Some(at) = &line.timestamp {
+            self.builder.time(at);
         }
 
         match line.kind.as_str() {
@@ -372,14 +317,14 @@ impl<'a> TraceBuilder<'a> {
             "assistant" => self.push_assistant(line),
             "attachment" => {
                 if let Some(text) = line.attachment.and_then(Attachment::queued_prompt) {
-                    self.push_prompt(&text);
+                    self.builder.prompt(&text, &Transcript::PROMPTS);
                 }
             }
             "system" if line.subtype.as_deref() == Some("compact_boundary") => {
                 let automatic = line
                     .compact_trigger
                     .is_some_and(|trigger| trigger == "auto");
-                self.emit(EventKind::Compaction { automatic });
+                self.builder.compaction(automatic);
             }
             _ => {}
         }
@@ -390,7 +335,7 @@ impl<'a> TraceBuilder<'a> {
         match message.content {
             Content::Text(text) => {
                 if !line.is_meta && !line.is_compact_summary {
-                    self.push_prompt(&text);
+                    self.builder.prompt(&text, &Transcript::PROMPTS);
                 }
             }
             Content::Blocks(blocks) => {
@@ -414,183 +359,71 @@ impl<'a> TraceBuilder<'a> {
                     }
                 }
                 if let Some(text) = prompt.filter(|_| !line.is_meta && !line.is_compact_summary) {
-                    self.push_prompt(&text);
+                    self.builder.prompt(&text, &Transcript::PROMPTS);
                 }
             }
         }
-    }
-
-    fn push_prompt(&mut self, text: &str) {
-        let text = text.trim();
-        if text.is_empty()
-            || Transcript::NON_PROMPT_PREFIXES
-                .iter()
-                .any(|prefix| text.starts_with(prefix))
-        {
-            return;
-        }
-        let headline = Self::headline(text);
-        if headline.is_empty() {
-            return;
-        }
-        let summary = self.summary(headline);
-        self.emit(EventKind::Prompt { summary });
-    }
-
-    fn headline(text: &str) -> &str {
-        let mut wrapper: Option<&str> = None;
-        let mut pasted = None;
-        for line in text.lines() {
-            let mut rest = line.trim();
-            while !rest.is_empty() {
-                if let Some(tag) = wrapper {
-                    let Some(close) = rest.find(&format!("</{}", &tag[1..])) else {
-                        if tag == Transcript::PASTED {
-                            pasted.get_or_insert(rest);
-                        }
-                        break;
-                    };
-                    let inside = rest[..close].trim();
-                    if tag == Transcript::PASTED && !inside.is_empty() {
-                        pasted.get_or_insert(inside);
-                    }
-                    wrapper = None;
-                    rest = Self::after_tag(&rest[close..]);
-                } else if let Some(tag) = Self::wrapper(rest) {
-                    wrapper = Some(tag);
-                    rest = Self::after_tag(rest);
-                } else {
-                    return rest;
-                }
-            }
-        }
-        pasted.unwrap_or_default()
-    }
-
-    fn wrapper(line: &str) -> Option<&'static str> {
-        Transcript::NON_PROMPT_PREFIXES
-            .iter()
-            .chain([&Transcript::PASTED])
-            .map(|prefix| prefix.trim_end_matches('>'))
-            .filter(|tag| tag.starts_with('<'))
-            .find(|tag| line.starts_with(tag))
-    }
-
-    fn after_tag(text: &str) -> &str {
-        text.find('>').map_or("", |end| text[end + 1..].trim())
-    }
-
-    fn summary(&self, line: &str) -> String {
-        let source = if line.len() > Transcript::SUMMARY_SOURCE_BYTES {
-            line[..line.floor_char_boundary(Transcript::SUMMARY_SOURCE_BYTES)]
-                .trim_end_matches(|c: char| !c.is_whitespace())
-        } else {
-            line
-        };
-        let redacted = self.redactor.redact(source);
-        Self::truncate(&redacted, Transcript::SUMMARY_CHARS)
-            .trim_end()
-            .to_owned()
-    }
-
-    fn truncate(text: &str, chars: usize) -> &str {
-        let Some((cut, _)) = text.char_indices().nth(chars) else {
-            return text;
-        };
-        let straddling = text
-            .match_indices(Transcript::REDACTED)
-            .map(|(start, _)| start)
-            .take_while(|&start| start < cut)
-            .last()
-            .filter(|&start| text[start..].find(']').is_none_or(|end| start + end >= cut));
-        &text[..straddling.unwrap_or(cut)]
     }
 
     fn push_assistant(&mut self, line: Line) {
         let Some(message) = line.message else { return };
-        if self.model.is_none() {
-            self.model = message.model.filter(|model| !model.starts_with('<'));
+        if let Some(model) = &message.model {
+            self.builder.model(model);
         }
         let Content::Blocks(blocks) = message.content else {
             return;
         };
         for block in blocks {
             if let Block::ToolUse { id, name, input } = block
-                && let Some(call) = self.tool_call(&name, &input)
+                && let Some((action, args)) = self.tool_call(&name, &input)
             {
-                let index = self.emit(EventKind::ToolCall(call));
-                self.pending.insert(id, index);
+                self.builder.call(Some(&id), &name, action, args);
             }
         }
     }
 
-    fn tool_call(&self, name: &str, input: &Value) -> Option<ToolCall> {
+    fn tool_call(&self, name: &str, input: &Value) -> Option<(ToolAction, ToolArgs)> {
         if Transcript::BOOKKEEPING_TOOLS.contains(&name) {
             return None;
         }
         let field = |key: &str| input.get(key).and_then(Value::as_str);
+        let builder = &self.builder;
         let mut args = ToolArgs::default();
         let action = match name {
             "Bash" => {
-                let subdirectory = self.subdirectory();
-                let base = if subdirectory.is_some() {
-                    &self.here
-                } else {
-                    &self.cwd
-                };
-                let command = Command::normalize(field("command").unwrap_or_default(), base);
-                let text = match subdirectory {
-                    Some(dir) if !command.text().is_empty() => {
-                        format!("cd {} && {}", Self::quoted(dir), command.text())
-                    }
-                    _ => command.text().to_owned(),
-                };
-                args.command = Some(self.redactor.redact(&text).into_owned());
-                command.action()
+                let (shell, action) = builder.shell(field("command").unwrap_or_default());
+                args = shell;
+                action
             }
             "Read" | "NotebookRead" => {
                 args.path = field("file_path")
                     .or_else(|| field("notebook_path"))
-                    .map(|p| self.relative(p));
+                    .map(|p| builder.relative(p));
                 ToolAction::Read
             }
             "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
                 args.path = field("file_path")
                     .or_else(|| field("notebook_path"))
-                    .map(|p| self.relative(p));
+                    .map(|p| builder.relative(p));
                 ToolAction::Edit
             }
             "Glob" | "Grep" => {
-                args.pattern = field("pattern").map(|p| {
-                    if name == "Glob" && Self::is_absolute(p) {
-                        self.relative(p)
-                    } else {
-                        self.redactor.redact(p).into_owned()
-                    }
-                });
-                args.path = field("path").map(|p| self.relative(p));
+                args.pattern = field("pattern").map(|p| builder.search_pattern(p, name == "Glob"));
+                args.path = field("path").map(|p| builder.relative(p));
                 ToolAction::Search
             }
             "WebFetch" => {
-                args.url = field("url").map(|u| self.redactor.redact(u).into_owned());
+                args.url = field("url").map(|u| builder.redact(u));
                 ToolAction::Fetch
             }
             "WebSearch" => {
-                args.query = field("query").map(|q| self.redactor.redact(q).into_owned());
+                args.query = field("query").map(|q| builder.redact(q));
                 ToolAction::Fetch
             }
             "Agent" | "Task" => ToolAction::Delegate,
             _ => ToolAction::Other,
         };
-        Some(ToolCall {
-            tool: name.to_owned(),
-            action,
-            args,
-            outcome: ToolOutcome::Interrupted,
-            changes: Vec::new(),
-            duration_ms: None,
-            error: None,
-        })
+        Some((action, args))
     }
 
     fn resolve(
@@ -600,9 +433,9 @@ impl<'a> TraceBuilder<'a> {
         is_error: bool,
         result: Option<&Value>,
     ) {
-        let Some(index) = self.pending.remove(tool_use_id) else {
+        if !self.builder.is_pending(tool_use_id) {
             return;
-        };
+        }
         let changes = if is_error {
             Vec::new()
         } else {
@@ -611,38 +444,21 @@ impl<'a> TraceBuilder<'a> {
                 .into_iter()
                 .collect()
         };
-        let EventKind::ToolCall(call) = &mut self.events[index].kind else {
-            return;
-        };
-
         let interrupted = result
             .and_then(|r| r.get("interrupted"))
             .and_then(Value::as_bool)
             == Some(true);
         let text = Self::text(content);
-        let verdict = call
-            .args
-            .command
-            .as_deref()
-            .and_then(|command| CheckOutput::verdict(command, &text));
-        call.outcome = match (interrupted, is_error, verdict) {
-            (true, _, _) => ToolOutcome::Interrupted,
-            (false, true, verdict) => match Self::failure(&text) {
-                ToolOutcome::Failed { .. } if verdict == Some(true) => ToolOutcome::Succeeded,
-                outcome => outcome,
-            },
-            (false, false, Some(false)) => ToolOutcome::Failed { exit_code: None },
-            (false, false, _) => ToolOutcome::Succeeded,
+        let finish = match (interrupted, is_error) {
+            (true, _) => Finish::Interrupted,
+            (false, true) => Self::failure(&text),
+            (false, false) => Finish::Succeeded,
         };
-        if matches!(call.outcome, ToolOutcome::Failed { .. }) {
-            call.error = ErrorSignature::of(&text, self.redactor);
-        }
-        call.duration_ms = result
+        let duration_ms = result
             .and_then(|r| r.get("durationMs"))
             .and_then(Value::as_u64);
-        if call.action == ToolAction::Edit {
-            call.changes = changes;
-        }
+        self.builder
+            .resolve(tool_use_id, finish, &text, duration_ms, changes);
     }
 
     fn text(content: &Value) -> String {
@@ -657,15 +473,15 @@ impl<'a> TraceBuilder<'a> {
         }
     }
 
-    fn failure(text: &str) -> ToolOutcome {
+    fn failure(text: &str) -> Finish {
         if text.starts_with("The user doesn't want") || text.contains("user rejected") {
-            return ToolOutcome::Interrupted;
+            return Finish::Interrupted;
         }
         let exit_code = text
             .strip_prefix("Exit code ")
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|code| code.parse().ok());
-        ToolOutcome::Failed { exit_code }
+        Finish::Failed { exit_code }
     }
 
     fn file_change(&self, result: &Value) -> Option<FileChange> {
@@ -677,14 +493,11 @@ impl<'a> TraceBuilder<'a> {
             .cloned()
             .unwrap_or_default();
 
-        let mut changed = Vec::new();
-        let mut starts = Vec::new();
-        let (mut added, mut removed) = (0_u32, 0_u32);
+        let mut diff = Diff::default();
         for hunk in &hunks {
             if let Some(start) = hunk.get("oldStart").and_then(Value::as_u64) {
-                starts.push(Hunk {
-                    old_start: usize::try_from(start).unwrap_or(usize::MAX),
-                });
+                diff.starts
+                    .push(usize::try_from(start).unwrap_or(usize::MAX));
             }
             for line in hunk
                 .get("lines")
@@ -693,183 +506,33 @@ impl<'a> TraceBuilder<'a> {
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                if let Some(text) = line.strip_prefix('+') {
-                    added += 1;
-                    changed.push(text);
-                } else if let Some(text) = line.strip_prefix('-') {
-                    removed += 1;
-                    changed.push(text);
-                }
+                diff.line(line);
             }
         }
 
         let created = result.get("type").and_then(Value::as_str) == Some("create")
             || (original.is_none() && result.get("content").is_some());
-        let content = result.get("content").and_then(Value::as_str);
         if created && hunks.is_empty() {
-            let lines: Vec<&str> = content.unwrap_or_default().lines().collect();
-            added = u32::try_from(lines.len()).unwrap_or(u32::MAX);
-            changed = lines;
+            diff = Diff::created(
+                result
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
         }
-
-        Some(FileChange {
-            path: self.relative(path),
-            created,
-            symbols: SymbolFinder::find(changed, original, &starts),
-            lines_added: added,
-            lines_removed: removed,
-        })
-    }
-
-    fn relative(&self, path: &str) -> String {
-        let (base, rest) = if Self::is_absolute(path) {
-            match self.below(path) {
-                Some(rest) => ("", rest),
-                None => return self.redactor.redact(path).into_owned(),
-            }
-        } else {
-            (self.subdirectory().unwrap_or_default(), path)
-        };
-        let separators = self.separators();
-        let parts = Self::normalized(base.split(separators).chain(rest.split(separators)));
-        let text = if parts.first() == Some(&"..") && !self.cwd.is_empty() {
-            let outside = self.outside(&parts);
-            match self.below(&outside) {
-                Some(rest) => Self::joined(&Self::normalized(rest.split(separators))),
-                None => outside,
-            }
-        } else {
-            Self::joined(&parts)
-        };
-        self.redactor.redact(&text).into_owned()
-    }
-
-    fn joined(parts: &[&str]) -> String {
-        if parts.is_empty() {
-            ".".to_owned()
-        } else {
-            parts.join("/")
-        }
-    }
-
-    fn outside(&self, parts: &[&str]) -> String {
-        let root = Self::root(&self.cwd);
-        let separator = if self.cwd.contains('\\') { "\\" } else { "/" };
-        let resolved = Self::normalized(
-            self.cwd[root.len()..]
-                .split(self.separators())
-                .chain(parts.iter().copied()),
-        );
-        let below_root: Vec<&str> = resolved
-            .into_iter()
-            .skip_while(|part| *part == "..")
-            .collect();
-        format!("{root}{}", below_root.join(separator))
-    }
-
-    fn below<'p>(&self, path: &'p str) -> Option<&'p str> {
-        if self.cwd.is_empty() {
-            return None;
-        }
-        let head = path.get(..self.cwd.len())?;
-        let same = if self.is_windows() {
-            head.chars().zip(self.cwd.chars()).all(|(a, b)| {
-                a.eq_ignore_ascii_case(&b)
-                    || (Transcript::SEPARATORS.contains(&a) && Transcript::SEPARATORS.contains(&b))
-            })
-        } else {
-            head == self.cwd
-        };
-        let rest = &path[self.cwd.len()..];
-        (same && (rest.is_empty() || rest.starts_with(self.separators())))
-            .then(|| rest.trim_start_matches(self.separators()))
-    }
-
-    fn subdirectory(&self) -> Option<&str> {
-        self.below(&self.here).filter(|dir| !dir.is_empty())
-    }
-
-    fn is_windows(&self) -> bool {
-        Self::has_drive(&self.cwd) || self.cwd.starts_with(r"\\")
-    }
-
-    fn separators(&self) -> &'static [char] {
-        if self.is_windows() {
-            Transcript::SEPARATORS
-        } else {
-            &Transcript::SEPARATORS[..1]
-        }
-    }
-
-    fn is_absolute(path: &str) -> bool {
-        path.starts_with(['~', '/', '\\'])
-            || (Self::has_drive(path) && path[2..].starts_with(Transcript::SEPARATORS))
-    }
-
-    fn has_drive(path: &str) -> bool {
-        matches!(path.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
-    }
-
-    fn root(path: &str) -> &str {
-        let drive = if Self::has_drive(path) { 2 } else { 0 };
-        let rest = path[drive..].trim_start_matches(Transcript::SEPARATORS);
-        &path[..path.len() - rest.len()]
-    }
-
-    fn normalized<'p>(parts: impl IntoIterator<Item = &'p str>) -> Vec<&'p str> {
-        let mut normalized = Vec::new();
-        for part in parts {
-            match part {
-                "" | "." => {}
-                ".." if normalized.last().is_some_and(|last| *last != "..") => {
-                    normalized.pop();
-                }
-                _ => normalized.push(part),
-            }
-        }
-        normalized
-    }
-
-    fn quoted(dir: &str) -> String {
-        if dir
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._-/+@%,:=".contains(c))
-        {
-            dir.to_owned()
-        } else {
-            format!("'{}'", dir.replace('\'', r"'\''"))
-        }
-    }
-
-    fn emit(&mut self, kind: EventKind) -> usize {
-        let seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
-        self.events.push(Event {
-            seq,
-            at: self.now,
-            kind,
-        });
-        self.events.len() - 1
+        Some(self.builder.change(path, created, &diff, original))
     }
 
     fn finish(self) -> Result<Trace> {
-        let Some(session) = self.session else {
-            bail!("no Claude Code session found in transcript");
-        };
-        Ok(Trace {
-            session: SessionId::new(session),
-            harness: HarnessId::new(HARNESS),
-            model: self.model,
-            cwd: self.redactor.redact(&self.cwd).into_owned(),
-            commit: None,
-            started_at: self.started_at.unwrap_or(self.now),
-            events: self.events,
-        })
+        self.builder
+            .finish("no Claude Code session found in transcript")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use trodden_core::trace::{EventKind, ToolCall, ToolOutcome};
 
     use super::*;
 
@@ -951,14 +614,14 @@ mod tests {
         ];
         let redactor = Redactor::with_home("/home/dev");
         for secret in &secrets {
-            for lead in 150..=Transcript::SUMMARY_CHARS {
+            for lead in 150..=TraceBuilder::SUMMARY_CHARS {
                 let prompt = format!("{} {secret} to deploy staging", "x".repeat(lead));
                 let redacted = redactor.redact(&prompt);
                 let summary = Session::summary(&prompt);
-                let markers = summary.matches(Transcript::REDACTED).count();
+                let markers = summary.matches(TraceBuilder::REDACTED).count();
 
-                assert!(redacted.contains(Transcript::REDACTED), "{secret}");
-                assert!(summary.chars().count() <= Transcript::SUMMARY_CHARS);
+                assert!(redacted.contains(TraceBuilder::REDACTED), "{secret}");
+                assert!(summary.chars().count() <= TraceBuilder::SUMMARY_CHARS);
                 assert!(redacted.starts_with(&summary), "{summary}");
                 assert_eq!(summary.matches('[').count(), markers, "{summary}");
                 assert_eq!(summary.matches(']').count(), markers, "{summary}");
@@ -968,7 +631,7 @@ mod tests {
 
     #[test]
     fn huge_first_lines_drop_the_token_cut_by_the_bound() {
-        let value = "a".repeat(Transcript::SUMMARY_SOURCE_BYTES - 41);
+        let value = "a".repeat(TraceBuilder::SUMMARY_SOURCE_BYTES - 41);
         let prompt = format!(
             "Deploy with TOKEN={value} and use {} for the smoke test",
             Secret::anthropic_key()
@@ -986,8 +649,8 @@ mod tests {
             Value::String("The user doesn't want to proceed with this tool use.".to_owned());
 
         assert_eq!(
-            TraceBuilder::failure(&TraceBuilder::text(&content)),
-            ToolOutcome::Interrupted
+            Reader::failure(&Reader::text(&content)),
+            Finish::Interrupted
         );
     }
 

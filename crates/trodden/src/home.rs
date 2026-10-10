@@ -86,6 +86,30 @@ impl Home {
         self.dir.join("ingest.pending")
     }
 
+    pub fn journals(&self) -> PathBuf {
+        self.dir.join("journals")
+    }
+
+    pub fn journal(&self, harness: &str, session: &str) -> PathBuf {
+        let plain = !session.is_empty()
+            && session.len() <= 128
+            && !session.starts_with('.')
+            && session
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        let name = if plain {
+            session.to_owned()
+        } else {
+            let hash = session
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+                });
+            format!("session-{hash:016x}")
+        };
+        self.journals().join(harness).join(format!("{name}.jsonl"))
+    }
+
     pub fn error_log(&self) -> PathBuf {
         self.dir.join("hook.log")
     }
@@ -336,5 +360,31 @@ mod tests {
         scratch.home.log_error("start a background ingest");
 
         assert_eq!(scratch.logged(), ["start a background ingest"]);
+    }
+
+    #[test]
+    fn journals_are_named_after_plain_session_ids_only() {
+        let home = Home::at("/data/trodden");
+
+        assert_eq!(
+            home.journal("cursor", "4f1c2a9e-77d1-4c4b-9a0e-3b1f2c7d8e90"),
+            PathBuf::from(
+                "/data/trodden/journals/cursor/4f1c2a9e-77d1-4c4b-9a0e-3b1f2c7d8e90.jsonl"
+            )
+        );
+        for hostile in ["../../escape", "", ".hidden", "a/b"] {
+            let path = home.journal("cursor", hostile);
+            assert_eq!(
+                path.parent(),
+                Some(Path::new("/data/trodden/journals/cursor"))
+            );
+            assert!(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("session-")),
+                "{}",
+                path.display()
+            );
+        }
     }
 }

@@ -1,45 +1,169 @@
+mod claude_code;
+mod cline;
+mod codex;
+mod copilot;
+mod cursor;
+mod droid;
+mod gemini;
+mod kimi;
+mod opencode;
+mod qwen;
+
 use std::{
-    env, fs,
+    fmt::Debug,
+    fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use serde::Deserialize;
-use trodden_capture::claude_code::{self, Transcript};
+use trodden_capture::journal::Observation;
 use trodden_core::Trace;
 use trodden_redact::Redactor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+use crate::connect::{Change, Program};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ValueEnum)]
 pub enum Harness {
-    #[value(name = claude_code::HARNESS)]
+    #[value(name = "claude-code")]
     ClaudeCode,
+    #[value(name = "codex")]
+    Codex,
+    #[value(name = "gemini")]
+    Gemini,
+    #[value(name = "qwen")]
+    Qwen,
+    #[value(name = "copilot")]
+    Copilot,
+    #[value(name = "droid")]
+    Droid,
+    #[value(name = "cursor")]
+    Cursor,
+    #[value(name = "opencode")]
+    OpenCode,
+    #[value(name = "kilo")]
+    Kilo,
+    #[value(name = "kimi")]
+    Kimi,
+    #[value(name = "cline")]
+    Cline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookEvent {
+    pub name: String,
+    pub session: String,
+    pub cwd: PathBuf,
+    pub transcript: Option<PathBuf>,
+    pub moment: Moment,
+    pub observed: Vec<Observation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Moment {
+    SessionStart,
+    Prompt(String),
+    CommandFailed(String),
+    ToolDone,
+    TurnEnd { continued: bool },
+    Compacting,
+    SessionEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply<'a> {
+    Recall(&'a str),
+    Remind(&'a str),
+}
+
+pub(crate) trait Agent: Debug + Sync {
+    fn title(&self) -> &'static str;
+
+    fn journaled(&self) -> bool {
+        false
+    }
+
+    fn history(&self) -> Result<Option<PathBuf>>;
+
+    fn transcripts(&self, history: &Path) -> Result<Vec<PathBuf>>;
+
+    fn parse(&self, text: &str, redactor: &Redactor) -> Result<(Trace, Option<PathBuf>)>;
+
+    fn event(&self, payload: &str, redactor: &Redactor) -> Result<Option<HookEvent>>;
+
+    fn render(&self, event: &HookEvent, reply: Reply<'_>) -> Option<String>;
+
+    fn detected(&self) -> bool;
+
+    fn connect(&self, program: &Program) -> Result<Vec<Change>>;
+
+    fn notice(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn disconnect(&self) -> Result<Vec<Change>>;
+
+    fn connected(&self) -> Result<bool>;
 }
 
 impl Harness {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ClaudeCode => claude_code::HARNESS,
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Qwen => "qwen",
+            Self::Copilot => "copilot",
+            Self::Droid => "droid",
+            Self::Cursor => "cursor",
+            Self::OpenCode => "opencode",
+            Self::Kilo => "kilo",
+            Self::Kimi => "kimi",
+            Self::Cline => "cline",
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub fn all() -> &'static [Self] {
         Self::value_variants()
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::all()
             .iter()
             .copied()
             .find(|harness| harness.as_str() == name)
     }
 
-    pub fn history_dir(self) -> Result<PathBuf> {
+    fn agent(self) -> &'static dyn Agent {
         match self {
-            Self::ClaudeCode => ClaudeCode::projects(),
+            Self::ClaudeCode => &claude_code::ClaudeCode,
+            Self::Codex => &codex::Codex,
+            Self::Gemini => &gemini::Gemini,
+            Self::Qwen => &qwen::Qwen,
+            Self::Copilot => &copilot::Copilot,
+            Self::Droid => &droid::Droid,
+            Self::Cursor => &cursor::Cursor,
+            Self::OpenCode => &opencode::OpenCode::OPENCODE,
+            Self::Kilo => &opencode::OpenCode::KILO,
+            Self::Kimi => &kimi::Kimi,
+            Self::Cline => &cline::Cline,
         }
     }
 
+    pub fn title(self) -> &'static str {
+        self.agent().title()
+    }
+
+    pub fn journaled(self) -> bool {
+        self.agent().journaled()
+    }
+
+    pub fn history_dir(self) -> Result<Option<PathBuf>> {
+        self.agent().history()
+    }
+
     pub(crate) fn transcripts(self, history: &Path) -> Result<Vec<PathBuf>> {
-        match self {
-            Self::ClaudeCode => ClaudeCode::transcripts(history),
-        }
+        self.agent().transcripts(history)
     }
 
     pub fn read(transcript: &Path) -> Result<String> {
@@ -53,73 +177,52 @@ impl Harness {
     }
 
     pub fn parse(self, text: &str, redactor: &Redactor) -> Result<(Trace, Option<PathBuf>)> {
-        match self {
-            Self::ClaudeCode => Ok((
-                Transcript::parse(text, redactor)?,
-                ClaudeCode::working_directory(text),
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ClaudeCodeLine {
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    is_sidechain: bool,
-}
-
-#[derive(Debug)]
-struct ClaudeCode;
-
-impl ClaudeCode {
-    fn working_directory(text: &str) -> Option<PathBuf> {
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<ClaudeCodeLine>(line).ok())
-            .filter(|line| !line.is_sidechain)
-            .find_map(|line| line.cwd)
+        self.agent().parse(text, redactor)
     }
 
-    fn projects() -> Result<PathBuf> {
-        Ok(env::home_dir()
-            .context("find the home directory")?
-            .join(".claude")
-            .join("projects"))
+    pub fn event(self, payload: &str, redactor: &Redactor) -> Result<Option<HookEvent>> {
+        self.agent().event(payload, redactor)
     }
 
-    fn transcripts(projects: &Path) -> Result<Vec<PathBuf>> {
-        let mut transcripts = Vec::new();
-        for project in
-            fs::read_dir(projects).with_context(|| format!("list {}", projects.display()))?
-        {
-            let project = project.context("read a project directory entry")?.path();
-            let Ok(entries) = fs::read_dir(&project) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-                {
-                    transcripts.push(path);
-                }
-            }
-        }
-        transcripts.sort();
-        Ok(transcripts)
+    pub fn render(self, event: &HookEvent, reply: Reply<'_>) -> Option<String> {
+        self.agent().render(event, reply)
+    }
+
+    pub fn detected(self) -> bool {
+        self.agent().detected()
+    }
+
+    pub fn connect(self, program: &Program) -> Result<Vec<Change>> {
+        self.agent().connect(program)
+    }
+
+    pub fn notice(self) -> Option<&'static str> {
+        self.agent().notice()
+    }
+
+    pub fn disconnect(self) -> Result<Vec<Change>> {
+        self.agent().disconnect()
+    }
+
+    pub fn connected(self) -> Result<bool> {
+        self.agent().connected()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
 
     #[test]
     fn harness_names_round_trip() {
-        for harness in Harness::value_variants() {
+        for harness in Harness::all() {
             assert_eq!(Harness::from_name(harness.as_str()), Some(*harness));
+            assert_eq!(
+                harness.to_possible_value().expect("visible").get_name(),
+                harness.as_str()
+            );
         }
         assert_eq!(Harness::ClaudeCode.as_str(), "claude-code");
         assert_eq!(Harness::from_name("future-agent"), None);
@@ -142,29 +245,5 @@ mod tests {
     fn valid_transcripts_decode_unchanged() {
         let text = "{\"cwd\":\"/home/dev/caf\u{e9}\"}\n";
         assert_eq!(Harness::decode(text.as_bytes().to_vec()), text);
-    }
-
-    #[test]
-    fn invalid_bytes_only_spoil_their_own_line() {
-        let bytes = [
-            b"{\"type\":\"user\",\"note\":\"caf\xe9\"}\n".as_slice(),
-            b"{\"cwd\":\"/home/dev/shop\"}\n",
-            b"{\"cwd\":\"/home/dev/caf\xc3",
-        ]
-        .concat();
-        let text = Harness::decode(bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines,
-            [
-                "{\"type\":\"user\",\"note\":\"caf\u{fffd}\"}",
-                "{\"cwd\":\"/home/dev/shop\"}",
-                "{\"cwd\":\"/home/dev/caf\u{fffd}",
-            ]
-        );
-        assert_eq!(
-            ClaudeCode::working_directory(&text),
-            Some(PathBuf::from("/home/dev/shop"))
-        );
     }
 }

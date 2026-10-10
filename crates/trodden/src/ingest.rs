@@ -46,7 +46,7 @@ impl IngestReport {
         }
     }
 
-    fn absorb(&mut self, other: Self) {
+    pub fn absorb(&mut self, other: Self) {
         self.sessions += other.sessions;
         self.tasks += other.tasks;
         self.created += other.created;
@@ -368,6 +368,9 @@ impl Ingest {
                 },
                 &stamp,
             )?;
+            if ended {
+                self.drop_journal(harness, &session, transcript)?;
+            }
             return Ok(IngestReport::default());
         }
         if trace.commit.is_none() {
@@ -458,7 +461,24 @@ impl Ingest {
         if report.created + report.refreshed + report.revised > 0 || settled.any() || aged.any() {
             self.rebuild_index()?;
         }
+        if ended {
+            self.drop_journal(harness, &session, transcript)?;
+        }
         Ok(report)
+    }
+
+    // A resumed conversation starts a new journal numbered from zero, so its progress goes too.
+    fn drop_journal(&self, harness: Harness, session: &str, journal: &Path) -> Result<()> {
+        if !harness.journaled() {
+            return Ok(());
+        }
+        match fs::remove_file(journal) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("remove {}", journal.display()));
+            }
+            _ => {}
+        }
+        self.store.forget_session(session)
     }
 
     pub fn backfill(
@@ -1678,6 +1698,47 @@ mod tests {
                 .expect("procedures list")
                 .len(),
             sessions.len()
+        );
+    }
+
+    #[test]
+    fn a_journal_is_removed_once_its_session_has_ended() {
+        let scratch = Scratch::new("journal-removed");
+        let home = scratch.home();
+        let journal = home.journal(Harness::Cursor.as_str(), "conv-1");
+        fs::create_dir_all(journal.parent().expect("journals have a directory"))
+            .expect("journal directory is writable");
+        let redactor = trodden_redact::Redactor::new();
+        let observer = trodden_capture::journal::Observer {
+            session: "conv-1",
+            cwd: &scratch.dir.to_string_lossy(),
+            at: Timestamp::now(),
+            model: None,
+            redactor: &redactor,
+        };
+        fs::write(
+            &journal,
+            observer
+                .prompt("Fix the paging bug")
+                .to_line()
+                .expect("line encodes"),
+        )
+        .expect("journal is writable");
+        let mut ingest = Ingest::start(&home).expect("ingest starts");
+
+        ingest
+            .transcript(Harness::Cursor, &journal, false)
+            .expect("an open session ingests");
+        assert!(journal.exists(), "an open session keeps its journal");
+        ingest
+            .transcript(Harness::Cursor, &journal, true)
+            .expect("an ended session ingests");
+
+        assert!(!journal.exists(), "an ended session's journal is removed");
+        assert_eq!(
+            ingest.store.progress("conv-1").expect("progress reads"),
+            None,
+            "a resumed conversation starts over"
         );
     }
 }

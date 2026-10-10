@@ -117,6 +117,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE extractions ADD COLUMN started_at TEXT;
     ALTER TABLE extractions ADD COLUMN ended_at TEXT;
 ",
+    r"
+    ALTER TABLE injections ADD COLUMN reminded_at TEXT;
+",
 ];
 
 impl Store {
