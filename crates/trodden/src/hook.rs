@@ -26,8 +26,6 @@ use trodden_store::{Cue, Injection, Patience, Store};
 
 use crate::output::Output;
 
-const MAX_INPUT_BYTES: u64 = 1 << 20;
-
 #[derive(Debug)]
 pub(crate) struct Hook;
 
@@ -56,11 +54,7 @@ impl Hook {
         if !home.is_initialized() {
             return Ok(());
         }
-        let mut raw = String::new();
-        io::stdin()
-            .take(MAX_INPUT_BYTES)
-            .read_to_string(&mut raw)
-            .context("read the hook payload")?;
+        let raw = Self::read_payload(io::stdin().lock())?;
         let Some(mut event) = harness.event(&raw, &Redactor::new())? else {
             return Ok(());
         };
@@ -70,6 +64,14 @@ impl Hook {
             event.transcript = Some(journal);
         }
         Self::respond(harness, &home, &event, out)
+    }
+
+    fn read_payload(mut input: impl Read) -> Result<String> {
+        let mut raw = String::new();
+        input
+            .read_to_string(&mut raw)
+            .context("read the hook payload")?;
+        Ok(raw)
     }
 
     fn respond(
@@ -847,6 +849,30 @@ mod tests {
             Hook::reminder(&procedure, "npm test"),
             "Trodden: the procedure recalled for this task is checked with `npm test`, \
              which has not run since your last change. Run it once before finishing."
+        );
+    }
+
+    #[test]
+    fn a_payload_over_a_mebibyte_is_read_whole() {
+        let prompt = format!("Fix the paging bug\n{}", "x".repeat(3 << 20));
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": "/home/dev/.claude/projects/shop/s1.jsonl",
+            "cwd": CWD,
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+        })
+        .to_string();
+
+        let raw = Hook::read_payload(payload.as_bytes()).expect("payload is valid UTF-8");
+        let event = Harness::ClaudeCode
+            .event(&raw, &Redactor::new())
+            .expect("payload parses")
+            .expect("prompt is a hook event");
+
+        assert_eq!(raw.len(), payload.len());
+        assert!(
+            matches!(event.moment, Moment::Prompt(text) if text.starts_with("Fix the paging bug"))
         );
     }
 }
