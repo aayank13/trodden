@@ -13,9 +13,13 @@ static FAILED: LazyLock<Regex> = LazyLock::new(|| {
 
 static PASSED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:test result: ok\.|# pass [1-9]|ℹ pass [1-9]|ok\s+\S+\s+[\d.]+s|All checks passed!|Finished\b.*\btarget\(s\))|(?:^|[\s(,])[1-9]\d* passed(?:[\s,;.)]|$)",
+        r"(?m)^\s*(?:test result: ok\.|# pass [1-9]|ℹ pass [1-9]|ok\s+\S+\s+[\d.]+s|All checks passed!)|(?:^|[\s(,])[1-9]\d* passed(?:[\s,;.)]|$)",
     )
     .expect("success pattern is valid")
+});
+
+static BUILT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*Finished\b.*\btarget\(s\)").expect("build pattern is valid")
 });
 
 static CHECK_WORD: LazyLock<Regex> = LazyLock::new(|| {
@@ -66,25 +70,31 @@ impl CheckOutput {
         "phpunit",
     ];
 
+    const BUILD_PROGRAMS: &[&str] = &["cargo build", "cargo check", "cargo clippy"];
+
     const TASK_RUNNERS: &[&str] = &["make", "just", "rake", "mvn", "gradle"];
 
     const SHELLS: &[&str] = &["sh", "bash", "zsh"];
 
     pub(crate) fn verdict(command: &str, output: &str) -> Option<bool> {
-        if !Self::hides_exit_code(command) || !Self::runs_check(command) {
+        if !Self::hides_exit_code(command) {
+            return None;
+        }
+        let command = Command::normalize(command, "");
+        let program = command.program();
+        if !Self::runs_check(&command, &program) {
             return None;
         }
         let output = ANSI.replace_all(output, "");
         if FAILED.is_match(&output) {
             Some(false)
         } else {
-            PASSED.is_match(&output).then_some(true)
+            let built = Self::BUILD_PROGRAMS.contains(&program.as_str()) && BUILT.is_match(&output);
+            (built || PASSED.is_match(&output)).then_some(true)
         }
     }
 
-    fn runs_check(command: &str) -> bool {
-        let command = Command::normalize(command, "");
-        let program = command.program();
+    fn runs_check(command: &Command, program: &str) -> bool {
         let runner = program.split_whitespace().next().unwrap_or_default();
         let argv = command.argv();
         let script = if Self::SHELLS.contains(&runner) {
@@ -92,7 +102,7 @@ impl CheckOutput {
         } else {
             argv.first().filter(|executable| executable.contains('/'))
         };
-        Self::CHECK_PROGRAMS.contains(&program.as_str())
+        Self::CHECK_PROGRAMS.contains(&program)
             || Self::TASK_RUNNERS.contains(&runner)
             || script.is_some_and(|script| CHECK_WORD.is_match(script))
     }
@@ -210,10 +220,21 @@ mod tests {
             "# pass 3\n# fail 0",
             "ok  \texample.com/paging\t0.012s",
             "All checks passed!",
-            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s",
         ] {
             assert_eq!(CheckOutput::verdict(piped, output), Some(true), "{output}");
         }
+        let built = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s";
+        assert_eq!(
+            CheckOutput::verdict("cargo build 2>&1 | tail", built),
+            Some(true)
+        );
+        assert_eq!(
+            CheckOutput::verdict(
+                "cargo test 2>&1 | head -6",
+                &format!("{built}\n     Running unittests src/lib.rs\n\nrunning 2 tests")
+            ),
+            None
+        );
         assert_eq!(
             CheckOutput::verdict(piped, "line 18\nline 19\nline 20"),
             None
