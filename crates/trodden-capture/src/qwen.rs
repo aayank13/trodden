@@ -186,11 +186,18 @@ impl Reader<'_> {
             return;
         }
         let field = |key: &str| record.get(key).and_then(Value::as_str);
-        if let Some(session) = field("sessionId") {
+        let forked = record.get("forkedFrom").filter(|origin| !origin.is_null());
+        let origin = forked
+            .and_then(|origin| origin.get("sessionId"))
+            .and_then(Value::as_str);
+        if let Some(session) = field("sessionId").filter(|session| Some(*session) != origin) {
             self.builder.session(session);
         }
         if let Some(cwd) = field("cwd") {
             self.builder.directory(cwd);
+        }
+        if forked.is_some() {
+            return;
         }
         if let Some(at) = field("timestamp") {
             self.builder.time(at);
@@ -474,6 +481,21 @@ mod tests {
                 "resultDisplay": {"type": "shell_result", "version": 1, "output": output, "directory": "/home/dev/shop", "exitCode": exit_code, "outcome": if exit_code == 0 { "completed" } else { "failed" }}}))
         }
 
+        fn branch(&self, session: &str) -> Self {
+            let lines = self
+                .lines
+                .iter()
+                .map(|line| {
+                    let mut copy = line.clone();
+                    copy["forkedFrom"] =
+                        json!({"sessionId": line["sessionId"], "messageUuid": line["uuid"]});
+                    copy["sessionId"] = json!(session);
+                    copy
+                })
+                .collect();
+            Self { lines }
+        }
+
         fn text(&self) -> String {
             self.lines.iter().map(|line| format!("{line}\n")).collect()
         }
@@ -623,6 +645,38 @@ mod tests {
 
         assert_eq!(Session::prompts(&trace), ["second attempt"]);
         assert!(Session::tool_calls(&trace).is_empty());
+    }
+
+    #[test]
+    fn branch_copies_are_left_out() {
+        let mut parent = Session::default();
+        parent
+            .user("fix the db tests")
+            .calls(json!([{"id": "c1", "name": "run_shell_command", "args": {"command": "cargo test -p db"}}]))
+            .shell("c1", 0, "test result: ok. 4 passed; 0 failed");
+
+        let mut branch = parent.branch("9b3e4c1a");
+        let copied = branch.trace();
+        assert_eq!(copied.session.as_str(), "9b3e4c1a");
+        assert_eq!(copied.cwd, "~/shop");
+        assert!(copied.events.is_empty());
+
+        branch.record(
+            "user",
+            json!({"sessionId": "9b3e4c1a", "provenance": "real_user",
+            "message": {"role": "user", "parts": [{"text": "now the sorting bug"}]}}),
+        );
+        let trace = branch.trace();
+        assert_eq!(Session::prompts(&trace), ["now the sorting bug"]);
+        assert!(Session::tool_calls(&trace).is_empty());
+
+        let mut kept = parent.branch("6f1c2a9e");
+        kept.record(
+            "user",
+            json!({"sessionId": "9b3e4c1a", "provenance": "real_user",
+            "message": {"role": "user", "parts": [{"text": "now the sorting bug"}]}}),
+        );
+        assert_eq!(kept.trace().session.as_str(), "9b3e4c1a");
     }
 
     #[test]
