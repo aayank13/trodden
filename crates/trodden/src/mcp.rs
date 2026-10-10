@@ -107,6 +107,7 @@ impl Server {
                                 repository yet, and its git history is too long to read within \
                                 a tool call. Run `trodden list` in the repository once, or \
                                 finish a session there, then try again.";
+    const PAUSED: &str = "Trodden is paused. Run `trodden resume` to recall procedures again.";
 
     pub(crate) fn serve(home: Home) -> Result<()> {
         let server = Self {
@@ -129,6 +130,9 @@ impl Server {
 
     fn recall_text(&self, prompt: &str, cwd: &Path, explain: bool) -> Result<String> {
         let store = self.store()?;
+        if store.paused()? {
+            return Ok(Self::PAUSED.to_owned());
+        }
         let Some(workspace) = Workspace::resolve_read_only(cwd, &store)? else {
             return Ok(Self::UNIDENTIFIED.to_owned());
         };
@@ -253,19 +257,34 @@ mod tests {
     }
 
     impl Scratch {
-        fn with_corrupt_pack(name: &str) -> Self {
+        fn new(name: &str) -> Self {
             let dir =
                 std::env::temp_dir().join(format!("trodden-mcp-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let home = Home::at(dir);
             home.initialize().expect("home initializes");
-            std::fs::write(home.embeddings(), b"TRDEMB\x01\0short").expect("pack is writable");
             Self {
                 server: Server {
                     home,
                     tool_router: Server::tool_router(),
                 },
             }
+        }
+
+        fn with_corrupt_pack(name: &str) -> Self {
+            let scratch = Self::new(name);
+            std::fs::write(scratch.server.home.embeddings(), b"TRDEMB\x01\0short")
+                .expect("pack is writable");
+            scratch
+        }
+
+        fn set_paused(&self, paused: bool) {
+            self.server
+                .home
+                .open_store(Patience::Batch)
+                .expect("store opens")
+                .set_paused(paused)
+                .expect("pause state is saved");
         }
     }
 
@@ -302,6 +321,29 @@ mod tests {
             status.contains("semantic matching: off (load the embedding model: "),
             "{status}"
         );
+    }
+
+    #[test]
+    fn recall_and_explain_say_trodden_is_paused() {
+        let scratch = Scratch::new("paused");
+        let cwd = scratch.server.home.dir();
+        let prompt = "Fix the crash in src/paginate.js";
+
+        scratch.set_paused(true);
+        for explain in [false, true] {
+            let text = scratch
+                .server
+                .recall_text(prompt, cwd, explain)
+                .expect("recall reads while paused");
+            assert_eq!(text, Server::PAUSED);
+        }
+
+        scratch.set_paused(false);
+        let resumed = scratch
+            .server
+            .recall_text(prompt, cwd, false)
+            .expect("recall reads after resuming");
+        assert_ne!(resumed, Server::PAUSED);
     }
 
     #[test]
