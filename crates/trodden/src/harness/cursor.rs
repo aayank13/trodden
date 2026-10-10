@@ -57,6 +57,8 @@ struct CursorHookInput {
     #[serde(default)]
     loop_count: Option<u64>,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     trigger: Option<String>,
 }
 
@@ -391,8 +393,13 @@ impl Agent for Cursor {
                 observed.push(observer.edit("Edit", path, edit, true));
                 Moment::ToolDone
             }
+            // A turn the user stopped, or one that errored, must not be restarted by a reminder.
             "stop" => Moment::TurnEnd {
-                continued: input.loop_count.is_some_and(|count| count > 0),
+                continued: input.loop_count.is_some_and(|count| count > 0)
+                    || input
+                        .status
+                        .as_deref()
+                        .is_some_and(|status| status != "completed"),
             },
             "preCompact" => {
                 observed.push(observer.compaction(input.trigger.as_deref() != Some("manual")));
@@ -722,6 +729,10 @@ mod tests {
             Some(Moment::TurnEnd { continued: true })
         );
         assert_eq!(
+            Payload::moment(json!({"hook_event_name": "stop", "loop_count": 0})),
+            Some(Moment::TurnEnd { continued: false })
+        );
+        assert_eq!(
             Payload::rendered(
                 Moment::TurnEnd { continued: false },
                 Reply::Remind("run it")
@@ -732,6 +743,21 @@ mod tests {
             Payload::rendered(Moment::TurnEnd { continued: true }, Reply::Remind("run it")),
             None
         );
+    }
+
+    #[test]
+    fn stopped_or_failed_turns_are_never_reminded() {
+        for status in ["aborted", "error"] {
+            let moment = Payload::moment(
+                json!({"hook_event_name": "stop", "status": status, "loop_count": 0}),
+            )
+            .expect("event");
+            assert_eq!(
+                Payload::rendered(moment, Reply::Remind("run it")),
+                None,
+                "{status}"
+            );
+        }
     }
 
     #[test]
